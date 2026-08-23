@@ -7293,6 +7293,9 @@ pub(crate) fn scrub_modification_descriptions(modification: &mut ContinuousModif
         ContinuousModification::GrantStaticAbility { definition } => {
             scrub_static_descriptions(definition)
         }
+        ContinuousModification::GrantReplacement { replacement } => {
+            scrub_replacement_descriptions(replacement)
+        }
         _ => {}
     }
 }
