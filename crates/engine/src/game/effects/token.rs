@@ -157,7 +157,7 @@ fn materialize_catalog_token_payload(
     materialized.source = TokenAbilitySource::CatalogRulesText;
     materialized.rules_text = Some(rules_text.to_string());
     let (static_definitions, modifications, unparsed_lines) =
-        catalog_rules_text_abilities(rules_text);
+        catalog_rules_text_abilities(rules_text, &preset.body.display_name);
     materialized.static_definitions = static_definitions;
     materialized.unparsed_rules_text_lines = unparsed_lines;
 
@@ -4364,11 +4364,13 @@ fn apply_token_ability_payload(obj: &mut GameObject, materialized: TokenAbilityM
 
 fn catalog_rules_text_abilities(
     rules_text: &str,
+    card_name: &str,
 ) -> (
     Vec<StaticDefinition>,
     Vec<ContinuousModification>,
     Vec<String>,
 ) {
+    let rules_text = crate::parser::oracle_util::normalize_card_name_refs(rules_text, card_name);
     let mut static_definitions = Vec::new();
     let mut modifications = Vec::new();
     let mut unparsed_lines = Vec::new();
@@ -4392,6 +4394,12 @@ fn catalog_rules_text_abilities(
                     .map(normalized_token_static_definition),
             );
         }
+    }
+    for def in &mut static_definitions {
+        crate::parser::oracle::scrub_static_descriptions(def);
+    }
+    for modification in &mut modifications {
+        crate::parser::oracle::scrub_modification_descriptions(modification);
     }
     (static_definitions, modifications, unparsed_lines)
 }
@@ -8448,6 +8456,7 @@ mod tests {
              This creature can't block.\n\
              {T}: Add {G}.\n\
              When this creature dies, you gain 1 life.",
+            "Test Card",
         );
         assert!(unparsed_lines.is_empty());
 
@@ -8480,6 +8489,102 @@ mod tests {
                 ContinuousModification::GrantTrigger { .. }
             )),
             "trigger rules text must route to GrantTrigger, got {modifications:?}"
+        );
+    }
+
+    /// Revert-to-red: removing the `card_name` threading in
+    /// `catalog_rules_text_abilities` reverts this to `TriggerMode::Unknown`
+    /// with the raw text, since the bare "galactus attacks..." subject
+    /// matches no recognized pattern and falls through to the terminal
+    /// fallback.
+    #[test]
+    fn catalog_galactus_preset_trigger_subject_normalizes() {
+        let (_statics, modifications, _unparsed_lines) = catalog_rules_text_abilities(
+            "Flying, trample\nWhenever Galactus attacks, destroy target land.",
+            "Galactus",
+        );
+
+        assert!(
+            modifications.iter().any(|modification| matches!(
+                modification,
+                ContinuousModification::GrantTrigger { trigger }
+                    if trigger.mode == TriggerMode::Attacks
+                        && trigger.valid_card == Some(TargetFilter::SelfRef)
+            )),
+            "card-name subject in an attack trigger must normalize to a \
+             self-referential TriggerMode::Attacks, got {modifications:?}"
+        );
+    }
+
+    /// Revert-to-red: without normalization, no `StaticDefinition` is
+    /// produced for this line at all (`parse_self_color_subject`'s `alt()`
+    /// doesn't match the bare name "Mechtitan"), and the CDA silently
+    /// vanishes into an inert `GrantAbility` instead.
+    #[test]
+    fn catalog_mechtitan_preset_cda_subject_normalizes() {
+        let (static_definitions, _modifications, _unparsed_lines) = catalog_rules_text_abilities(
+            "Mechtitan is all colors.\nFlying, vigilance, trample, lifelink, haste",
+            "Mechtitan",
+        );
+
+        assert!(
+            static_definitions.iter().any(|def| {
+                def.characteristic_defining
+                    && def.affected == Some(TargetFilter::SelfRef)
+                    && def.modifications.iter().any(|modification| matches!(
+                        modification,
+                        ContinuousModification::SetColor { colors }
+                            if colors.len() == 5
+                    ))
+            }),
+            "card-name subject in a CDA color-setting static must normalize to a \
+             self-referential characteristic-defining SetColor{{all 5 colors}}, got {static_definitions:?}"
+        );
+    }
+
+    /// Revert-to-red: without normalization, the effect's target is
+    /// `TargetFilter::Any` (the unconsumed literal name falls through
+    /// `parse_target`'s terminal fallback), meaning the token would copy
+    /// any legal target instead of itself.
+    #[test]
+    fn catalog_council_of_reeds_preset_copy_effect_normalizes() {
+        let (_statics, modifications, _unparsed_lines) = catalog_rules_text_abilities(
+            "The \"legend rule\" doesn't apply to creatures you control.\n\
+             At the beginning of combat on your turn, if you've cast a noncreature \
+             spell this turn, create a token that's a copy of Council of Reeds.\n\
+             (This token's mana cost is {2}{U}.)",
+            "Council of Reeds",
+        );
+
+        fn ability_has_self_copy(def: &AbilityDefinition) -> bool {
+            matches!(
+                *def.effect,
+                Effect::CopyTokenOf {
+                    target: TargetFilter::SelfRef,
+                    ..
+                }
+            ) || def
+                .sub_ability
+                .as_deref()
+                .is_some_and(ability_has_self_copy)
+                || def
+                    .else_ability
+                    .as_deref()
+                    .is_some_and(ability_has_self_copy)
+                || def.mode_abilities.iter().any(ability_has_self_copy)
+        }
+
+        assert!(
+            modifications.iter().any(|modification| matches!(
+                modification,
+                ContinuousModification::GrantTrigger { trigger }
+                    if trigger
+                        .execute
+                        .as_deref()
+                        .is_some_and(ability_has_self_copy)
+            )),
+            "card-name copy-of subject must normalize to a self-referential \
+             CopyTokenOf, got {modifications:?}"
         );
     }
 
@@ -8740,6 +8845,103 @@ mod tests {
         assert!(equip
             .activation_restrictions
             .contains(&ActivationRestriction::AsSorcery));
+    }
+
+    /// CR 201.5a end-to-end proof: Toggo's Rock grants the equipped creature
+    /// "{1}, {T}, Sacrifice Rock: This creature deals 2 damage to any
+    /// target." Rock (the card literally named in the cost) must be the
+    /// object sacrificed — not the host it's equipped to — and the scrub
+    /// pass (Step 1) must have removed the raw placeholder character from
+    /// the granted ability's description before it ever reaches the host.
+    ///
+    /// Revert-to-red: reverting the `card_name` threading in
+    /// `catalog_rules_text_abilities` (Step 2) makes the sacrifice cost bind
+    /// to the host instead of Rock — `host` would be sacrificed (and,
+    /// being a nontoken permanent, land observably in the graveyard) while
+    /// Rock would stay on the battlefield untouched; reverting only the
+    /// scrub pass (Step 1) would leave the raw placeholder character in the
+    /// description instead.
+    #[test]
+    fn catalog_toggo_rock_sacrifice_cost_binds_to_rock_not_host() {
+        use crate::game::scenario::{GameScenario, P0, P1};
+        use crate::types::mana::{ManaType, ManaUnit};
+
+        fn sacrifice_target(cost: &AbilityCost) -> Option<&TargetFilter> {
+            match cost {
+                AbilityCost::Sacrifice(sac) => Some(&sac.target),
+                AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
+                    costs.iter().find_map(sacrifice_target)
+                }
+                _ => None,
+            }
+        }
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.with_mana_pool(
+            P0,
+            vec![ManaUnit::new(ManaType::White, ObjectId(0), false, vec![])],
+        );
+        let host = scenario.add_creature(P0, "Bearer", 2, 2).id();
+
+        let mut runner = scenario.build();
+        let rock_id = build_catalog_token(
+            runner.state_mut(),
+            "Rock",
+            "1657233e-c9e1-54ff-aa5a-6e2e2846be42",
+        );
+        {
+            let st = runner.state_mut();
+            st.objects.get_mut(&rock_id).unwrap().attached_to = Some(AttachTarget::Object(host));
+            st.layers_dirty.mark_full();
+        }
+        crate::game::layers::evaluate_layers(runner.state_mut());
+
+        let idx = runner.state().objects[&host]
+            .abilities
+            .iter()
+            .position(|a| a.cost.as_ref().and_then(sacrifice_target).is_some())
+            .expect("host must carry Rock's granted sacrifice-cost ability after evaluate_layers");
+
+        assert_eq!(
+            runner.state().objects[&host].abilities[idx]
+                .cost
+                .as_ref()
+                .and_then(sacrifice_target),
+            Some(&TargetFilter::SpecificObject { id: rock_id }),
+            "CR 201.5a: the sacrifice cost must target Rock (the granting object), not the host"
+        );
+        assert!(
+            !runner.state().objects[&host].abilities[idx]
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains(crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER),
+            "granted ability description must not leak the raw placeholder char"
+        );
+
+        let outcome = runner
+            .activate(host, idx)
+            .target_player(P1)
+            .pay_with(&[rock_id])
+            .resolve();
+
+        // CR 111.7 + CR 704.5d: Rock is a token, so once it's sacrificed off the
+        // battlefield it ceases to exist as a state-based action and is purged
+        // from `state.objects` entirely — it never sits observably in the
+        // graveyard the way a card-backed permanent would (contrast
+        // `deconstruction_hammer_sacrifice_hits_the_equipment_not_the_host`,
+        // whose Hammer is a real card and persists at `zone_of == Graveyard`).
+        assert!(
+            !outcome.state().objects.contains_key(&rock_id),
+            "Rock (the object actually named in the cost) must be sacrificed and, \
+             being a token, cease to exist"
+        );
+        assert_eq!(
+            outcome.zone_of(host),
+            Zone::Battlefield,
+            "the equipped creature survives"
+        );
     }
 
     #[test]

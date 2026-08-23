@@ -7277,19 +7277,23 @@ fn scrub_trigger_descriptions(trig: &mut TriggerDefinition) {
     }
 }
 
-fn scrub_static_descriptions(st: &mut StaticDefinition) {
+pub(crate) fn scrub_static_descriptions(st: &mut StaticDefinition) {
     scrub_description(&mut st.description);
     for modification in st.modifications.iter_mut() {
-        match modification {
-            ContinuousModification::GrantAbility { definition } => {
-                scrub_ability_descriptions(definition)
-            }
-            ContinuousModification::GrantTrigger { trigger } => scrub_trigger_descriptions(trigger),
-            ContinuousModification::GrantStaticAbility { definition } => {
-                scrub_static_descriptions(definition)
-            }
-            _ => {}
+        scrub_modification_descriptions(modification);
+    }
+}
+
+pub(crate) fn scrub_modification_descriptions(modification: &mut ContinuousModification) {
+    match modification {
+        ContinuousModification::GrantAbility { definition } => {
+            scrub_ability_descriptions(definition)
         }
+        ContinuousModification::GrantTrigger { trigger } => scrub_trigger_descriptions(trigger),
+        ContinuousModification::GrantStaticAbility { definition } => {
+            scrub_static_descriptions(definition)
+        }
+        _ => {}
     }
 }
 
