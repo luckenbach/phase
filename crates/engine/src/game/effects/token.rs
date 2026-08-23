@@ -4370,6 +4370,12 @@ fn catalog_rules_text_abilities(
     Vec<ContinuousModification>,
     Vec<String>,
 ) {
+    // CR 201.5 + CR 201.5a: A card's Oracle text uses its name to refer to
+    // itself, and a granted ability that refers to its granter by name refers
+    // only to that specific granter. Token catalog rules text is parsed
+    // independently of `parse_oracle_ir`'s single entry point, so it needs its
+    // own `normalize_card_name_refs` pass here, mirroring `parse_oracle_ir`'s
+    // call in `oracle.rs`.
     let rules_text = crate::parser::oracle_util::normalize_card_name_refs(rules_text, card_name);
     let mut static_definitions = Vec::new();
     let mut modifications = Vec::new();
@@ -4395,6 +4401,10 @@ fn catalog_rules_text_abilities(
             );
         }
     }
+    // CR 201.5a: catch any residual `GRANTING_SELF_PLACEHOLDER` left in the
+    // parsed statics'/modifications' display `description`s, mirroring
+    // `scrub_granting_placeholder_descriptions`'s whole-tree sweep in
+    // `oracle.rs` for this independent parse entry point.
     for def in &mut static_definitions {
         crate::parser::oracle::scrub_static_descriptions(def);
     }
@@ -8855,12 +8865,31 @@ mod tests {
     /// the granted ability's description before it ever reaches the host.
     ///
     /// Revert-to-red: reverting the `card_name` threading in
-    /// `catalog_rules_text_abilities` (Step 2) makes the sacrifice cost bind
-    /// to the host instead of Rock — `host` would be sacrificed (and,
-    /// being a nontoken permanent, land observably in the graveyard) while
-    /// Rock would stay on the battlefield untouched; reverting only the
-    /// scrub pass (Step 1) would leave the raw placeholder character in the
-    /// description instead.
+    /// `catalog_rules_text_abilities` (Step 2) does NOT bind the sacrifice
+    /// cost to the host. Verified empirically (temporarily disabling the
+    /// `normalize_card_name_refs` call and printing the resulting cost): it
+    /// produces a generic, UNBOUND
+    /// `AbilityCost::Sacrifice(SacrificeCost { target: Typed(TypedFilter {
+    /// type_filters: [], controller: None, properties: [] }), .. })` that
+    /// matches any permanent, not a host-bound `SelfRef`. Because that filter
+    /// is unconstrained, `pay_with(&[rock_id])` below still succeeds even
+    /// under the reverted code (Rock trivially satisfies "any permanent"),
+    /// and the runtime activate/pay/resolve assertions still pass — they
+    /// exercise that the grant-and-activate mechanism works end-to-end (a
+    /// real but separate property), not the granter-binding regression
+    /// itself. The pre-activation `TargetFilter` equality assertion
+    /// immediately below is the one check in this test that is actually
+    /// load-bearing for this regression.
+    ///
+    /// For the placeholder-leak assertion: Rock's granted ability is a
+    /// granted *activated* ability, routed through `parse_quoted_ability`
+    /// (`oracle_static/grammar.rs`), which already calls its own
+    /// `sanitize_granting_placeholder` independent of the two scrub loops
+    /// added to `catalog_rules_text_abilities` in this diff — so disabling
+    /// only those two loops does not reproduce a leak here. See
+    /// `catalog_synthetic_equipment_grant_trigger_scrub_removes_placeholder`
+    /// for the case (a granted TRIGGER, with no independent scrubber) that
+    /// actually exercises the new scrub loops.
     #[test]
     fn catalog_toggo_rock_sacrifice_cost_binds_to_rock_not_host() {
         use crate::game::scenario::{GameScenario, P0, P1};
@@ -8941,6 +8970,90 @@ mod tests {
             outcome.zone_of(host),
             Zone::Battlefield,
             "the equipped creature survives"
+        );
+    }
+
+    /// CR 201.5a: proves the two `scrub_static_descriptions` /
+    /// `scrub_modification_descriptions` loops at the end of
+    /// `catalog_rules_text_abilities` actually do something. Rock's own test
+    /// above (a granted *activated* ability, routed through
+    /// `parse_quoted_ability`) is scrubbed independently by that grammar's own
+    /// `sanitize_granting_placeholder` call and does not exercise these two
+    /// loops. A granted *trigger* has no such independent scrubber, so this
+    /// synthetic Equipment's granted "Whenever this creature attacks,
+    /// sacrifice <self>" trigger — parsed via `parse_static_line_multi` →
+    /// `classify_quoted_inner`'s `GrantTrigger` branch, never touching
+    /// `parse_quoted_ability` — is the case that actually needs the new
+    /// scrub loops.
+    ///
+    /// Revert-to-red: commenting out the two scrub loops (while leaving
+    /// `normalize_card_name_refs` intact) leaves the raw
+    /// `GRANTING_SELF_PLACEHOLDER` char in the granted trigger's
+    /// `description`, flipping the no-leak assertion below to a failure.
+    #[test]
+    fn catalog_synthetic_equipment_grant_trigger_scrub_removes_placeholder() {
+        let (static_definitions, _modifications, unparsed_lines) = catalog_rules_text_abilities(
+            "Equipped creature has \"Whenever this creature attacks, sacrifice Ember Golem.\"",
+            "Ember Golem",
+        );
+        assert!(
+            unparsed_lines.is_empty(),
+            "line must fully parse, got unparsed: {unparsed_lines:?}"
+        );
+
+        fn find_grant_trigger(def: &StaticDefinition) -> Option<&TriggerDefinition> {
+            def.modifications.iter().find_map(|m| match m {
+                ContinuousModification::GrantTrigger { trigger } => Some(trigger.as_ref()),
+                _ => None,
+            })
+        }
+
+        let trigger = static_definitions
+            .iter()
+            .find_map(find_grant_trigger)
+            .unwrap_or_else(|| {
+                panic!(
+                    "quoted \"Whenever ...\" body must parse to a GrantTrigger, \
+                     got {static_definitions:?}"
+                )
+            });
+
+        let sacrifices_granter = trigger.execute.as_deref().is_some_and(|def| {
+            matches!(
+                *def.effect,
+                Effect::Sacrifice {
+                    target: TargetFilter::GrantingObject,
+                    ..
+                }
+            )
+        });
+        assert!(
+            sacrifices_granter,
+            "the granted trigger's sacrifice effect must target the GRANTING object \
+             (the equipment itself), got {trigger:?}"
+        );
+
+        // NOTE: check the actual `description` fields directly, NOT a
+        // `{:?}`-formatted dump of the tree — `Debug` escapes the raw private-use
+        // char to the literal text `\u{e0002}`, so searching a Debug string for
+        // the real character is always false regardless of whether scrubbing ran.
+        let placeholder = crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER;
+        let leaked = static_definitions.iter().any(|def| {
+            def.description
+                .as_deref()
+                .is_some_and(|d| d.contains(placeholder))
+                || def.modifications.iter().any(|m| match m {
+                    ContinuousModification::GrantTrigger { trigger } => trigger
+                        .description
+                        .as_deref()
+                        .is_some_and(|d| d.contains(placeholder)),
+                    _ => false,
+                })
+        });
+        assert!(
+            !leaked,
+            "the new scrub loops must remove the raw placeholder char from the \
+             granted trigger's description, got {static_definitions:#?}"
         );
     }
 
