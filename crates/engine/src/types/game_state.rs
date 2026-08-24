@@ -27621,6 +27621,74 @@ mod tests {
         );
     }
 
+    /// #7799 review follow-up (matthewevans, review 5012075716): `PayCostKind::
+    /// TapCreatures::mode` (added by the selection-mode-discriminator fix) has no
+    /// `#[serde(default)]`, replacing the prior `aggregate: Option<..>` field.
+    /// This is a deliberate wire-compatibility break, backed by
+    /// `lobby_broker::PROTOCOL_VERSION` 36 / `WIRE_PROTOCOL_VERSION` 27 (not a
+    /// backward-compatible decode shim) — the same convention entry 23
+    /// (`PayableResource::ManaGeneric`) established. This test proves the break
+    /// is a clean, non-silent deserialize failure through the actual production
+    /// restore path (`PersistedGameState`, the same type `server-core::session::
+    /// PersistedSession.state` uses), for BOTH prior `TapCreatures` shapes: the
+    /// fixed-count form (`aggregate` omitted/null) and the aggregate form
+    /// (`aggregate: {..}`) — proving the rejection isn't an artifact of one
+    /// particular legacy payload, and specifically that an aggregate-shaped
+    /// legacy payload cannot be silently admitted as a `Fixed` decode.
+    #[test]
+    fn tap_creatures_pre_mode_wire_shape_is_rejected() {
+        let mut state = GameState::new_two_player(42);
+        state.waiting_for = WaitingFor::PayCost {
+            player: PlayerId(0),
+            kind: PayCostKind::TapCreatures {
+                mode: TapCreaturesSelectionMode::Fixed,
+            },
+            choices: vec![ObjectId(1)],
+            count: 1,
+            min_count: 0,
+            resume: CostResume::Resolution,
+        };
+        let base = serde_json::to_value(state).expect("fixture state serializes");
+
+        // Prior fixed-count wire shape: `aggregate` omitted (the old field was
+        // `#[serde(default, skip_serializing_if = "Option::is_none")]`).
+        let mut legacy_fixed = base.clone();
+        legacy_fixed["waiting_for"]["data"]["kind"]
+            .as_object_mut()
+            .expect("kind is a JSON object")
+            .remove("mode");
+        let fixed_error = serde_json::from_value::<PersistedGameState>(legacy_fixed)
+            .expect_err("pre-mode fixed-count TapCreatures payload must fail to deserialize");
+        assert!(
+            fixed_error.to_string().contains("mode"),
+            "expected a missing-`mode` deserialize error, got: {fixed_error}"
+        );
+
+        // Prior aggregate wire shape: `aggregate: {..}` present, `mode` absent.
+        let mut legacy_aggregate = base;
+        let kind = legacy_aggregate["waiting_for"]["data"]["kind"]
+            .as_object_mut()
+            .expect("kind is a JSON object");
+        kind.remove("mode");
+        kind.insert(
+            "aggregate".to_string(),
+            serde_json::json!({
+                "stat": "TotalPower",
+                "comparator": "GE",
+                "value": 3
+            }),
+        );
+        let aggregate_error = serde_json::from_value::<PersistedGameState>(legacy_aggregate)
+            .expect_err(
+                "pre-mode aggregate TapCreatures payload must fail to deserialize, \
+                 not silently decode as a Fixed-mode payment",
+            );
+        assert!(
+            aggregate_error.to_string().contains("mode"),
+            "expected a missing-`mode` deserialize error, got: {aggregate_error}"
+        );
+    }
+
     #[test]
     fn direct_current_raw_requires_canonical_trigger_firing_carriers() {
         let state = normal_trigger_firing_fixture();

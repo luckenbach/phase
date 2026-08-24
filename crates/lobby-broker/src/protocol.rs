@@ -43,6 +43,19 @@ pub enum ServerErrorCode {
 /// handshake. When making such changes, plan a deprecation window where
 /// both the old and new variants coexist, then bump and remove the old.
 ///
+/// 36 — `PayCostKind::TapCreatures` changed from `{ aggregate:
+///      Option<TapCreaturesAggregate> }` to a required `{ mode:
+///      TapCreaturesSelectionMode }` (Fixed/VariableX/Aggregate) — the fix
+///      that also unlocks the `u32::MAX` X-sentinel tap-cost form (Glacian,
+///      Powerstone Engineer + 8 sibling cards, #7799). `mode` carries no
+///      `#[serde(default)]`: a `GameState` snapshot paused mid-TapCreatures
+///      payment (Crew/Saddle/Teamwork/Conspire, or the newly-unlocked
+///      X-sentinel form) under the old `aggregate` shape now fails
+///      deserialization rather than risk silently misclassifying an
+///      aggregate payment as fixed-count (or vice versa) — exactly the
+///      ambiguity `TapCreaturesSelectionMode` exists to make
+///      unrepresentable. Old and new peers can't parse each other's
+///      serialized snapshots while such a payment is in flight.
 /// 35 — `DerivedViews::current_target_kind` publishes the engine's CR 115.1
 ///      classification of the live target announcement. A CAPABILITY bump like
 ///      24 and 32, not a parse bump: the field is `Option` +
@@ -107,7 +120,7 @@ pub enum ServerErrorCode {
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 35;
+pub const PROTOCOL_VERSION: u32 = 36;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -515,12 +528,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 35);
+        assert_eq!(PROTOCOL_VERSION, 36);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which is what refuses an older full-game peer whose GameState cannot
         // understand a success acknowledgment the submitting client awaits.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 34);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 35);
     }
 
     #[test]
