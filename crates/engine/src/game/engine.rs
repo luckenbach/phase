@@ -9313,6 +9313,7 @@ fn apply_action(
                         state,
                         *player,
                         *pending_cast.clone(),
+                        *min_count,
                         *count,
                         *aggregate,
                         choices,
@@ -9440,6 +9441,7 @@ fn apply_action(
                 PayCostKind::TapCreatures { aggregate } => {
                     casting_costs::pay_tap_creatures_selection(
                         state,
+                        *min_count,
                         *count,
                         *aggregate,
                         choices,

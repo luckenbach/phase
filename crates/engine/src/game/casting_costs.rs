@@ -3800,6 +3800,7 @@ pub(crate) fn tap_creatures_total_power(state: &GameState, ids: &[ObjectId]) -> 
 /// CR 118.3 + CR 701.26a: Complete the tap-creatures cost after player selection.
 pub(crate) fn pay_tap_creatures_selection(
     state: &mut GameState,
+    min_count: usize,
     count: usize,
     aggregate: Option<TapCreaturesAggregate>,
     legal_creatures: &[ObjectId],
@@ -3818,11 +3819,21 @@ pub(crate) fn pay_tap_creatures_selection(
         }
     }
     match aggregate {
+        // CR 107.3a: `min_count < count` only for the X-sentinel shape ("Tap X
+        // untapped [type] you control"), where X is chosen freely by the
+        // controller within [min_count, count] — mirrors
+        // `handle_sacrifice_for_cost`'s range check exactly. A fixed (non-X)
+        // requirement still has min_count == count, so this subsumes the
+        // prior exact-match behavior unchanged for every existing card.
         None => {
-            if chosen.len() != count {
+            if chosen.len() < min_count || chosen.len() > count {
+                let requirement = if min_count == count {
+                    format!("exactly {count} creature(s)")
+                } else {
+                    format!("between {min_count} and {count} creature(s)")
+                };
                 return Err(EngineError::InvalidAction(format!(
-                    "Must tap exactly {} creature(s), got {}",
-                    count,
+                    "Must tap {requirement}, got {}",
                     chosen.len()
                 )));
             }
@@ -3853,14 +3864,32 @@ pub(crate) fn pay_tap_creatures_selection(
 pub(crate) fn handle_tap_creatures_for_spell_cost(
     state: &mut GameState,
     player: PlayerId,
-    pending: PendingCast,
+    mut pending: PendingCast,
+    min_count: usize,
     count: usize,
     aggregate: Option<TapCreaturesAggregate>,
     legal_creatures: &[ObjectId],
     chosen: &[ObjectId],
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    pay_tap_creatures_selection(state, count, aggregate, legal_creatures, chosen, events)?;
+    pay_tap_creatures_selection(
+        state,
+        min_count,
+        count,
+        aggregate,
+        legal_creatures,
+        chosen,
+        events,
+    )?;
+    // CR 107.3a: the selected payment count defines X for this activation
+    // while its ability is on the stack — mirrors `handle_sacrifice_for_cost`'s
+    // identical `min_count == 0` guard (only the X-sentinel shape ever has
+    // min_count 0; a fixed requirement always has min_count == count).
+    if min_count == 0 {
+        pending
+            .ability
+            .set_chosen_x_recursive(chosen.len().try_into().unwrap_or(u32::MAX));
+    }
     finish_pending_cost_or_cast(state, player, pending, events)
 }
 
@@ -4862,7 +4891,12 @@ pub(crate) fn surface_next_unpaid_interactive_activation_cost(
         let eligible = super::casting::find_eligible_tap_creatures_for_cost(
             state, player, source_id, cost, filter,
         );
-        if eligible.len() < count as usize {
+        // CR 107.3a + CR 601.2b: mirror the adjacent Sacrifice arm above —
+        // a "Tap X untapped [type] you control" cost uses the u32::MAX
+        // sentinel for X, bounding the choice to [0, eligible.len()], not a
+        // literal exact/minimum match on u32::MAX.
+        let (min_count, max_count) = super::casting::sacrifice_cost_bounds(count, eligible.len());
+        if eligible.len() < min_count {
             return Err(EngineError::ActionNotAllowed(
                 "Not enough eligible creatures to tap".into(),
             ));
@@ -4879,8 +4913,8 @@ pub(crate) fn surface_next_unpaid_interactive_activation_cost(
             player,
             kind: PayCostKind::TapCreatures { aggregate: None },
             choices: eligible,
-            count: count as usize,
-            min_count: 0,
+            count: max_count,
+            min_count,
             resume: CostResume::Spell {
                 spell: Box::new(pending),
             },

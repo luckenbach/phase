@@ -769,7 +769,17 @@ fn has_enough_tap_creatures(
         })
     });
     match requirement {
-        TapCreaturesRequirement::Count { count } => eligible.count() >= *count as usize,
+        // CR 107.3a + CR 601.2b: X in a "Tap X untapped [type] you control" cost
+        // is chosen during announcement, and X=0 is always legal (mirrors the
+        // `AbilityCost::Exile` `EXILE_COST_X` early-return above and Sacrifice's
+        // `sacrifice_cost_bounds` floor) — the pre-announcement affordability
+        // gate must not treat the `u32::MAX` X-sentinel as a literal count that
+        // can never be satisfied.
+        TapCreaturesRequirement::Count { count } => {
+            let eligible_count = eligible.count();
+            let (min_count, _) = super::casting::sacrifice_cost_bounds(*count, eligible_count);
+            eligible_count >= min_count
+        }
         TapCreaturesRequirement::Aggregate {
             stat: TapCreaturesAggregateStat::TotalPower,
             comparator,

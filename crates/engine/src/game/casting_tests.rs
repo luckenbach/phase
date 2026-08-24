@@ -53065,3 +53065,672 @@ fn bomat_courier_activates_empty_handed_casting_path() {
     assert!(state.stack.is_empty(), "the ability must fully resolve");
     assert_eq!(state.objects[&lib_card].zone, Zone::Hand);
 }
+
+/// CR 107.3a + CR 601.2b: the X-sentinel `TapCreatures` activation cost
+/// ("{T}, Tap X untapped artifacts you control: …") is shared by 9 printed
+/// cards, headed by Glacian, Powerstone Engineer. X is chosen freely by the
+/// controller within `[0, eligible]`, so all three cost-payment checkpoints —
+/// the payability gate (`cost_payability::has_enough_tap_creatures`), the
+/// interactive dispatcher (`surface_next_unpaid_interactive_activation_cost`),
+/// and the selection-completion validator (`pay_tap_creatures_selection` /
+/// `handle_tap_creatures_for_spell_cost`) — must treat the `u32::MAX` sentinel
+/// as a range, and the chosen count must bind the ability's X.
+mod x_sentinel_tap_creatures_activation_cost {
+    use super::*;
+    use crate::types::ability::TapCreaturesRequirement;
+
+    /// Glacian, Powerstone Engineer's verbatim Oracle text, fetched from
+    /// Scryfall (oracle_id `e96ce18e-b002-4b5b-9560-c1634320e164`). Verbatim,
+    /// not paraphrased — a paraphrase can take a different parser branch.
+    const GLACIAN_ORACLE_TEXT: &str = "{T}, Tap X untapped artifacts you control: Look at the top \
+         X cards of your library. Put one of those cards into your hand and the rest into your \
+         graveyard.\nPartner (You can have two commanders if both have partner.)";
+
+    fn create_untapped_artifact(
+        state: &mut GameState,
+        controller: PlayerId,
+        card_id: CardId,
+        name: &str,
+    ) -> ObjectId {
+        let id = create_object(
+            state,
+            card_id,
+            controller,
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).expect("new artifact exists");
+        obj.card_types.core_types.push(CoreType::Artifact);
+        obj.tapped = false;
+        id
+    }
+
+    fn put_card_on_top_of_library(
+        state: &mut GameState,
+        owner: PlayerId,
+        card_id: CardId,
+        name: &str,
+    ) -> ObjectId {
+        let id = create_object(state, card_id, owner, name.to_string(), Zone::Library);
+        let player = state
+            .players
+            .iter_mut()
+            .find(|p| p.id == owner)
+            .expect("library owner exists");
+        player.library.retain(|existing| *existing != id);
+        player.library.push_front(id);
+        id
+    }
+
+    /// Installs Glacian's REAL parsed abilities (no hand-built AST) onto a new
+    /// battlefield permanent and returns `(source, activated_ability_index)`.
+    /// `extra_core_types` lets the self-matching hostile fixture make the
+    /// source itself an artifact.
+    fn install_glacian(state: &mut GameState, extra_core_types: &[CoreType]) -> (ObjectId, usize) {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            GLACIAN_ORACLE_TEXT,
+            "Glacian, Powerstone Engineer",
+            &["Partner".to_string()],
+            &["Creature".to_string()],
+            &["Human".to_string(), "Artificer".to_string()],
+        );
+        let index = parsed
+            .abilities
+            .iter()
+            .position(|ability| ability.kind == AbilityKind::Activated)
+            .expect("Glacian's Oracle text must parse to an activated ability");
+
+        // Positive reach guard: this fixture must reach the X-SENTINEL arm of
+        // every checkpoint, not a degenerate fixed-count branch. If the parser
+        // ever stops emitting the u32::MAX sentinel, these tests would silently
+        // stop testing the fix, so assert the shape the fix is written against.
+        let cost = parsed.abilities[index]
+            .cost
+            .clone()
+            .expect("Glacian's activated ability carries an activation cost");
+        let AbilityCost::Composite { costs } = &cost else {
+            panic!("Glacian's cost must parse to a Composite {{T}} + TapCreatures, got {cost:?}");
+        };
+        assert!(
+            costs.iter().any(|leg| matches!(leg, AbilityCost::Tap)),
+            "Glacian's cost must include the bare {{T}} leg, got {costs:?}"
+        );
+        assert!(
+            costs.iter().any(|leg| matches!(
+                leg,
+                AbilityCost::TapCreatures {
+                    requirement: TapCreaturesRequirement::Count { count },
+                    ..
+                } if *count == u32::MAX
+            )),
+            "Glacian's cost must include the u32::MAX X-sentinel TapCreatures leg, got {costs:?}"
+        );
+
+        let source = create_object(
+            state,
+            CardId(7_101),
+            PlayerId(0),
+            "Glacian, Powerstone Engineer".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&source).expect("Glacian exists");
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.card_types
+            .core_types
+            .extend(extra_core_types.iter().copied());
+        obj.card_types.supertypes.push(Supertype::Legendary);
+        obj.card_types.subtypes = vec!["Human".to_string(), "Artificer".to_string()];
+        obj.power = Some(3);
+        obj.toughness = Some(6);
+        obj.summoning_sick = false;
+        Arc::make_mut(&mut obj.abilities).extend(parsed.abilities.iter().cloned());
+        (source, index)
+    }
+
+    /// CR 107.3a: X=0 is a legal choice, so the pre-announcement affordability
+    /// gate must not reject the activation when NO artifact is eligible.
+    /// Reverting the `has_enough_tap_creatures` fix flips this to `false`
+    /// (`0 >= u32::MAX as usize`), making the card permanently unactivatable.
+    #[test]
+    fn glacian_shaped_ability_is_activatable_with_zero_eligible_artifacts() {
+        let mut state = setup_game_at_main_phase();
+        let (source, ability_index) = install_glacian(&mut state, &[]);
+
+        assert!(
+            !state.battlefield.iter().any(|id| state.objects[id]
+                .card_types
+                .core_types
+                .contains(&CoreType::Artifact)),
+            "fixture must have zero eligible artifacts to exercise the X=0 floor"
+        );
+
+        assert!(
+            can_activate_ability_now(&state, PlayerId(0), source, ability_index),
+            "CR 107.3a: X=0 is legal, so a 'Tap X untapped artifacts you control' cost must be \
+             payable with no eligible artifacts on the battlefield"
+        );
+    }
+
+    /// CR 107.3a + CR 601.2b: the interactive dispatcher must advertise the
+    /// choice as the range `[0, eligible]`, not an exact `u32::MAX` match.
+    /// Reverting the `surface_next_unpaid_interactive_activation_cost` fix
+    /// turns this into `Err(ActionNotAllowed("Not enough eligible creatures
+    /// to tap"))` even with three eligible artifacts on the battlefield.
+    #[test]
+    fn glacian_shaped_ability_surfaces_range_not_exact_match() {
+        let mut state = setup_game_at_main_phase();
+        let (source, ability_index) = install_glacian(&mut state, &[]);
+        let artifacts: Vec<ObjectId> = (0..3)
+            .map(|i| {
+                create_untapped_artifact(
+                    &mut state,
+                    PlayerId(0),
+                    CardId(7_200 + i),
+                    &format!("Powerstone {i}"),
+                )
+            })
+            .collect();
+
+        apply_as_current(
+            &mut state,
+            GameAction::ActivateAbility {
+                source_id: source,
+                ability_index,
+            },
+        )
+        .expect("CR 107.3a: activating an X-sentinel tap cost with 3 eligible artifacts is legal");
+
+        match &state.waiting_for {
+            WaitingFor::PayCost {
+                player,
+                kind: PayCostKind::TapCreatures { aggregate: None },
+                choices,
+                count,
+                min_count,
+                ..
+            } => {
+                assert_eq!(*player, PlayerId(0));
+                assert_eq!(
+                    *count, 3,
+                    "the X-sentinel upper bound is the eligible count, not u32::MAX"
+                );
+                assert_eq!(*min_count, 0, "CR 107.3a: X=0 is always a legal choice");
+                let mut sorted = choices.clone();
+                sorted.sort();
+                let mut expected = artifacts.clone();
+                expected.sort();
+                assert_eq!(sorted, expected, "all three artifacts must be selectable");
+            }
+            other => {
+                panic!("expected PayCost {{ TapCreatures }} with a [0, 3] range, got {other:?}")
+            }
+        }
+    }
+
+    /// CR 107.3a: the selection-completion validator must accept any X within
+    /// `[min_count, count]`, not force the maximum. Reverting the range check
+    /// in `pay_tap_creatures_selection` rejects 2-of-3 with
+    /// `Err(InvalidAction("Must tap exactly 3 creature(s), got 2"))`.
+    #[test]
+    fn glacian_shaped_ability_accepts_x_below_eligible_maximum() {
+        fn activated_fixture() -> (GameState, Vec<ObjectId>) {
+            let mut state = setup_game_at_main_phase();
+            let (source, ability_index) = install_glacian(&mut state, &[]);
+            let artifacts: Vec<ObjectId> = (0..3)
+                .map(|i| {
+                    create_untapped_artifact(
+                        &mut state,
+                        PlayerId(0),
+                        CardId(7_300 + i),
+                        &format!("Powerstone {i}"),
+                    )
+                })
+                .collect();
+            apply_as_current(
+                &mut state,
+                GameAction::ActivateAbility {
+                    source_id: source,
+                    ability_index,
+                },
+            )
+            .expect("activation must surface the tap-cost prompt");
+            assert!(
+                matches!(
+                    state.waiting_for,
+                    WaitingFor::PayCost {
+                        kind: PayCostKind::TapCreatures { aggregate: None },
+                        ..
+                    }
+                ),
+                "positive reach guard: every case below must start from the real tap-cost prompt"
+            );
+            (state, artifacts)
+        }
+
+        // X = 2 of 3 eligible: strictly between the bounds — the exact case the
+        // old `chosen.len() != count` check rejected.
+        let (mut state, artifacts) = activated_fixture();
+        apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: artifacts[..2].to_vec(),
+            },
+        )
+        .expect("CR 107.3a: tapping 2 of 3 eligible artifacts is a legal choice of X");
+        assert!(
+            state.objects[&artifacts[0]].tapped && state.objects[&artifacts[1]].tapped,
+            "the two chosen artifacts must actually be tapped as the cost payment"
+        );
+        assert!(
+            !state.objects[&artifacts[2]].tapped,
+            "the unchosen artifact must stay untapped"
+        );
+
+        // X = 0: the lower bound.
+        let (mut state, _artifacts) = activated_fixture();
+        apply_as_current(&mut state, GameAction::SelectCards { cards: vec![] })
+            .expect("CR 107.3a: X=0 is a legal choice for an X-sentinel tap cost");
+
+        // X above the eligible maximum must still be rejected — the fix widens
+        // the accepted range to [0, eligible], it does not remove the ceiling.
+        let (mut state, artifacts) = activated_fixture();
+        let over_max = vec![artifacts[0], artifacts[0], artifacts[1], artifacts[2]];
+        let err = apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: over_max.clone(),
+            },
+        )
+        .expect_err("selecting more entries than eligible artifacts must be rejected");
+        assert!(
+            matches!(err, EngineError::InvalidAction(_)),
+            "over-max selection must be an InvalidAction, got {err:?}"
+        );
+        assert!(
+            !state.objects[&artifacts[2]].tapped,
+            "a rejected selection must not tap anything"
+        );
+
+        // An ineligible object (a tapped artifact) is still refused.
+        let (mut state, artifacts) = activated_fixture();
+        let ineligible =
+            create_untapped_artifact(&mut state, PlayerId(0), CardId(7_399), "Latecomer");
+        let mut with_ineligible = artifacts.clone();
+        with_ineligible.push(ineligible);
+        apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: with_ineligible,
+            },
+        )
+        .expect_err("an object outside the advertised choices must be refused");
+    }
+
+    /// CR 107.3a: the payment count IS X for the rest of the activation. This
+    /// is the full production pipeline — activate, pay by tapping 2 of 3
+    /// artifacts, resolve the ability off the stack, and observe `Effect::Dig`
+    /// looking at exactly 2 cards.
+    ///
+    /// Reverting ONLY the `set_chosen_x_recursive` call in
+    /// `handle_tap_creatures_for_spell_cost` leaves `chosen_x == None`, so
+    /// `QuantityRef::Variable("X")` resolves to 0 and Dig short-circuits with
+    /// no `WaitingFor::DigChoice` at all — the `DigChoice` match below fails.
+    #[test]
+    fn glacian_shaped_ability_threads_chosen_x_into_dig_count() {
+        let mut state = setup_game_at_main_phase();
+        let (source, ability_index) = install_glacian(&mut state, &[]);
+        let artifacts: Vec<ObjectId> = (0..3)
+            .map(|i| {
+                create_untapped_artifact(
+                    &mut state,
+                    PlayerId(0),
+                    CardId(7_400 + i),
+                    &format!("Powerstone {i}"),
+                )
+            })
+            .collect();
+        // Bottom-to-top so `third` ends up on top of the library.
+        let deep = put_card_on_top_of_library(&mut state, PlayerId(0), CardId(7_450), "Deep Card");
+        let second =
+            put_card_on_top_of_library(&mut state, PlayerId(0), CardId(7_451), "Second Card");
+        let top = put_card_on_top_of_library(&mut state, PlayerId(0), CardId(7_452), "Top Card");
+        let library_before = state.players[0].library.len();
+        let hand_before = state.players[0].hand.len();
+        let graveyard_before = state.players[0].graveyard.len();
+
+        apply_as_current(
+            &mut state,
+            GameAction::ActivateAbility {
+                source_id: source,
+                ability_index,
+            },
+        )
+        .expect("activation must surface the tap-cost prompt");
+        apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: artifacts[..2].to_vec(),
+            },
+        )
+        .expect("tapping 2 of 3 eligible artifacts must be accepted");
+
+        // Drive the real priority loop until the ability resolves and Dig asks
+        // which of the looked-at cards to keep.
+        for _ in 0..10 {
+            if matches!(state.waiting_for, WaitingFor::DigChoice { .. }) {
+                break;
+            }
+            if state.stack.is_empty() && matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                break;
+            }
+            apply_as_current(&mut state, GameAction::PassPriority)
+                .expect("priority passing must not error while the ability resolves");
+        }
+
+        let looked_at = match &state.waiting_for {
+            WaitingFor::DigChoice {
+                cards, keep_count, ..
+            } => {
+                assert_eq!(
+                    *keep_count, 1,
+                    "Glacian keeps exactly one of the looked-at cards"
+                );
+                cards.clone()
+            }
+            other => panic!(
+                "CR 107.3a: X=2 must make Dig look at 2 cards and prompt a DigChoice, got {other:?}"
+            ),
+        };
+        assert_eq!(
+            looked_at,
+            vec![top, second],
+            "Dig must look at exactly the top X=2 cards of the library"
+        );
+        assert!(
+            !looked_at.contains(&deep),
+            "a third card must NOT be looked at when X=2"
+        );
+
+        apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![second],
+            },
+        )
+        .expect("choosing which looked-at card goes to hand must be accepted");
+
+        assert_eq!(
+            state.objects[&second].zone,
+            Zone::Hand,
+            "the chosen card goes to hand"
+        );
+        assert_eq!(
+            state.objects[&top].zone,
+            Zone::Graveyard,
+            "the rest of the looked-at cards go to the graveyard"
+        );
+        assert_eq!(
+            state.objects[&deep].zone,
+            Zone::Library,
+            "the un-looked-at card stays in the library"
+        );
+        assert_eq!(
+            state.players[0].library.len(),
+            library_before - 2,
+            "the library must shrink by exactly X=2"
+        );
+        assert_eq!(
+            state.players[0].hand.len(),
+            hand_before + 1,
+            "exactly one card lands in hand"
+        );
+        assert_eq!(
+            state.players[0].graveyard.len(),
+            graveyard_before + 1,
+            "exactly one card lands in the graveyard"
+        );
+    }
+
+    /// CR 601.2b: an X-sentinel tap cost on a source that itself matches the
+    /// cost's filter (Merchant's Dockhand / Belisarius Cawl shape: an artifact
+    /// creature tapping artifacts) must not offer its own id. The `{T}` leg is
+    /// not yet applied to state when the eligible set is computed, so the
+    /// exclusion is by identity in `find_eligible_tap_creatures_for_cost`, not
+    /// by `!tapped`. This fixture proves the bounds fix does not disturb it.
+    #[test]
+    fn merchant_dockhand_shaped_self_matching_source_not_overcounted() {
+        let mut state = setup_game_at_main_phase();
+        let (source, ability_index) = install_glacian(&mut state, &[CoreType::Artifact]);
+        assert!(
+            state.objects[&source]
+                .card_types
+                .core_types
+                .contains(&CoreType::Artifact),
+            "positive reach guard: the source must itself match the cost's artifact filter"
+        );
+        assert!(
+            !state.objects[&source].tapped,
+            "positive reach guard: the source is still untapped when eligibility is computed"
+        );
+        let others: Vec<ObjectId> = (0..2)
+            .map(|i| {
+                create_untapped_artifact(
+                    &mut state,
+                    PlayerId(0),
+                    CardId(7_500 + i),
+                    &format!("Powerstone {i}"),
+                )
+            })
+            .collect();
+
+        apply_as_current(
+            &mut state,
+            GameAction::ActivateAbility {
+                source_id: source,
+                ability_index,
+            },
+        )
+        .expect("a self-matching source must still be able to activate the ability");
+
+        match &state.waiting_for {
+            WaitingFor::PayCost {
+                kind: PayCostKind::TapCreatures { aggregate: None },
+                choices,
+                count,
+                min_count,
+                ..
+            } => {
+                assert!(
+                    !choices.contains(&source),
+                    "the source pays its own {{T}} leg and must not also be offered as an X artifact"
+                );
+                let mut sorted = choices.clone();
+                sorted.sort();
+                let mut expected = others.clone();
+                expected.sort();
+                assert_eq!(
+                    sorted, expected,
+                    "only the two OTHER artifacts are eligible"
+                );
+                assert_eq!(*count, 2, "the upper bound excludes the source itself");
+                assert_eq!(*min_count, 0);
+            }
+            other => panic!("expected PayCost {{ TapCreatures }}, got {other:?}"),
+        }
+    }
+
+    /// Regression sibling: a FIXED (non-X) `TapCreatures` requirement keeps
+    /// `min_count == count`, so it is still unpayable when short and still
+    /// rejects an undersized selection. If any of the three fixes computed the
+    /// bounds wrong, a fixed cost would silently loosen into an unbounded one.
+    #[test]
+    fn fixed_count_tap_creatures_cost_still_requires_exact_count() {
+        fn install_fixed_two(state: &mut GameState) -> ObjectId {
+            let source = create_object(
+                state,
+                CardId(7_600),
+                PlayerId(0),
+                "Fixed Two Artificer".to_string(),
+                Zone::Battlefield,
+            );
+            let obj = state.objects.get_mut(&source).expect("source exists");
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.summoning_sick = false;
+            Arc::make_mut(&mut obj.abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Tap,
+                        AbilityCost::TapCreatures {
+                            requirement: TapCreaturesRequirement::count(2),
+                            filter: TargetFilter::Typed(TypedFilter {
+                                type_filters: vec![TypeFilter::Artifact],
+                                controller: Some(ControllerRef::You),
+                                properties: vec![],
+                            }),
+                        },
+                    ],
+                }),
+            );
+            source
+        }
+
+        // Only one eligible artifact: still unpayable.
+        let mut state = setup_game_at_main_phase();
+        let source = install_fixed_two(&mut state);
+        create_untapped_artifact(&mut state, PlayerId(0), CardId(7_610), "Lone Powerstone");
+        assert!(
+            !can_activate_ability_now(&state, PlayerId(0), source, 0),
+            "a fixed 'Tap two untapped artifacts' cost must stay unpayable with only 1 eligible"
+        );
+
+        // Two eligible: payable, and the advertised bounds are exact.
+        let mut state = setup_game_at_main_phase();
+        let source = install_fixed_two(&mut state);
+        let artifacts: Vec<ObjectId> = (0..2)
+            .map(|i| {
+                create_untapped_artifact(
+                    &mut state,
+                    PlayerId(0),
+                    CardId(7_620 + i),
+                    &format!("Powerstone {i}"),
+                )
+            })
+            .collect();
+        assert!(
+            can_activate_ability_now(&state, PlayerId(0), source, 0),
+            "a fixed 'Tap two untapped artifacts' cost is payable with exactly 2 eligible"
+        );
+        apply_as_current(
+            &mut state,
+            GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            },
+        )
+        .expect("activation must surface the tap-cost prompt");
+        match &state.waiting_for {
+            WaitingFor::PayCost {
+                kind: PayCostKind::TapCreatures { aggregate: None },
+                count,
+                min_count,
+                ..
+            } => {
+                assert_eq!(*count, 2);
+                assert_eq!(
+                    *min_count, 2,
+                    "a fixed requirement must keep min_count == count (no X freedom)"
+                );
+            }
+            other => panic!("expected PayCost {{ TapCreatures }}, got {other:?}"),
+        }
+
+        // Selecting only one of the two must still be rejected.
+        let err = apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![artifacts[0]],
+            },
+        )
+        .expect_err("a fixed count must still reject an undersized selection");
+        assert!(
+            matches!(err, EngineError::InvalidAction(_)),
+            "undersized fixed-count selection must be an InvalidAction, got {err:?}"
+        );
+        assert!(
+            !state.objects[&artifacts[0]].tapped,
+            "a rejected selection must not tap anything"
+        );
+    }
+
+    /// CR 107.3a: X=0 is legal end to end — the activation is announced, the
+    /// cost is paid by tapping nothing beyond the source's own {T}, and Dig
+    /// resolves as a legal no-op ("If the value of X is 0, you don't look at
+    /// or move any cards"). No error anywhere in the chain.
+    #[test]
+    fn x_equals_zero_is_a_legal_glacian_activation() {
+        let mut state = setup_game_at_main_phase();
+        let (source, ability_index) = install_glacian(&mut state, &[]);
+        let artifacts: Vec<ObjectId> = (0..2)
+            .map(|i| {
+                create_untapped_artifact(
+                    &mut state,
+                    PlayerId(0),
+                    CardId(7_700 + i),
+                    &format!("Powerstone {i}"),
+                )
+            })
+            .collect();
+        put_card_on_top_of_library(&mut state, PlayerId(0), CardId(7_750), "Deep Card");
+        put_card_on_top_of_library(&mut state, PlayerId(0), CardId(7_751), "Top Card");
+        let library_before = state.players[0].library.len();
+        let hand_before = state.players[0].hand.len();
+        let graveyard_before = state.players[0].graveyard.len();
+
+        apply_as_current(
+            &mut state,
+            GameAction::ActivateAbility {
+                source_id: source,
+                ability_index,
+            },
+        )
+        .expect("activation must surface the tap-cost prompt");
+        apply_as_current(&mut state, GameAction::SelectCards { cards: vec![] })
+            .expect("CR 107.3a: choosing X=0 must be accepted");
+
+        for _ in 0..10 {
+            if state.stack.is_empty() && matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                break;
+            }
+            assert!(
+                !matches!(state.waiting_for, WaitingFor::DigChoice { .. }),
+                "X=0 must not prompt a DigChoice — no cards are looked at"
+            );
+            apply_as_current(&mut state, GameAction::PassPriority)
+                .expect("an X=0 activation must resolve without error");
+        }
+
+        assert!(state.stack.is_empty(), "the ability must fully resolve");
+        assert!(
+            state.objects[&source].tapped,
+            "the source still paid its own {{T}} leg"
+        );
+        assert!(
+            artifacts.iter().all(|id| !state.objects[id].tapped),
+            "X=0 taps no artifacts"
+        );
+        assert_eq!(
+            state.players[0].library.len(),
+            library_before,
+            "X=0 looks at no cards"
+        );
+        assert_eq!(state.players[0].hand.len(), hand_before);
+        assert_eq!(state.players[0].graveyard.len(), graveyard_before);
+    }
+}
