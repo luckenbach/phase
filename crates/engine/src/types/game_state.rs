@@ -17,7 +17,7 @@ use super::ability::{
     EffectKind, FaceDownProfile, GameRestriction, KeywordAction, KickerVariant, LibraryPosition,
     ModalChoice, PermanentEntryMode, PileSource, QuantityExpr, ResolvedAbility,
     SearchDestinationSplit, SearchOrderingHint, SearchSelectionConstraint, StackAbilityKind,
-    StaticCondition, TapCreaturesAggregate, TargetFilter, TargetRef, ThisWayCause,
+    StaticCondition, TapCreaturesSelectionMode, TargetFilter, TargetRef, ThisWayCause,
     TriggerBaseSetInstanceRef, TriggerCondition, TriggerDefinition, TriggerDefinitionOccurrenceRef,
     TriggerDefinitionRef, TriggerEntry,
 };
@@ -8329,19 +8329,24 @@ pub enum PayCostKind {
         #[serde(default)]
         selection: CounterCostSelection,
     },
-    /// CR 601.2b: Tap creatures as a cost. `aggregate` distinguishes the two
-    /// `TapCreaturesRequirement` shapes at the interactive payment layer: `None`
-    /// is the fixed-count form (player taps exactly `WaitingFor::PayCost` `count`
-    /// creatures; Conspire/Convoke), while `Some(aggregate)` is the aggregate
-    /// "tap any number satisfying the constraint" form (Crew CR 702.122a / Saddle
-    /// CR 702.171a / Teamwork) — the chosen set may be any size whose total
-    /// positive power (CR 208.1) satisfies `aggregate`'s comparator vs its value.
-    /// Carrying the full `TapCreaturesAggregate` (not just a threshold int) keeps
-    /// the payment validator honoring the advertised comparator instead of
-    /// hard-coding `>=`.
+    /// CR 601.2b: Tap creatures as a cost. `mode` is the single authority for
+    /// which of the three `TapCreaturesRequirement` selection semantics this
+    /// payment carries (CR 107.3a + CR 208.1), computed once at registration
+    /// time via `TapCreaturesRequirement::selection_mode`: `Fixed` is the
+    /// fixed-count form (player taps exactly `WaitingFor::PayCost` `count`
+    /// creatures; Conspire/Convoke), `VariableX` is the "Tap X untapped … you
+    /// control" X-sentinel form whose chosen count *defines* the ability's X,
+    /// and `Aggregate(aggregate)` is the "tap any number satisfying the
+    /// constraint" form (Crew CR 702.122a / Saddle CR 702.171a / Teamwork
+    /// CR 702.194a) — the chosen set may be any size whose total positive power
+    /// (CR 208.1) satisfies `aggregate`'s comparator vs its value. Carrying the
+    /// full `TapCreaturesAggregate` inside the variant (not just a threshold
+    /// int) keeps the payment validator honoring the advertised comparator
+    /// instead of hard-coding `>=`; carrying the mode rather than an
+    /// `Option<TapCreaturesAggregate>` keeps `Fixed` and `VariableX` from
+    /// collapsing into one indistinguishable `None`.
     TapCreatures {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        aggregate: Option<TapCreaturesAggregate>,
+        mode: TapCreaturesSelectionMode,
     },
     Behold {
         action: BeholdCostAction,
@@ -30959,7 +30964,9 @@ mod tests {
         // variant here does not lose mid-cast tracking.
         let tap_mana = WaitingFor::PayCost {
             player: PlayerId(0),
-            kind: PayCostKind::TapCreatures { aggregate: None },
+            kind: PayCostKind::TapCreatures {
+                mode: TapCreaturesSelectionMode::Fixed,
+            },
             choices: vec![ObjectId(1)],
             count: 1,
             min_count: 0,

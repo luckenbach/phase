@@ -9308,14 +9308,14 @@ fn apply_action(
                         &mut events,
                     )?
                 }
-                PayCostKind::TapCreatures { aggregate } => {
+                PayCostKind::TapCreatures { mode } => {
                     engine_casting::handle_tap_creatures_for_spell_cost(
                         state,
                         *player,
                         *pending_cast.clone(),
                         *min_count,
                         *count,
-                        *aggregate,
+                        *mode,
                         choices,
                         &chosen,
                         &mut events,
@@ -9343,12 +9343,14 @@ fn apply_action(
             CostResume::ManaAbility {
                 mana_ability: pending_mana_ability,
             } => match kind {
-                // CR 605.1a: mana-ability tap costs are always fixed-count; the
-                // aggregate form never resumes a mana ability.
-                PayCostKind::TapCreatures { .. } => {
+                // CR 605.1a: the aggregate form never resumes a mana ability;
+                // fixed-count and X-sentinel forms both do.
+                PayCostKind::TapCreatures { mode } => {
                     let wf = engine_casting::handle_tap_creatures_for_mana_ability(
                         state,
+                        *min_count,
                         *count,
+                        *mode,
                         choices,
                         pending_mana_ability,
                         &chosen,
@@ -9438,12 +9440,12 @@ fn apply_action(
                 }
             },
             CostResume::Resolution => match kind {
-                PayCostKind::TapCreatures { aggregate } => {
+                PayCostKind::TapCreatures { mode } => {
                     casting_costs::pay_tap_creatures_selection(
                         state,
                         *min_count,
                         *count,
-                        *aggregate,
+                        *mode,
                         choices,
                         &chosen,
                         &mut events,

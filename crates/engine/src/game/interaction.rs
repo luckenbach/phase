@@ -19,7 +19,7 @@ use crate::analysis::decision_template::{
 use crate::types::ability::{
     AggregateFunction, ChoiceType, ChooseFromZoneConstraint, Comparator, CounterCostSelection,
     DoorLockOp, EffectKind, ObjectProperty, SearchSelectionConstraint, TapCreaturesAggregateStat,
-    TargetRef,
+    TapCreaturesSelectionMode, TargetRef,
 };
 use crate::types::actions::{
     AlternativeCastDecision, CastChoice, GameAction, MulliganChoice, OutsideGameSelection,
@@ -3209,7 +3209,7 @@ fn selection_projection(
         } => {
             let constraint = match kind {
                 PayCostKind::TapCreatures {
-                    aggregate: Some(aggregate),
+                    mode: TapCreaturesSelectionMode::Aggregate(aggregate),
                 } => match aggregate.stat {
                     TapCreaturesAggregateStat::TotalPower => SelectionConstraint::Aggregate {
                         function: InteractionAggregateFunction::Sum,
@@ -3230,7 +3230,12 @@ fn selection_projection(
                     comparator: comparator_dto(*comparator),
                     amount: *value,
                 },
-                PayCostKind::TapCreatures { aggregate: None }
+                // CR 107.3a: both count-bounded forms project as a plain
+                // `[min_count, count]` selection; the X-sentinel's freedom is
+                // already encoded in the bounds the registration site published.
+                PayCostKind::TapCreatures {
+                    mode: TapCreaturesSelectionMode::Fixed | TapCreaturesSelectionMode::VariableX,
+                }
                 | PayCostKind::Discard
                 | PayCostKind::Reveal
                 | PayCostKind::Sacrifice

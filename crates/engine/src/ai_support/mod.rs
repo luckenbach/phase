@@ -21,7 +21,9 @@ use crate::game::mana_abilities;
 use crate::game::mana_payment;
 use crate::game::mana_sources;
 use crate::game::triggers;
-use crate::types::ability::{AbilityKind, CounterCostSelection, TargetRef, TriggerDefinition};
+use crate::types::ability::{
+    AbilityKind, CounterCostSelection, TapCreaturesSelectionMode, TargetRef, TriggerDefinition,
+};
 use crate::types::actions::GameAction;
 use crate::types::card_type::CoreType;
 use crate::types::events::{GameEvent, ManaTapState};
@@ -717,12 +719,13 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
         // whose summed CURRENT positive power satisfies the advertised comparator
         // — not a fixed cardinality. Evaluates through the same `satisfied_by`
         // the payment validator (`handle_tap_creatures_for_spell_cost`) uses, so
-        // both seams agree on which subsets are legal.
+        // both seams agree on which subsets are legal. The `Fixed`/`VariableX`
+        // forms fall through to the exact-`count` selection below.
         (
             WaitingFor::PayCost {
                 kind:
                     PayCostKind::TapCreatures {
-                        aggregate: Some(aggregate),
+                        mode: TapCreaturesSelectionMode::Aggregate(aggregate),
                     },
                 choices,
                 ..

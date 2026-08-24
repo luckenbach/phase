@@ -8,7 +8,9 @@ use crate::game::effects::prepare;
 use crate::game::game_object::RoomDoor;
 use crate::game::keywords;
 use crate::game::mana_sources;
-use crate::types::ability::{ChoiceType, CounterCostSelection, TargetRef};
+use crate::types::ability::{
+    ChoiceType, CounterCostSelection, TapCreaturesSelectionMode, TargetRef,
+};
 use crate::types::actions::{
     CastChoice, GameAction, LearnOption, MulliganChoice, OutsideGameSelection,
     ResolveAllConsentDecision,
@@ -2212,13 +2214,13 @@ pub fn candidate_actions_broad_with_probe(
         // subsets (mirroring crew/saddle) so the AI/MP legal-action set offers
         // them; measure each creature via the same current-power authority, and
         // evaluate acceptance through the same `satisfied_by` the payment
-        // validator uses, so all three seams agree. The `aggregate: None`
-        // (fixed-count) form falls through to the exact-`count` selection below.
+        // validator uses, so all three seams agree. The `Fixed`/`VariableX`
+        // forms fall through to the exact-`count` selection below.
         WaitingFor::PayCost {
             player,
             kind:
                 PayCostKind::TapCreatures {
-                    aggregate: Some(aggregate),
+                    mode: TapCreaturesSelectionMode::Aggregate(aggregate),
                 },
             choices,
             ..

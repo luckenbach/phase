@@ -18,7 +18,7 @@ use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AdditionalCost, AdditionalCostOrigin,
     Comparator, Effect, SpellCastingOptionKind, TapCreaturesAggregateStat, TapCreaturesRequirement,
-    TargetRef,
+    TapCreaturesSelectionMode, TargetRef,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
@@ -267,11 +267,13 @@ fn team_tactics_with_teamwork_grants_double_strike_and_trample() {
     // Tap the 3/3 (total power 3 >= Teamwork 1) to pay the aggregate cost.
     match runner.state().waiting_for.clone() {
         WaitingFor::PayCost {
-            kind: PayCostKind::TapCreatures { aggregate },
+            kind:
+                PayCostKind::TapCreatures {
+                    mode: TapCreaturesSelectionMode::Aggregate(aggregate),
+                },
             choices,
             ..
         } => {
-            let aggregate = aggregate.expect("Teamwork surfaces an aggregate constraint");
             assert_eq!(
                 aggregate.value, 1,
                 "Teamwork 1 must surface an aggregate power threshold of 1"

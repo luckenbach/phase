@@ -53077,7 +53077,7 @@ fn bomat_courier_activates_empty_handed_casting_path() {
 /// as a range, and the chosen count must bind the ability's X.
 mod x_sentinel_tap_creatures_activation_cost {
     use super::*;
-    use crate::types::ability::TapCreaturesRequirement;
+    use crate::types::ability::{TapCreaturesRequirement, TapCreaturesSelectionMode};
 
     /// Glacian, Powerstone Engineer's verbatim Oracle text, fetched from
     /// Scryfall (oracle_id `e96ce18e-b002-4b5b-9560-c1634320e164`). Verbatim,
@@ -53183,8 +53183,14 @@ mod x_sentinel_tap_creatures_activation_cost {
         obj.power = Some(3);
         obj.toughness = Some(6);
         obj.summoning_sick = false;
+        // The returned index must be the ability's position on the OBJECT, not
+        // its position within the freshly-parsed list. These coincide only while
+        // `obj.abilities` happens to start empty — an implicit assumption that
+        // would silently mis-target the activation if `create_object` ever seeds
+        // a baseline ability.
+        let existing_ability_count = obj.abilities.len();
         Arc::make_mut(&mut obj.abilities).extend(parsed.abilities.iter().cloned());
-        (source, index)
+        (source, existing_ability_count + index)
     }
 
     /// CR 107.3a: X=0 is a legal choice, so the pre-announcement affordability
@@ -53243,7 +53249,10 @@ mod x_sentinel_tap_creatures_activation_cost {
         match &state.waiting_for {
             WaitingFor::PayCost {
                 player,
-                kind: PayCostKind::TapCreatures { aggregate: None },
+                kind:
+                    PayCostKind::TapCreatures {
+                        mode: TapCreaturesSelectionMode::VariableX,
+                    },
                 choices,
                 count,
                 min_count,
@@ -53298,7 +53307,9 @@ mod x_sentinel_tap_creatures_activation_cost {
                 matches!(
                     state.waiting_for,
                     WaitingFor::PayCost {
-                        kind: PayCostKind::TapCreatures { aggregate: None },
+                        kind: PayCostKind::TapCreatures {
+                            mode: TapCreaturesSelectionMode::VariableX,
+                        },
                         ..
                     }
                 ),
@@ -53342,28 +53353,45 @@ mod x_sentinel_tap_creatures_activation_cost {
             },
         )
         .expect_err("selecting more entries than eligible artifacts must be rejected");
+        // Prove the CEILING is what fired, not some other rejection: the range
+        // check's own message names the advertised `[0, 3]` window. A bare
+        // `InvalidAction(_)` assertion would also pass if the duplicate entry
+        // tripped an unrelated guard first.
+        let EngineError::InvalidAction(message) = &err else {
+            panic!("over-max selection must be an InvalidAction, got {err:?}");
+        };
         assert!(
-            matches!(err, EngineError::InvalidAction(_)),
-            "over-max selection must be an InvalidAction, got {err:?}"
+            message.contains("between 0 and 3 creature(s)"),
+            "the ceiling must reject with the advertised [0, eligible] window, got {message:?}"
         );
         assert!(
             !state.objects[&artifacts[2]].tapped,
             "a rejected selection must not tap anything"
         );
 
-        // An ineligible object (a tapped artifact) is still refused.
+        // An object outside the advertised choice set (created AFTER the prompt
+        // was published, so it is untapped and artifact-typed but never offered)
+        // is still refused. Deliberately sized at exactly 3 entries — two real
+        // choices plus the latecomer — so this stays INSIDE the `[0, 3]` ceiling
+        // and can only be rejected by the eligibility check.
         let (mut state, artifacts) = activated_fixture();
         let ineligible =
             create_untapped_artifact(&mut state, PlayerId(0), CardId(7_399), "Latecomer");
-        let mut with_ineligible = artifacts.clone();
-        with_ineligible.push(ineligible);
-        apply_as_current(
+        let with_ineligible = vec![artifacts[0], artifacts[1], ineligible];
+        let err = apply_as_current(
             &mut state,
             GameAction::SelectCards {
                 cards: with_ineligible,
             },
         )
         .expect_err("an object outside the advertised choices must be refused");
+        let EngineError::InvalidAction(message) = &err else {
+            panic!("an ineligible selection must be an InvalidAction, got {err:?}");
+        };
+        assert!(
+            message.contains("not eligible"),
+            "the ELIGIBILITY check must be what fired, not the ceiling, got {message:?}"
+        );
     }
 
     /// CR 107.3a: the payment count IS X for the rest of the activation. This
@@ -53534,7 +53562,10 @@ mod x_sentinel_tap_creatures_activation_cost {
 
         match &state.waiting_for {
             WaitingFor::PayCost {
-                kind: PayCostKind::TapCreatures { aggregate: None },
+                kind:
+                    PayCostKind::TapCreatures {
+                        mode: TapCreaturesSelectionMode::VariableX,
+                    },
                 choices,
                 count,
                 min_count,
@@ -53637,7 +53668,10 @@ mod x_sentinel_tap_creatures_activation_cost {
         .expect("activation must surface the tap-cost prompt");
         match &state.waiting_for {
             WaitingFor::PayCost {
-                kind: PayCostKind::TapCreatures { aggregate: None },
+                kind:
+                    PayCostKind::TapCreatures {
+                        mode: TapCreaturesSelectionMode::Fixed,
+                    },
                 count,
                 min_count,
                 ..
@@ -53732,5 +53766,636 @@ mod x_sentinel_tap_creatures_activation_cost {
         );
         assert_eq!(state.players[0].hand.len(), hand_before);
         assert_eq!(state.players[0].graveyard.len(), graveyard_before);
+    }
+}
+
+/// CR 107.3a + CR 208.1 + CR 702.194a — the AGGREGATE (Crew/Saddle/Teamwork)
+/// `TapCreatures` cost must never redefine the spell's X.
+///
+/// This is the human reviewer's blocking finding, made observable end-to-end.
+/// The aggregate form legitimately publishes `min_count == 0` (any subset whose
+/// total power clears the threshold is a complete payment, CR 208.1), so the
+/// pre-fix `if min_count == 0 { set_chosen_x_recursive(chosen.len()) }` guard
+/// silently rewrote the spell's X to the number of creatures the player happened
+/// to tap.
+///
+/// Production route: `GameAction::CastSpell` → `DecideOptionalCost{pay:true}` →
+/// `pay_additional_cost_with_source`'s `Aggregate` sub-arm →
+/// `WaitingFor::PayCost` → `handle_tap_creatures_for_spell_cost` (the fixed
+/// line) → `ChooseXValue` → `ManaPayment` → resolution.
+#[cfg(test)]
+mod aggregate_tap_cost_does_not_clobber_chosen_x {
+    use super::*;
+    use crate::game::scenario::{GameRunner, GameScenario, P0};
+    use crate::types::ability::TapCreaturesSelectionMode;
+    use crate::types::game_state::CastPaymentMode;
+
+    /// A Teamwork-3 spell whose BODY consumes X, so the spell's X is directly
+    /// observable as a life delta after resolution (life avoids any library or
+    /// hand-size coupling that could mask the value). Heroic-Teamwork-shaped
+    /// (`Aggregate { TotalPower, GE, 3 }`) reminder text, verbatim from the real
+    /// keyword's Oracle wording, composed with an `{X}` mana cost.
+    const TEAMWORK_X_DRAW: &str = "Teamwork 3 (As an additional cost to cast this spell, you may \
+         tap any number of creatures you control with total power 3 or more.)\nYou gain X life.";
+
+    /// Build the fixture: one 3/3 (the sole eligible Teamwork tapper, power 3
+    /// clears Teamwork 3 by itself), enough lands to pay a large X, and the
+    /// `{X}` Teamwork spell in hand. Returns `(runner, spell_id, hand_before)`.
+    fn setup(lands: usize) -> (GameRunner, ObjectId, i32) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_creature(P0, "Bear", 3, 3);
+        for _ in 0..lands {
+            scenario.add_basic_land(P0, ManaColor::Green);
+        }
+        let mut builder =
+            scenario.add_spell_to_hand_from_oracle(P0, "Rallying Draw", false, TEAMWORK_X_DRAW);
+        builder.with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::X],
+            generic: 0,
+        });
+        let spell = builder.id();
+        let runner = scenario.build();
+        let life_before = runner.state().players[0].life;
+        (runner, spell, life_before)
+    }
+
+    /// Cast the spell, opt IN to the Teamwork cost, tap the single 3/3 to pay it,
+    /// announce X, and resolve. Returns the life gained.
+    ///
+    /// `tapped_seen` records how many creatures the aggregate payment actually
+    /// tapped, so the caller can prove the tapped count and the announced X are
+    /// genuinely different numbers (otherwise the assertion would be vacuous).
+    fn cast_pay_teamwork_and_resolve(
+        runner: &mut GameRunner,
+        spell: ObjectId,
+        x: u32,
+        life_before: i32,
+    ) -> (i32, i32) {
+        let card_id = runner.state().objects[&spell].card_id;
+        runner
+            .act(GameAction::CastSpell {
+                object_id: spell,
+                card_id,
+                targets: vec![],
+                payment_mode: CastPaymentMode::Auto,
+            })
+            .expect("casting the teamwork X spell must be accepted");
+
+        let mut tapped_seen = 0usize;
+        let mut reached_aggregate_window = false;
+        for _ in 0..24 {
+            if runner.state().stack.is_empty() && tapped_seen > 0 {
+                break;
+            }
+            match runner.state().waiting_for.clone() {
+                WaitingFor::ChooseXValue { .. } => {
+                    runner
+                        .act(GameAction::ChooseX { value: x })
+                        .expect("announcing X must be accepted");
+                }
+                WaitingFor::OptionalCostChoice { .. } => {
+                    runner
+                        .act(GameAction::DecideOptionalCost { pay: true })
+                        .expect("opting to pay teamwork must be accepted");
+                }
+                WaitingFor::PayCost {
+                    kind:
+                        PayCostKind::TapCreatures {
+                            mode: TapCreaturesSelectionMode::Aggregate(aggregate),
+                        },
+                    choices,
+                    min_count,
+                    ..
+                } => {
+                    // Positive reach guard: this really is the AGGREGATE arm with
+                    // the zero floor the pre-fix code misread as "this is X".
+                    assert_eq!(
+                        aggregate.value, 3,
+                        "reach guard: the fixture must surface the Teamwork 3 threshold"
+                    );
+                    assert_eq!(
+                        min_count, 0,
+                        "reach guard: the aggregate form's floor IS 0 — the exact signal the \
+                         pre-fix guard mistook for an X-sentinel"
+                    );
+                    assert_eq!(
+                        choices.len(),
+                        1,
+                        "reach guard: exactly one creature is an eligible teamwork tapper"
+                    );
+                    reached_aggregate_window = true;
+                    tapped_seen = 1;
+                    runner
+                        .act(GameAction::SelectCards {
+                            cards: vec![choices[0]],
+                        })
+                        .expect("CR 208.1: a single 3-power creature satisfies Teamwork 3");
+                }
+                _ => {
+                    runner
+                        .act(GameAction::PassPriority)
+                        .expect("advancing the cast/resolution must not error");
+                }
+            }
+        }
+        assert!(
+            reached_aggregate_window,
+            "reach guard: the cast never reached the aggregate tap-creatures payment"
+        );
+        assert!(
+            runner.state().stack.is_empty(),
+            "the spell must fully resolve"
+        );
+        let gained = runner.state().players[0].life - life_before;
+        (gained, tapped_seen as i32)
+    }
+
+    /// Announce X=2, pay Teamwork 3 by tapping ONE 3/3.
+    ///
+    /// Reverting the `matches!(mode, TapCreaturesSelectionMode::VariableX)` guard
+    /// in `handle_tap_creatures_for_spell_cost` back to `min_count == 0` rebinds
+    /// the spell's X to the tapped-creature count, and the `drawn == 2` assertion
+    /// below fails.
+    #[test]
+    fn aggregate_teamwork_payment_preserves_x_of_two() {
+        let (mut runner, spell, life_before) = setup(6);
+        let (gained, tapped) = cast_pay_teamwork_and_resolve(&mut runner, spell, 2, life_before);
+        assert_ne!(
+            gained, tapped,
+            "the fixture must keep the announced X and the tapped count distinct, or this \
+             assertion could not discriminate"
+        );
+        assert_eq!(
+            gained, 2,
+            "CR 107.3a: the spell's X (2) must survive the aggregate tap payment — paying by \
+             tapping 1 creature must not silently rewrite X to 1"
+        );
+    }
+
+    /// Sibling: the same fixture with a DIFFERENT X proves the assertion above
+    /// tracks the real announcement rather than a coincidental constant.
+    #[test]
+    fn aggregate_teamwork_payment_preserves_x_of_three() {
+        let (mut runner, spell, life_before) = setup(6);
+        let (gained, tapped) = cast_pay_teamwork_and_resolve(&mut runner, spell, 3, life_before);
+        assert_ne!(gained, tapped, "X and the tapped count must stay distinct");
+        assert_eq!(gained, 3, "the spell's X (3) must survive unchanged");
+    }
+}
+
+/// CR 107.3a + CR 605.1a — Hazel of the Rootbloom's X-sentinel MANA-ability tap
+/// cost, end to end.
+///
+/// `{T}, Pay 2 life, Tap X untapped tokens you control: Add X mana in any
+/// combination of colors.` This card is unactivatable without all three
+/// mana-ability fixes landing together:
+///
+/// * registration (`tap_creature_cost_choice` + its `advance_mana_ability_activation`
+///   caller) compared `creatures.len() < u32::MAX` and always failed;
+/// * completion (`handle_tap_creatures_for_mana_ability`) demanded an exact
+///   `u32::MAX`-sized selection and never bound `chosen_x`;
+/// * cost application (`pay_mana_ability_cost_with_choices`) looped
+///   `0..u32::MAX` over a selection only a few entries long.
+#[cfg(test)]
+mod hazel_x_sentinel_mana_ability {
+    use super::*;
+    use crate::game::scenario::{GameRunner, GameScenario, P0};
+    use crate::types::ability::TapCreaturesSelectionMode;
+
+    /// Hazel of the Rootbloom's verbatim mana ability (checked against
+    /// `data/card-data.json`). Only the activated mana ability is needed; the
+    /// end-step trigger is irrelevant to the cost path and is omitted so the
+    /// fixture cannot accidentally resolve through it.
+    const HAZEL_MANA_ABILITY: &str =
+        "{T}, Pay 2 life, Tap X untapped tokens you control: Add X mana in any combination of \
+         colors.";
+
+    /// Build Hazel on the battlefield plus `tokens` untapped token creatures.
+    /// Returns `(runner, hazel_id, ability_index, token_ids)`.
+    fn setup(tokens: usize) -> (GameRunner, ObjectId, usize, Vec<ObjectId>) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let hazel = scenario
+            .add_creature_from_oracle(P0, "Hazel of the Rootbloom", 3, 3, HAZEL_MANA_ABILITY)
+            .id();
+        let token_ids: Vec<ObjectId> = (0..tokens)
+            .map(|i| {
+                scenario
+                    .add_creature(P0, &format!("Squirrel {i}"), 1, 1)
+                    .id()
+            })
+            .collect();
+        let mut runner = scenario.build();
+        for id in &token_ids {
+            let obj = runner.state_mut().objects.get_mut(id).unwrap();
+            obj.is_token = true;
+            obj.tapped = false;
+            obj.summoning_sick = false;
+        }
+        {
+            let obj = runner.state_mut().objects.get_mut(&hazel).unwrap();
+            obj.summoning_sick = false;
+            obj.tapped = false;
+        }
+
+        // Positive reach guard: the parsed cost really is the u32::MAX
+        // X-sentinel `TapCreatures` leg, not a fixed count. Without this the
+        // tests below could silently exercise an entirely different branch.
+        let index = runner.state().objects[&hazel]
+            .abilities
+            .iter()
+            .position(|a| {
+                a.cost
+                    .as_ref()
+                    .and_then(crate::game::casting::find_tap_creatures_cost)
+                    .is_some_and(|(requirement, _)| {
+                        requirement.selection_mode() == TapCreaturesSelectionMode::VariableX
+                    })
+            })
+            .expect("Hazel's Oracle text must parse to an X-sentinel TapCreatures mana ability");
+        (runner, hazel, index, token_ids)
+    }
+
+    /// CR 107.3a: X=0 is a legal announcement, so Hazel must be activatable even
+    /// with ZERO untapped tokens.
+    ///
+    /// Reverting Site 7 (`creatures.len() < min_count` back to
+    /// `creatures.len() < count`) makes this `Err("Not enough untapped creatures
+    /// to pay mana ability cost")` on every board — the permanent-unactivatability
+    /// bug this card shipped with.
+    #[test]
+    fn hazel_is_activatable_with_zero_eligible_tokens() {
+        let (mut runner, hazel, index, tokens) = setup(0);
+        assert!(
+            tokens.is_empty(),
+            "reach guard: the fixture must have zero eligible tokens"
+        );
+
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: hazel,
+                ability_index: index,
+            })
+            .expect(
+                "CR 107.3a: X=0 is legal, so a 'Tap X untapped tokens you control' mana ability \
+                 must be activatable with no eligible tokens",
+            );
+    }
+
+    // ------------------------------------------------------------------
+    // BLOCKED — two production defects outside this plan's scope prevent the
+    // Hazel end-to-end tests (Verification Matrix row 8: "activate Hazel with 3
+    // eligible tokens, select 2, resolve, assert 2 mana lands in the pool") from
+    // being written honestly. Both were found by driving the real pipeline; both
+    // are described in the implementation report. Neither is fixed here, so no
+    // test claims the end-to-end unlock:
+    //
+    //  A. `advance_mana_ability_selection_cursor` (`mana_abilities.rs`) does
+    //     `cursor.next_tapper += requirement.fixed_count()`, i.e. `+= u32::MAX`
+    //     for an X-sentinel cost. `ensure_mana_ability_selection_cursor_consumed`
+    //     then rejects the activation with "Too many creatures selected for mana
+    //     ability cost". (The plan traced only the `.skip()` consumer of
+    //     `next_tapper` and concluded this site was harmless; it is not.)
+    //
+    //  B. `advance_mana_ability_activation` gates tap-cost registration on
+    //     `pending.chosen_tappers.is_empty()` as a "no selection yet" sentinel.
+    //     For a `VariableX` cost an empty selection is a LEGAL, COMPLETE X=0
+    //     payment, so the same `PayCost` window is re-surfaced forever.
+    //     Distinguishing the two states needs a state-representation decision
+    //     this plan never scoped.
+    // ------------------------------------------------------------------
+
+    /// Hostile: an over-ceiling selection is still refused. The fix widens the
+    /// window to `[0, eligible]`; it does not remove the ceiling.
+    #[test]
+    fn hazel_rejects_a_selection_above_the_eligible_ceiling() {
+        let (mut runner, hazel, index, tokens) = setup(2);
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: hazel,
+                ability_index: index,
+            })
+            .expect("activation must surface the tap-cost prompt");
+
+        let err = runner
+            .act(GameAction::SelectCards {
+                cards: vec![tokens[0], tokens[1], tokens[0]],
+            })
+            .expect_err("selecting more entries than eligible tokens must be rejected");
+        // Prove the RANGE CHECK fired, not some unrelated guard: its message
+        // names the advertised `[0, 2]` window.
+        let EngineError::InvalidAction(message) = &err else {
+            panic!("an over-ceiling selection must be an InvalidAction, got {err:?}");
+        };
+        assert!(
+            message.contains("between 0 and 2 creature(s)"),
+            "the ceiling must reject with the advertised [0, eligible] window, got {message:?}"
+        );
+        assert!(
+            tokens.iter().all(|id| !runner.state().objects[id].tapped),
+            "a rejected selection must not tap anything"
+        );
+    }
+}
+
+/// CR 601.2h ("Partial payments are not allowed") — the SPELL-CAST ADDITIONAL
+/// COST registration site (`pay_additional_cost_with_source`) hardcoded
+/// `min_count: 0` for its fixed-`Count` sub-arm.
+///
+/// This is a live, currently-exploitable defect on a real printed card: Battle
+/// Screech's `Flashback—Tap three untapped white creatures you control.` A
+/// player could pay it by tapping ONE or TWO white creatures, because the
+/// hardcoded floor made every under-count selection legal once the shared
+/// validator (`pay_tap_creatures_selection`) moved from an exact-match check to
+/// a `[min_count, count]` range check.
+///
+/// Production route: `handle_cast_spell` (flashback variant) →
+/// `pay_additional_cost_with_source`'s `TapCreatures`/`Count` sub-arm →
+/// `WaitingFor::PayCost` → `handle_tap_creatures_for_spell_cost` →
+/// `pay_tap_creatures_selection`.
+#[cfg(test)]
+mod battle_screech_flashback_partial_payment {
+    use super::*;
+    use crate::types::ability::TapCreaturesSelectionMode;
+
+    /// Battle Screech's REAL flashback cost shape, taken from
+    /// `data/card-data.json`: `TapCreatures { Count { count: 3 }, white
+    /// creatures you control }`.
+    fn install_battle_screech(state: &mut GameState) -> (ObjectId, CardId) {
+        let obj_id = add_flashback_instant_to_graveyard(
+            state,
+            PlayerId(0),
+            ManaCost::NoCost,
+            ManaCost::Cost {
+                generic: 1,
+                shards: vec![ManaCostShard::White],
+            },
+        );
+        let obj = state.objects.get_mut(&obj_id).unwrap();
+        obj.base_keywords.clear();
+        obj.keywords.clear();
+        obj.base_keywords
+            .push(Keyword::Flashback(FlashbackCost::NonMana(
+                AbilityCost::TapCreatures {
+                    requirement: TapCreaturesRequirement::count(3),
+                    filter: TargetFilter::Typed(TypedFilter::creature()),
+                },
+            )));
+        obj.keywords = obj.base_keywords.clone();
+        (obj_id, obj.card_id)
+    }
+
+    fn add_untapped_creature(state: &mut GameState, index: u64) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(8_300 + index),
+            PlayerId(0),
+            format!("Bird Token {index}"),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.power = Some(1);
+        obj.toughness = Some(1);
+        obj.tapped = false;
+        obj.summoning_sick = false;
+        id
+    }
+
+    /// Reach the flashback tap-cost window and return `(min_count, count,
+    /// choices)`. The `min_count` returned here is the regression's direct shape
+    /// discriminator: it was hardcoded `0`.
+    fn reach_flashback_tap_window(state: &mut GameState) -> (usize, usize, Vec<ObjectId>) {
+        let (obj_id, card_id) = install_battle_screech(state);
+        let creatures: Vec<ObjectId> = (0..3).map(|i| add_untapped_creature(state, i)).collect();
+        assert_eq!(creatures.len(), 3, "reach guard: three eligible tappers");
+
+        state.waiting_for = handle_cast_spell(state, PlayerId(0), obj_id, card_id, &mut Vec::new())
+            .expect("casting Battle Screech via flashback must surface the tap cost");
+
+        match &state.waiting_for {
+            WaitingFor::PayCost {
+                kind:
+                    PayCostKind::TapCreatures {
+                        mode: TapCreaturesSelectionMode::Fixed,
+                    },
+                choices,
+                count,
+                min_count,
+                ..
+            } => (*min_count, *count, choices.clone()),
+            other => panic!("expected a fixed TapCreatures PayCost window, got {other:?}"),
+        }
+    }
+
+    /// The BEHAVIORAL discriminator. Reverting the `sacrifice_cost_bounds`
+    /// derivation in `pay_additional_cost_with_source` restores `min_count: 0`,
+    /// which makes the two-of-three selection below return `Ok` and actually tap
+    /// two creatures to pay a "tap three" cost — a direct CR 601.2h violation.
+    #[test]
+    fn battle_screech_flashback_rejects_two_of_three() {
+        let mut state = setup_game_at_main_phase();
+        let (min_count, count, choices) = reach_flashback_tap_window(&mut state);
+
+        // Positive reach guard: the partial selection really is drawn from the
+        // offered choice set, so the rejection is the FLOOR firing and not an
+        // eligibility miss.
+        let partial = vec![choices[0], choices[1]];
+        assert!(
+            partial.iter().all(|id| choices.contains(id)),
+            "reach guard: the partial selection must be eligible"
+        );
+
+        let err = apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: partial.clone(),
+            },
+        )
+        .expect_err("CR 601.2h: tapping 2 of a required 3 creatures is a partial payment");
+        let EngineError::InvalidAction(message) = &err else {
+            panic!("a partial payment must be an InvalidAction, got {err:?}");
+        };
+        assert!(
+            message.contains("exactly 3 creature(s)"),
+            "the exact-count floor must be what rejected the payment, got {message:?}"
+        );
+        assert!(
+            partial.iter().all(|id| !state.objects[id].tapped),
+            "a rejected partial payment must not tap anything"
+        );
+
+        // Secondary shape pin on the emitted window.
+        assert_eq!(
+            (min_count, count),
+            (3, 3),
+            "CR 601.2h: a fixed `count: 3` additional cost is an exact-3 window"
+        );
+    }
+
+    /// Sibling: the legal full payment still works, so the fix narrows the
+    /// window rather than breaking the card.
+    #[test]
+    fn battle_screech_flashback_accepts_three_of_three() {
+        let mut state = setup_game_at_main_phase();
+        let (_min_count, _count, choices) = reach_flashback_tap_window(&mut state);
+
+        apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: choices.clone(),
+            },
+        )
+        .expect("CR 601.2h: tapping exactly the required 3 creatures is a legal full payment");
+        assert!(
+            choices.iter().all(|id| state.objects[id].tapped),
+            "a full payment must tap every chosen creature"
+        );
+    }
+
+    /// Hostile boundary: an EMPTY selection is refused too. Under the hardcoded
+    /// `min_count: 0` this paid a "tap three creatures" cost by tapping nothing.
+    #[test]
+    fn battle_screech_flashback_rejects_empty_selection() {
+        let mut state = setup_game_at_main_phase();
+        let (_min_count, _count, choices) = reach_flashback_tap_window(&mut state);
+
+        let err = apply_as_current(&mut state, GameAction::SelectCards { cards: vec![] })
+            .expect_err("CR 601.2h: paying a `count: 3` tap cost with zero creatures is partial");
+        assert!(
+            matches!(err, EngineError::InvalidAction(_)),
+            "an empty selection must be an InvalidAction, got {err:?}"
+        );
+        assert!(
+            choices.iter().all(|id| !state.objects[id].tapped),
+            "a rejected empty payment must not tap anything"
+        );
+    }
+}
+
+/// CR 601.2h — the FIXED-count mana-ability tap cost (Springleaf-Drum-shaped
+/// `{T}, Tap an untapped creature you control: Add one mana of any color.`) must
+/// still reject a partial payment after `handle_tap_creatures_for_mana_ability`
+/// swapped its exact-match check for a `[min_count, count]` range check.
+///
+/// This is the "correct by accident" sibling of the X-sentinel work: it needs no
+/// behavior change, but it MUST stay correct across that rewrite, or the range
+/// check would silently let every fixed mana-ability tap cost be paid with an
+/// empty selection.
+#[cfg(test)]
+mod fixed_mana_ability_tap_cost_rejects_partial_payment {
+    use super::*;
+    use crate::game::scenario::{GameRunner, GameScenario, P0};
+    use crate::types::ability::TapCreaturesSelectionMode;
+
+    const SPRINGLEAF_SHAPED: &str =
+        "{T}, Tap an untapped creature you control: Add one mana of any color.";
+
+    fn setup() -> (GameRunner, ObjectId, usize, Vec<ObjectId>) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let source = scenario
+            .add_artifact_from_oracle(P0, "Springleaf Drum", SPRINGLEAF_SHAPED)
+            .id();
+        let creatures: Vec<ObjectId> = (0..2)
+            .map(|i| scenario.add_creature(P0, &format!("Helper {i}"), 1, 1).id())
+            .collect();
+        let mut runner = scenario.build();
+        for id in &creatures {
+            let obj = runner.state_mut().objects.get_mut(id).unwrap();
+            obj.tapped = false;
+            obj.summoning_sick = false;
+        }
+        {
+            let obj = runner.state_mut().objects.get_mut(&source).unwrap();
+            obj.tapped = false;
+            obj.summoning_sick = false;
+        }
+        // Positive reach guard: this must be the FIXED shape, not the sentinel.
+        let index = runner.state().objects[&source]
+            .abilities
+            .iter()
+            .position(|a| {
+                a.cost
+                    .as_ref()
+                    .and_then(crate::game::casting::find_tap_creatures_cost)
+                    .is_some_and(|(requirement, _)| {
+                        requirement.selection_mode() == TapCreaturesSelectionMode::Fixed
+                    })
+            })
+            .expect("the fixture must parse to a fixed-count TapCreatures mana ability");
+        (runner, source, index, creatures)
+    }
+
+    /// Reverting `handle_tap_creatures_for_mana_ability`'s range check to accept
+    /// anything at or below the ceiling would make the empty selection legal —
+    /// paying a "tap an untapped creature you control" cost by tapping nothing.
+    #[test]
+    fn empty_selection_is_rejected_for_a_fixed_count_one_cost() {
+        let (mut runner, source, index, creatures) = setup();
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: index,
+            })
+            .expect("activation must surface the tap-cost prompt");
+
+        // Shape pin: a fixed `count: 1` cost is an exact-1 window even with two
+        // eligible creatures on the battlefield.
+        match runner.state().waiting_for.clone() {
+            WaitingFor::PayCost {
+                kind:
+                    PayCostKind::TapCreatures {
+                        mode: TapCreaturesSelectionMode::Fixed,
+                    },
+                min_count,
+                count,
+                ..
+            } => assert_eq!(
+                (min_count, count),
+                (1, 1),
+                "CR 601.2h: a fixed `count: 1` cost has no freedom"
+            ),
+            other => panic!("expected a fixed TapCreatures PayCost window, got {other:?}"),
+        }
+
+        let err = runner
+            .act(GameAction::SelectCards { cards: vec![] })
+            .expect_err("CR 601.2h: an empty selection is a partial payment");
+        let EngineError::InvalidAction(message) = &err else {
+            panic!("an empty selection must be an InvalidAction, got {err:?}");
+        };
+        assert!(
+            message.contains("exactly 1 creature(s)"),
+            "the exact-count floor must be what rejected the payment, got {message:?}"
+        );
+        assert!(
+            creatures
+                .iter()
+                .all(|id| !runner.state().objects[id].tapped),
+            "a rejected payment must not tap anything"
+        );
+    }
+
+    /// Sibling: the legal one-creature payment still works.
+    #[test]
+    fn single_creature_selection_is_accepted() {
+        let (mut runner, source, index, creatures) = setup();
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: index,
+            })
+            .expect("activation must surface the tap-cost prompt");
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![creatures[0]],
+            })
+            .expect("tapping exactly 1 creature satisfies a `count: 1` cost");
+        assert!(
+            runner.state().objects[&creatures[0]].tapped,
+            "the chosen creature must be tapped by the accepted payment"
+        );
     }
 }
