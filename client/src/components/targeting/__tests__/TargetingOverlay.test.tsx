@@ -274,6 +274,53 @@ describe("TargetingOverlay", () => {
     });
   });
 
+  it("confirms an X-style tap cost paid below the maximum eligible count", () => {
+    const dispatch = vi.fn().mockResolvedValue([]);
+    const gameState = createGameState({
+      objects: buildObjectMap(
+        buildGameObjectWithCoreTypes(["Creature"], { id: 7, name: "Memnite" }),
+        buildGameObjectWithCoreTypes(["Creature"], { id: 8, name: "Ornithopter" }),
+        buildGameObjectWithCoreTypes(["Creature"], { id: 9, name: "Phyrexian Walker" }),
+      ),
+      waiting_for: {
+        type: "PayCost",
+        data: {
+          player: 0,
+          kind: { type: "TapCreatures" },
+          choices: [7, 8, 9],
+          // The engine offers X = 1..3 here; paying X = 1 must be confirmable.
+          count: 3,
+          min_count: 1,
+          resume: { type: "Resolution" },
+        },
+      },
+    });
+
+    act(() => {
+      useGameStore.setState({
+        gameState,
+        waitingFor: gameState.waiting_for,
+        dispatch,
+      });
+    });
+
+    render(<TargetingOverlay />);
+
+    act(() => {
+      useUiStore.setState({ selectedCardIds: [7] });
+    });
+
+    const confirm = screen.getByRole("button", { name: "Confirm (1/3)" });
+    expect(confirm).not.toBeDisabled();
+
+    fireEvent.click(confirm);
+
+    expect(dispatch).toHaveBeenCalledWith({
+      type: "SelectCards",
+      data: { cards: [7] },
+    });
+  });
+
   it("confirms aggregate-power board choices when the selected power is high enough", () => {
     const dispatch = vi.fn().mockResolvedValue([]);
     const gameState = createGameState({

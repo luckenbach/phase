@@ -521,7 +521,7 @@ export function getBoardChoiceView(
             player: waitingFor.data.player,
             objectIds: waitingFor.data.choices,
             intent: "tap",
-            selection: confirmedCountSelection(waitingFor.data.count, waitingFor.data.count),
+            selection: confirmedCountSelection(waitingFor.data.count, waitingFor.data.min_count),
             response: { type: "SelectCards" },
             sourceId: payCostSourceId(waitingFor.data),
             cancelAction: waitingFor.data.resume.type === "Spell" ? { type: "CancelCast" } : undefined,

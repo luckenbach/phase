@@ -592,7 +592,12 @@ export function TargetingOverlay() {
           {!boardChoice && isTapCreatureChoice && (
             <button
               onClick={handleConfirmTap}
-              disabled={selectedCardIds.length !== waitingFor.data.count}
+              // The engine supplies the legal payment range; an X-style tap cost has
+              // min_count < count, so any in-range selection confirms.
+              disabled={
+                selectedCardIds.length < waitingFor.data.min_count ||
+                selectedCardIds.length > waitingFor.data.count
+              }
               className="pointer-events-auto rounded-lg bg-emerald-700 px-6 py-2 font-semibold text-white shadow-lg transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-white/50"
             >
               {t("targeting.confirmTap", { selected: selectedCardIds.length, count: waitingFor.data.count })}

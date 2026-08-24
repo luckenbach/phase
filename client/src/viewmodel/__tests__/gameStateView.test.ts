@@ -590,6 +590,40 @@ describe("getBoardChoiceView", () => {
     });
   });
 
+  it("maps an X-style TapCreatures PayCost to a range the player can under-fill", () => {
+    const waitingFor: WaitingFor = {
+      type: "PayCost",
+      data: {
+        player: 0,
+        kind: { type: "TapCreatures" },
+        choices: [4, 5, 6],
+        count: 3,
+        min_count: 1,
+        resume: { type: "Resolution" },
+      },
+    };
+
+    const choice = getBoardChoiceView(
+      waitingFor,
+      buildObjectMap(
+        buildGameObject({ id: 4, zone: "Battlefield" }),
+        buildGameObject({ id: 5, zone: "Battlefield" }),
+        buildGameObject({ id: 6, zone: "Battlefield" }),
+      ),
+    );
+
+    expect(choice).toMatchObject({
+      player: 0,
+      objectIds: [4, 5, 6],
+      intent: "tap",
+      selection: { type: "rangeCount", min: 1, max: 3 },
+    });
+    expect(choice && buildBoardChoiceAction(choice, [4])).toEqual({
+      type: "SelectCards",
+      data: { cards: [4] },
+    });
+  });
+
   it("keeps PayCost choices modal-only unless every candidate is on the battlefield", () => {
     const waitingFor: WaitingFor = {
       type: "PayCost",

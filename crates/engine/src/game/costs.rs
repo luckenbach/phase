@@ -1164,7 +1164,8 @@ fn pay_ability_cost_inner(
                             "eligible creatures do not satisfy tap-creatures aggregate cost",
                         ));
                     }
-                    // CR 208.1 + CR 601.2f: the aggregate (Crew/Saddle/Teamwork)
+                    // CR 208.1 + CR 601.2f (Crew CR 702.122a / Saddle CR 702.171a /
+                    // Teamwork): the aggregate (Crew/Saddle/Teamwork)
                     // form taps ANY number of creatures whose total positive power
                     // satisfies the comparator, so every subset size is admissible
                     // and the floor stays 0. `pay_tap_creatures_selection`'s
@@ -3922,7 +3923,8 @@ mod tests {
         );
     }
 
-    /// CR 208.1 + CR 601.2f: the aggregate (Crew/Saddle/Teamwork) shape taps ANY
+    /// CR 208.1 + CR 601.2f (Crew CR 702.122a / Saddle CR 702.171a / Teamwork):
+    /// the aggregate (Crew/Saddle/Teamwork) shape taps ANY
     /// number of creatures whose total positive power satisfies the comparator,
     /// so its floor stays 0 — unchanged by this fix. This pins that the widened
     /// `(kind, count, min_count)` binding did not leak the fixed-count floor
