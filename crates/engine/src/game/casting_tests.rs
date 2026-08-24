@@ -54263,13 +54263,75 @@ mod battle_screech_flashback_partial_payment {
 
         let err = apply_as_current(&mut state, GameAction::SelectCards { cards: vec![] })
             .expect_err("CR 601.2h: paying a `count: 3` tap cost with zero creatures is partial");
+        let EngineError::InvalidAction(message) = &err else {
+            panic!("an empty selection must be an InvalidAction, got {err:?}");
+        };
         assert!(
-            matches!(err, EngineError::InvalidAction(_)),
-            "an empty selection must be an InvalidAction, got {err:?}"
+            message.contains("exactly 3 creature(s)"),
+            "the exact-count floor must be what rejected the payment, got {message:?}"
         );
         assert!(
             choices.iter().all(|id| !state.objects[id].tapped),
             "a rejected empty payment must not tap anything"
+        );
+    }
+
+    /// CR 118.3 + CR 601.2h: a creature spent on this payment can't be spent
+    /// again within the same payment. Without the dedup guard in
+    /// `pay_tap_creatures_selection`, `[c0, c0, c1]` has `len() == 3`, so it
+    /// satisfies the `count: 3` bounds check and every id passes the
+    /// membership check individually — the payment is accepted and taps only
+    /// TWO distinct creatures to pay a "tap three untapped white creatures"
+    /// flashback cost.
+    #[test]
+    fn battle_screech_flashback_rejects_duplicate_creature() {
+        let mut state = setup_game_at_main_phase();
+        let (min_count, count, choices) = reach_flashback_tap_window(&mut state);
+
+        let duplicated = vec![choices[0], choices[0], choices[1]];
+
+        // Positive reach guard: the submission is drawn entirely from the
+        // offered choice set and clears the count bounds, so the rejection
+        // below can only be the NEW dedup guard firing — not an eligibility
+        // miss and not the range check.
+        assert!(
+            duplicated.iter().all(|id| choices.contains(id)),
+            "reach guard: every submitted id must be an eligible choice"
+        );
+        assert_eq!(
+            duplicated.len(),
+            count,
+            "reach guard: the submission must clear the exact-count bounds check"
+        );
+        assert!(
+            duplicated.len() >= min_count,
+            "reach guard: the submission must clear the count floor"
+        );
+        let distinct: std::collections::HashSet<ObjectId> = duplicated.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            2,
+            "reach guard: the submission must cover only 2 DISTINCT creatures, so accepting it \
+             would underpay a 3-creature cost"
+        );
+
+        let err = apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: duplicated.clone(),
+            },
+        )
+        .expect_err("CR 601.2h: one creature cannot pay a tap cost twice");
+        let EngineError::InvalidAction(message) = &err else {
+            panic!("a duplicate selection must be an InvalidAction, got {err:?}");
+        };
+        assert!(
+            message.contains("Cannot tap the same creature twice"),
+            "the dedup guard must be what rejected the payment, got {message:?}"
+        );
+        assert!(
+            choices.iter().all(|id| !state.objects[id].tapped),
+            "a rejected duplicate payment must not tap anything"
         );
     }
 }

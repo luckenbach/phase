@@ -3811,21 +3811,17 @@ pub(crate) fn pay_tap_creatures_selection(
     // `Fixed`/`VariableX` are the count-bounded forms (tap a count within
     // [min_count, count]); `Aggregate(a)` is the Crew/Saddle/Teamwork form (tap
     // any number whose total positive power, CR 208.1, satisfies the advertised
-    // comparator vs `a.value`).
-    for id in chosen {
-        if !legal_creatures.contains(id) {
-            return Err(EngineError::InvalidAction(
-                "Selected creature not eligible for tapping".to_string(),
-            ));
-        }
-    }
+    // comparator vs `a.value`). Bounds/aggregate-satisfaction is checked first,
+    // mirroring `handle_sacrifice_for_cost` and
+    // `handle_tap_creatures_for_mana_ability` — the same-mechanism sibling that
+    // validates this exact `TapCreaturesSelectionMode` type for the mana-ability
+    // leg of the same cost.
     match mode {
         // CR 107.3a: `min_count < count` only for the X-sentinel shape ("Tap X
         // untapped [type] you control"), where X is chosen freely by the
-        // controller within [min_count, count] — mirrors
-        // `handle_sacrifice_for_cost`'s range check exactly. A fixed (non-X)
-        // requirement still has min_count == count, so this subsumes the
-        // prior exact-match behavior unchanged for every existing card.
+        // controller within [min_count, count]. A fixed (non-X) requirement
+        // still has min_count == count, so this subsumes the prior
+        // exact-match behavior unchanged for every existing card.
         TapCreaturesSelectionMode::Fixed | TapCreaturesSelectionMode::VariableX => {
             if chosen.len() < min_count || chosen.len() > count {
                 let requirement = if min_count == count {
@@ -3848,6 +3844,29 @@ pub(crate) fn pay_tap_creatures_selection(
                     aggregate.comparator, aggregate.value
                 )));
             }
+        }
+    }
+
+    // CR 118.3 + CR 601.2h: one creature can only pay for itself once — a
+    // creature already spent on this payment can't be spent again within the
+    // same payment. Checked unconditionally, for every `mode`, BEFORE the tap
+    // loop: the `Aggregate` arm above sums `chosen` with no dedup
+    // (`tap_creatures_total_power` — a duplicated id would double-count its
+    // power, letting `[a, a]` on a power-2 creature satisfy a "total power >=
+    // 4" requirement with only one real creature), so this loop is what
+    // actually protects the aggregate case, not the match arm's own check.
+    // Combined into a single pass with the membership check, mirroring
+    // `handle_tap_creatures_for_mana_ability`.
+    for (index, id) in chosen.iter().enumerate() {
+        if !legal_creatures.contains(id) {
+            return Err(EngineError::InvalidAction(
+                "Selected creature not eligible for tapping".to_string(),
+            ));
+        }
+        if chosen[..index].contains(id) {
+            return Err(EngineError::InvalidAction(
+                "Cannot tap the same creature twice for a tap-creatures cost".to_string(),
+            ));
         }
     }
 
@@ -4885,7 +4904,7 @@ pub(crate) fn surface_next_unpaid_interactive_activation_cost(
     }
 
     if let Some((requirement, filter)) = super::casting::find_tap_creatures_cost(cost) {
-        // CR 107.3a + CR 208.1: compute the selection semantics once from the
+        // CR 107.3a: compute the selection semantics once from the
         // requirement and carry them verbatim to the completion handler.
         let mode = requirement.selection_mode();
         let count = requirement.fixed_count().ok_or_else(|| {
@@ -7666,7 +7685,7 @@ fn pay_additional_cost_with_source(
             // advertised comparator, so the player may select up to every
             // eligible creature.
             //
-            // CR 107.3a + CR 208.1: compute the selection semantics once from the
+            // CR 107.3a: compute the selection semantics once from the
             // requirement and carry them verbatim to the completion handler.
             let mode = requirement.selection_mode();
             let (kind, count, min_count) = match requirement {

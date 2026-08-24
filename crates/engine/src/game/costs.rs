@@ -1135,7 +1135,7 @@ fn pay_ability_cost_inner(
             // switched from an exact-match check to a `[min_count, count]`
             // range check.
             //
-            // CR 107.3a + CR 208.1: compute the selection semantics once from the
+            // CR 107.3a: compute the selection semantics once from the
             // requirement and carry them verbatim to the completion handler.
             let mode = requirement.selection_mode();
             let (kind, count, min_count) = match requirement {
@@ -3971,6 +3971,85 @@ mod tests {
             }
             other => panic!("expected an aggregate TapCreatures PayCost prompt, got {other:?}"),
         }
+    }
+
+    /// CR 118.3 + CR 601.2h: the aggregate arm is the case the dedup guard
+    /// actually protects. `tap_creatures_total_power` sums `chosen` with NO
+    /// dedup, so a repeated id double-counts its power: `[c0, c0]` on a
+    /// 1-power creature sums to 2 and spuriously satisfies "total power >= 2"
+    /// with only ONE real creature. Without the guard in
+    /// `pay_tap_creatures_selection` this returns `Ok(())` and taps a single
+    /// 1-power creature to pay a 2-power crew-shaped cost.
+    #[test]
+    fn resolution_aggregate_tap_cost_rejects_duplicate_creature() {
+        let mut scenario = GameScenario::new();
+        let src = scenario.add_creature(P0, "Crewed Vehicle", 1, 1).id();
+        scenario.add_creature(P0, "Helper", 1, 1);
+        let ability = tap_cost_stub_ability(src);
+
+        pay_tap_cost_at_resolution(
+            &mut scenario.state,
+            src,
+            &ability,
+            TapCreaturesRequirement::total_power_at_least(2),
+        );
+
+        let (min_count, count, choices) = emitted_tap_cost_window(&scenario.state);
+        let mode = match &scenario.state.waiting_for {
+            WaitingFor::PayCost {
+                kind: PayCostKind::TapCreatures { mode },
+                ..
+            } => *mode,
+            other => panic!("expected a TapCreatures PayCost prompt, got {other:?}"),
+        };
+        assert!(
+            matches!(mode, TapCreaturesSelectionMode::Aggregate(_)),
+            "reach guard: this test must exercise the Aggregate arm, got {mode:?}"
+        );
+
+        // Positive reach guard: ONE creature's power alone does not satisfy the
+        // threshold, but the duplicated pair sums to exactly the threshold — so
+        // the aggregate check PASSES on this submission and the rejection below
+        // can only be the dedup guard firing, not "does not satisfy".
+        let single = [choices[0]];
+        assert_eq!(
+            crate::game::casting_costs::tap_creatures_total_power(&scenario.state, &single),
+            1,
+            "reach guard: one eligible creature contributes only 1 power"
+        );
+        let duplicated = vec![choices[0], choices[0]];
+        assert_eq!(
+            crate::game::casting_costs::tap_creatures_total_power(&scenario.state, &duplicated),
+            2,
+            "reach guard: the duplicate double-counts to exactly the threshold, so the aggregate \
+             check cannot be what rejects this submission"
+        );
+        assert!(
+            duplicated.iter().all(|id| choices.contains(id)),
+            "reach guard: the submitted id must be an eligible choice"
+        );
+
+        let err = crate::game::casting_costs::pay_tap_creatures_selection(
+            &mut scenario.state,
+            min_count,
+            count,
+            mode,
+            &choices,
+            &duplicated,
+            &mut Vec::new(),
+        )
+        .expect_err("CR 601.2h: one creature cannot pay an aggregate tap cost twice");
+        let EngineError::InvalidAction(message) = &err else {
+            panic!("a duplicate selection must be an InvalidAction, got {err:?}");
+        };
+        assert!(
+            message.contains("Cannot tap the same creature twice"),
+            "the dedup guard must reject this, not the aggregate comparator, got {message:?}"
+        );
+        assert!(
+            choices.iter().all(|id| !scenario.state.objects[id].tapped),
+            "a rejected duplicate payment must not tap anything"
+        );
     }
 
     /// Hostile fixture: fewer eligible creatures than the fixed requirement.

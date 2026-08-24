@@ -720,7 +720,7 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
         // — not a fixed cardinality. Evaluates through the same `satisfied_by`
         // the payment validator (`handle_tap_creatures_for_spell_cost`) uses, so
         // both seams agree on which subsets are legal. The `Fixed`/`VariableX`
-        // forms fall through to the exact-`count` selection below.
+        // forms are handled by the range arm immediately below.
         (
             WaitingFor::PayCost {
                 kind:
@@ -734,6 +734,28 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
         ) => {
             let total = crate::game::casting_costs::tap_creatures_total_power(state, chosen);
             selection_mismatch(chosen, choices, None) || !aggregate.satisfied_by(total)
+        }
+        // CR 107.3a + CR 118.3: the Fixed/VariableX tap-creatures forms honor the
+        // [min_count, count] range exactly like the Sacrifice/ExileFromZone arm
+        // above — a fixed (non-X) requirement has min_count == count, so this
+        // subsumes the exact-match case unchanged; the X-sentinel form additionally
+        // permits any count in between, letting the AI consider a non-maximal X.
+        (
+            WaitingFor::PayCost {
+                kind:
+                    PayCostKind::TapCreatures {
+                        mode: TapCreaturesSelectionMode::Fixed | TapCreaturesSelectionMode::VariableX,
+                    },
+                choices,
+                count,
+                min_count,
+                ..
+            },
+            GameAction::SelectCards { cards: chosen },
+        ) => {
+            selection_mismatch(chosen, choices, None)
+                || chosen.len() < *min_count
+                || chosen.len() > *count
         }
         // CR 118.3 + CR 605.3b: every other PayCost kind selects exactly `count`.
         (WaitingFor::PayCost { choices, count, .. }, GameAction::SelectCards { cards: chosen }) => {
@@ -2534,15 +2556,16 @@ mod tests {
     use crate::types::ability::{
         AbilityCost, AbilityDefinition, AbilityKind, ChoiceType, ContinuousModification,
         ControllerRef, Effect, FilterProp, ManaContribution, ManaProduction, QuantityExpr,
-        ResolvedAbility, SacrificeCost, SearchSelectionConstraint, StaticDefinition, TargetFilter,
-        TargetRef, TriggerDefinition, TypeFilter, TypedFilter,
+        ResolvedAbility, SacrificeCost, SearchSelectionConstraint, StaticDefinition,
+        TapCreaturesSelectionMode, TargetFilter, TargetRef, TriggerDefinition, TypeFilter,
+        TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
     use crate::types::game_state::{
-        CastingVariant, ConvokeMode, DistributionUnit, EndEffectGroupId, GameState,
-        MulliganDecisionEntry, MulliganDecisionPhase, PendingCast, PendingMulliganAction,
-        PriorityPassingMode, StackEntry, StackEntryKind, WaitingFor,
+        CastingVariant, ConvokeMode, CostResume, DistributionUnit, EndEffectGroupId, GameState,
+        MulliganDecisionEntry, MulliganDecisionPhase, PayCostKind, PendingCast,
+        PendingMulliganAction, PriorityPassingMode, StackEntry, StackEntryKind, WaitingFor,
     };
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::keywords::{Keyword, KeywordKind};
@@ -3815,6 +3838,98 @@ mod tests {
         assert!(!cheap_reject_candidate(
             &state,
             &GameAction::SelectCards { cards: choices }
+        ));
+    }
+
+    /// CR 107.3a: X=0 through X=count are all legal announcements for an
+    /// X-sentinel tap-creatures cost, so the AI's cheap rejection filter must
+    /// admit every count in `[min_count, count]`. Without the Fixed/VariableX
+    /// range arm this falls through to the generic exact-`count` PayCost arm,
+    /// which rejects every non-maximal X — the AI can never even consider
+    /// announcing a smaller X.
+    #[test]
+    fn cheap_reject_candidate_honors_variable_x_tap_creatures_range() {
+        let mut state = GameState::new_two_player(42);
+        let choices = vec![ObjectId(1), ObjectId(2), ObjectId(3)];
+        state.waiting_for = WaitingFor::PayCost {
+            player: PlayerId(0),
+            kind: PayCostKind::TapCreatures {
+                mode: TapCreaturesSelectionMode::VariableX,
+            },
+            choices: choices.clone(),
+            count: 2,
+            min_count: 0,
+            resume: CostResume::Resolution,
+        };
+
+        // X = 0, 1, 2 are all inside the advertised [0, 2] window.
+        assert!(!cheap_reject_candidate(
+            &state,
+            &GameAction::SelectCards { cards: vec![] }
+        ));
+        assert!(!cheap_reject_candidate(
+            &state,
+            &GameAction::SelectCards {
+                cards: vec![choices[0]]
+            }
+        ));
+        assert!(!cheap_reject_candidate(
+            &state,
+            &GameAction::SelectCards {
+                cards: vec![choices[0], choices[1]]
+            }
+        ));
+        // A third id exceeds the ceiling even though every id is eligible.
+        assert!(cheap_reject_candidate(
+            &state,
+            &GameAction::SelectCards {
+                cards: choices.clone()
+            }
+        ));
+        // The shared `selection_mismatch` dedup still rejects a repeated id.
+        assert!(cheap_reject_candidate(
+            &state,
+            &GameAction::SelectCards {
+                cards: vec![choices[0], choices[0]]
+            }
+        ));
+    }
+
+    /// Non-regression pin: a FIXED tap-creatures requirement has
+    /// `min_count == count`, so routing it through the new range arm must stay
+    /// behaviorally identical to the old exact-`count` fallback.
+    #[test]
+    fn cheap_reject_candidate_preserves_exact_fixed_tap_creatures_count() {
+        let mut state = GameState::new_two_player(42);
+        let choices = vec![ObjectId(1), ObjectId(2), ObjectId(3)];
+        state.waiting_for = WaitingFor::PayCost {
+            player: PlayerId(0),
+            kind: PayCostKind::TapCreatures {
+                mode: TapCreaturesSelectionMode::Fixed,
+            },
+            choices: choices.clone(),
+            count: 2,
+            min_count: 2,
+            resume: CostResume::Resolution,
+        };
+
+        assert!(!cheap_reject_candidate(
+            &state,
+            &GameAction::SelectCards {
+                cards: vec![choices[0], choices[1]]
+            }
+        ));
+        assert!(cheap_reject_candidate(
+            &state,
+            &GameAction::SelectCards {
+                cards: vec![choices[0]]
+            }
+        ));
+        assert!(cheap_reject_candidate(
+            &state,
+            &GameAction::SelectCards {
+                cards: choices.clone()
+            }
         ));
     }
 

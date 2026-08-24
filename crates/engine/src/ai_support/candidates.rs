@@ -2215,7 +2215,7 @@ pub fn candidate_actions_broad_with_probe(
         // them; measure each creature via the same current-power authority, and
         // evaluate acceptance through the same `satisfied_by` the payment
         // validator uses, so all three seams agree. The `Fixed`/`VariableX`
-        // forms fall through to the exact-`count` selection below.
+        // forms are handled by the range arm immediately below.
         WaitingFor::PayCost {
             player,
             kind:
@@ -2232,6 +2232,23 @@ pub fn candidate_actions_broad_with_probe(
             crate::game::casting_costs::tap_creature_power_contribution,
             |cards| GameAction::SelectCards { cards },
         ),
+        // CR 107.3a + CR 118.3: mirror the Sacrifice/ExileFromZone arm above — the
+        // Fixed/VariableX tap-creatures forms select any count in [min_count, count]
+        // (a fixed requirement has min_count == count, degenerating to the single
+        // exact-count candidate unchanged). Without this arm the AI can only ever
+        // consider tapping every eligible creature for an X-sentinel cost, never a
+        // smaller announced X.
+        WaitingFor::PayCost {
+            player,
+            kind:
+                PayCostKind::TapCreatures {
+                    mode: TapCreaturesSelectionMode::Fixed | TapCreaturesSelectionMode::VariableX,
+                },
+            choices,
+            count,
+            min_count,
+            ..
+        } => bounded_select_card_candidates(*player, choices, *min_count..=*count),
         // CR 117.1 + CR 601.2b: Aggregate-threshold "exile any number" cost
         // (Baron Helmut Zemo's Boast). The threshold is satisfied by ANY chosen
         // subset whose summed `property` meets the comparator, so enumerate
@@ -6819,6 +6836,73 @@ mod tests {
             actions[0].action,
             GameAction::SelectCards { ref cards } if cards.is_empty()
         ));
+    }
+
+    /// CR 107.3a: the AI must be able to CONSIDER every legal announced X for
+    /// an X-sentinel tap-creatures cost, not just the maximum. Without the
+    /// Fixed/VariableX range arm this falls through to the generic
+    /// exact-`count` PayCost arm and only ever generates the single maximal
+    /// selection, so a smaller X is unreachable for the AI at every seam.
+    #[test]
+    fn candidate_actions_broad_generates_variable_x_range() {
+        let mut state = GameState::new_two_player(42);
+        let choices = vec![ObjectId(1), ObjectId(2)];
+        state.waiting_for = WaitingFor::PayCost {
+            player: PlayerId(0),
+            kind: PayCostKind::TapCreatures {
+                mode: TapCreaturesSelectionMode::VariableX,
+            },
+            choices: choices.clone(),
+            count: 2,
+            min_count: 0,
+            resume: CostResume::Resolution,
+        };
+
+        let sizes: std::collections::BTreeSet<usize> = candidate_actions_broad(&state)
+            .iter()
+            .filter_map(|candidate| match &candidate.action {
+                GameAction::SelectCards { cards } => Some(cards.len()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            sizes.contains(&0) && sizes.contains(&1) && sizes.contains(&2),
+            "CR 107.3a: X=0, X=1 and X=2 must all be offered as candidates, got sizes {sizes:?}"
+        );
+    }
+
+    /// Non-regression pin: a FIXED tap-creatures requirement has
+    /// `min_count == count`, so the new range arm must still collapse to the
+    /// single exact-count candidate the generic arm produced before.
+    #[test]
+    fn candidate_actions_broad_keeps_fixed_tap_creatures_exact() {
+        let mut state = GameState::new_two_player(42);
+        let choices = vec![ObjectId(1), ObjectId(2), ObjectId(3)];
+        state.waiting_for = WaitingFor::PayCost {
+            player: PlayerId(0),
+            kind: PayCostKind::TapCreatures {
+                mode: TapCreaturesSelectionMode::Fixed,
+            },
+            choices: choices.clone(),
+            count: 3,
+            min_count: 3,
+            resume: CostResume::Resolution,
+        };
+
+        let sizes: Vec<usize> = candidate_actions_broad(&state)
+            .iter()
+            .filter_map(|candidate| match &candidate.action {
+                GameAction::SelectCards { cards } => Some(cards.len()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            sizes,
+            vec![3],
+            "CR 601.2h: a fixed count: 3 cost admits exactly one selection size"
+        );
     }
 
     #[test]
