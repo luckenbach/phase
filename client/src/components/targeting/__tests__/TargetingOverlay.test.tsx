@@ -266,7 +266,10 @@ describe("TargetingOverlay", () => {
       useUiStore.setState({ selectedCardIds: [7] });
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Confirm Tap (1/1)" }));
+    // min_count: 0 makes this a legal [0,1] range, not an exact-1 requirement
+    // (the same min_count-honoring fix this file's other new test covers) —
+    // the generic range-count confirm label renders here, not "Confirm Tap".
+    fireEvent.click(screen.getByRole("button", { name: "Confirm (1/1)" }));
 
     expect(dispatch).toHaveBeenCalledWith({
       type: "SelectCards",
