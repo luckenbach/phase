@@ -10630,6 +10630,135 @@ fn migrate_legacy_turn_face_up_resume(value: &mut serde_json::Value) -> Result<(
     Ok(())
 }
 
+/// Protocol 36 / P2P 27: `WaitingFor::ChooseDungeon` carried
+/// `options: Vec<DungeonId>` and `WaitingFor::ChooseDungeonRoom` carried
+/// `options: Vec<u8>` plus `option_names: Vec<String>` before each option grew
+/// the room's printed name and room-ability text (CR 309.4b-c).
+///
+/// A save paused at either prompt therefore cannot deserialize into the current
+/// shape. This migrates rather than rejects because the migration is TOTAL: the
+/// legacy payload's scalars are exactly the keys into the static dungeon table.
+/// A `DungeonId` resolves its own topmost room (CR 309.4a), and a room index
+/// resolves that room's name and text, so the rebuilt preview is identical to
+/// what the current engine would emit at that position — no saved game is lost
+/// and no field is guessed. `option_names` is dropped because `RoomPreview::name`
+/// now carries it from the same authority.
+///
+/// Rebuilt through `dungeon::dungeon_preview` / `dungeon::room_preview` rather
+/// than hand-written JSON, so this migration cannot drift from the shape the
+/// prompts actually emit.
+///
+/// Idempotent: legacy options are scalars (string / number) and current ones are
+/// objects, so a re-run over already-current state matches nothing. A `DungeonId`
+/// this engine does not know is a hard error — that is corrupt state, not a
+/// migratable shape.
+fn migrate_legacy_dungeon_choice_previews(value: &mut serde_json::Value) -> Result<(), String> {
+    use crate::game::dungeon::{dungeon_preview, room_preview, DungeonId};
+    use std::str::FromStr;
+
+    fn parse_dungeon(value: &serde_json::Value, field: &str) -> Result<DungeonId, String> {
+        let name = value
+            .as_str()
+            .ok_or_else(|| format!("legacy dungeon prompt {field} must be a string"))?;
+        DungeonId::from_str(name)
+            .map_err(|_| format!("legacy dungeon prompt {field} names an unknown dungeon: {name}"))
+    }
+
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                migrate_legacy_dungeon_choice_previews(value)?;
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let variant = object.get("type").and_then(serde_json::Value::as_str);
+            match variant {
+                Some("ChooseDungeon") => {
+                    if let Some(data) = object.get_mut("data").and_then(|d| d.as_object_mut()) {
+                        let is_legacy = data
+                            .get("options")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|options| {
+                                options.iter().any(serde_json::Value::is_string)
+                            });
+                        if is_legacy {
+                            let options = data
+                                .get("options")
+                                .and_then(serde_json::Value::as_array)
+                                .expect("checked above")
+                                .clone();
+                            let previews = options
+                                .iter()
+                                .map(|option| {
+                                    let id = parse_dungeon(option, "options entry")?;
+                                    serde_json::to_value(dungeon_preview(id))
+                                        .map_err(|error| error.to_string())
+                                })
+                                .collect::<Result<Vec<_>, String>>()?;
+                            data.insert("options".to_string(), serde_json::Value::Array(previews));
+                        }
+                    }
+                }
+                Some("ChooseDungeonRoom") => {
+                    if let Some(data) = object.get_mut("data").and_then(|d| d.as_object_mut()) {
+                        let is_legacy = data
+                            .get("options")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|options| {
+                                options.iter().any(serde_json::Value::is_number)
+                            })
+                            || data.contains_key("option_names");
+                        if is_legacy {
+                            let dungeon = parse_dungeon(
+                                data.get("dungeon").ok_or_else(|| {
+                                    "legacy ChooseDungeonRoom is missing dungeon".to_string()
+                                })?,
+                                "dungeon",
+                            )?;
+                            let options = data
+                                .get("options")
+                                .and_then(serde_json::Value::as_array)
+                                .ok_or_else(|| {
+                                    "legacy ChooseDungeonRoom options must be an array".to_string()
+                                })?
+                                .clone();
+                            let previews = options
+                                .iter()
+                                .map(|option| {
+                                    let index = option.as_u64().ok_or_else(|| {
+                                        "legacy ChooseDungeonRoom options entry must be a number"
+                                            .to_string()
+                                    })?;
+                                    let index = u8::try_from(index).map_err(|_| {
+                                        format!("legacy ChooseDungeonRoom room index {index} is out of range")
+                                    })?;
+                                    serde_json::to_value(room_preview(dungeon, index))
+                                        .map_err(|error| error.to_string())
+                                })
+                                .collect::<Result<Vec<_>, String>>()?;
+                            // `option_names` is superseded by `RoomPreview::name`.
+                            data.remove("option_names");
+                            data.insert(
+                                "dungeon_name".to_string(),
+                                serde_json::Value::from(
+                                    crate::game::dungeon::get_definition(dungeon).name,
+                                ),
+                            );
+                            data.insert("options".to_string(), serde_json::Value::Array(previews));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for value in object.values_mut() {
+                migrate_legacy_dungeon_choice_previews(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn delayed_trigger_install_command(
     entry: &serde_json::Value,
 ) -> Option<&serde_json::Map<String, serde_json::Value>> {
@@ -12520,16 +12649,20 @@ pub enum WaitingFor {
         )>,
     },
     /// CR 701.49a: Player chooses which dungeon to venture into (no active dungeon).
+    /// Each option carries its topmost room (CR 309.4a) so the prompt can show
+    /// what choosing that dungeon immediately does.
     ChooseDungeon {
         player: PlayerId,
-        options: Vec<crate::game::dungeon::DungeonId>,
+        options: Vec<crate::game::dungeon::DungeonPreview>,
     },
     /// CR 309.5a: Player at a branching room chooses which room to advance to.
+    /// Each option carries the room's printed name and effect (CR 309.4b-c).
     ChooseDungeonRoom {
         player: PlayerId,
         dungeon: crate::game::dungeon::DungeonId,
-        options: Vec<u8>,
-        option_names: Vec<String>,
+        /// The dungeon's printed name, so the prompt never has to map the id.
+        dungeon_name: String,
+        options: Vec<crate::game::dungeon::RoomPreview>,
     },
     /// Digital-only Specialize: choose which color specialization to apply.
     SpecializeColor {
@@ -16307,6 +16440,10 @@ declare_game_state! {
     /// top-level chain entry (depth == 0) in `resolve_ability_chain`, and — when
     /// the chain is modal — again at each CR 700.2 mode boundary, keyed on
     /// [`Self::resolving_modal_instruction`].
+    ///
+    /// Resolution-scoped, so `normalize_for_loop` clears it for the CR 104.4b
+    /// position comparison: between resolutions it is the previous resolution's
+    /// residue and must not split two identical positions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_tracked_set_id: Option<TrackedSetId>,
 
@@ -18079,6 +18216,7 @@ impl GameStateDecode {
             )?;
         }
         migrate_legacy_turn_face_up_resume(&mut value)?;
+        migrate_legacy_dungeon_choice_previews(&mut value)?;
         let mut state = Self::materialize_prepared(value)?;
         normalize_delayed_trigger_allocators(&mut state)?;
         validate_trigger_firing_coherence(&state)?;
@@ -18110,6 +18248,10 @@ impl GameStateDecode {
         migrate_legacy_mana_target_roles(value)?;
         migrate_legacy_tap_effects(value);
         migrate_legacy_turn_face_up_resume(value)?;
+        // Protocol 36: a v2 resolution wire is still accepted, and a v2 save can
+        // be paused at either dungeon prompt, so the compatibility boundary has
+        // to rebuild those payloads before `RawGameStateFields` sees them.
+        migrate_legacy_dungeon_choice_previews(value)?;
         Ok(())
     }
 
@@ -22935,10 +23077,19 @@ impl GameState {
         // then differ here alone and never confirm a repeated position. It is
         // eq-compared (AI-search dedup legitimately reads it), so it is
         // normalized away HERE rather than excluded from `PartialEq`.
-        // NOTE: its lockstep partner `chain_tracked_set_id` carries the same
-        // residue and is deliberately NOT cleared here — that is pre-existing
-        // behavior with its own follow-up, not something this line may widen.
         clone.resolving_modal_instruction = None;
+        // CR 608.2c + CR 104.4b: the chain tracked-set pointer is that latch's
+        // lockstep partner and is resolution-scoped for the same reason — a chain's
+        // "those cards" anaphor names only what THIS resolution's instructions
+        // produced. Nothing narrows it at chain EXIT (a `repeat_for` drain even
+        // re-enters at depth 1 to preserve it), so between resolutions it still names
+        // the last resolution's set while the arena it points into
+        // (`tracked_object_sets` / `next_tracked_set_id` — real accumulated content,
+        // deliberately left compared) is unchanged. The pointer alone then splits two
+        // identical positions, so neither the CR 104.4b draw confirmation nor the
+        // CR 732.2a recurrence certification that shares this seam can confirm a
+        // repeat.
+        clone.chain_tracked_set_id = None;
         // CR 104.4b + CR 400.7: the all-zone incarnation bump advances a source's
         // epoch on every zone change, so a mandatory loop that cycles its source's
         // zones would otherwise carry a growing `TriggerSourceContext` into loop
@@ -26217,6 +26368,173 @@ mod tests {
                 "expected root-alias coherence failure, got {error}"
             );
         }
+    }
+
+    /// Rewrites a captured dungeon prompt back to its pre-protocol-36 payload:
+    /// `ChooseDungeon` held bare `DungeonId`s, and `ChooseDungeonRoom` held bare
+    /// room indices plus a parallel `option_names`, with no `dungeon_name`.
+    fn downgrade_dungeon_prompt_to_legacy(persisted: &mut serde_json::Value) {
+        let state = if persisted.get("state").is_some() {
+            persisted
+                .get_mut("state")
+                .expect("trusted fixture has an inner state")
+        } else {
+            persisted
+        };
+        let waiting = state
+            .get_mut("waiting_for")
+            .expect("fixture is paused at a prompt");
+        let variant = waiting
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .expect("waiting_for is adjacently tagged")
+            .to_string();
+        let data = waiting
+            .get_mut("data")
+            .and_then(|data| data.as_object_mut())
+            .expect("dungeon prompts carry data");
+        let options = data
+            .get("options")
+            .and_then(serde_json::Value::as_array)
+            .expect("dungeon prompts carry options")
+            .clone();
+        match variant.as_str() {
+            "ChooseDungeon" => {
+                let legacy = options
+                    .iter()
+                    .map(|option| option["dungeon"].clone())
+                    .collect();
+                data.insert("options".to_string(), serde_json::Value::Array(legacy));
+            }
+            "ChooseDungeonRoom" => {
+                let names = options
+                    .iter()
+                    .map(|option| option["name"].clone())
+                    .collect();
+                let indices = options
+                    .iter()
+                    .map(|option| option["index"].clone())
+                    .collect();
+                data.remove("dungeon_name");
+                data.insert("option_names".to_string(), serde_json::Value::Array(names));
+                data.insert("options".to_string(), serde_json::Value::Array(indices));
+            }
+            other => panic!("not a dungeon prompt: {other}"),
+        }
+    }
+
+    fn restore_both_envelopes(state: GameState) -> [GameState; 2] {
+        let mut raw = serde_json::to_value(PersistedGameState::Raw(Box::new(state.clone())))
+            .expect("serialize raw fixture");
+        let mut trusted =
+            serde_json::to_value(PersistedGameState::capture(state)).expect("serialize trusted");
+        downgrade_dungeon_prompt_to_legacy(&mut raw);
+        downgrade_dungeon_prompt_to_legacy(&mut trusted);
+        [
+            serde_json::from_value::<PersistedGameState>(raw)
+                .expect("raw legacy dungeon prompt migrates")
+                .into_game_state(),
+            serde_json::from_value::<PersistedGameState>(trusted)
+                .expect("trusted legacy dungeon prompt migrates")
+                .into_game_state(),
+        ]
+    }
+
+    /// Protocol 36: a save paused at `ChooseDungeon` predates `DungeonPreview`.
+    /// The migration must rebuild each option's topmost room (CR 309.4a) rather
+    /// than fail to deserialize, through BOTH persistence ingresses.
+    #[test]
+    fn legacy_choose_dungeon_prompt_migrates_through_both_envelopes() {
+        use crate::game::dungeon::{dungeon_preview, DungeonId};
+
+        let mut state = GameState::new_two_player(42);
+        let expected: Vec<_> = [
+            DungeonId::LostMineOfPhandelver,
+            DungeonId::DungeonOfTheMadMage,
+            DungeonId::TombOfAnnihilation,
+        ]
+        .into_iter()
+        .map(dungeon_preview)
+        .collect();
+        state.waiting_for = WaitingFor::ChooseDungeon {
+            player: PlayerId(0),
+            options: expected.clone(),
+        };
+
+        for restored in restore_both_envelopes(state) {
+            match &restored.waiting_for {
+                WaitingFor::ChooseDungeon { player, options } => {
+                    assert_eq!(*player, PlayerId(0));
+                    // Rebuilt from the static table, so it is not merely
+                    // parseable — it equals what the engine emits today.
+                    assert_eq!(options, &expected);
+                }
+                other => panic!("expected ChooseDungeon, got {other:?}"),
+            }
+        }
+    }
+
+    /// Protocol 36: a save paused at `ChooseDungeonRoom` predates `RoomPreview`,
+    /// `dungeon_name`, and the removal of `option_names`. Room indices resolve
+    /// their own name and printed effect (CR 309.4b-c), so the rebuild is total.
+    #[test]
+    fn legacy_choose_dungeon_room_prompt_migrates_through_both_envelopes() {
+        use crate::game::dungeon::{room_preview, DungeonId};
+
+        let mut state = GameState::new_two_player(42);
+        let expected: Vec<_> = [1, 2]
+            .into_iter()
+            .map(|room| room_preview(DungeonId::LostMineOfPhandelver, room))
+            .collect();
+        state.waiting_for = WaitingFor::ChooseDungeonRoom {
+            player: PlayerId(0),
+            dungeon: DungeonId::LostMineOfPhandelver,
+            dungeon_name: "Lost Mine of Phandelver".to_string(),
+            options: expected.clone(),
+        };
+
+        for restored in restore_both_envelopes(state) {
+            match &restored.waiting_for {
+                WaitingFor::ChooseDungeonRoom {
+                    player,
+                    dungeon,
+                    dungeon_name,
+                    options,
+                } => {
+                    assert_eq!(*player, PlayerId(0));
+                    assert_eq!(*dungeon, DungeonId::LostMineOfPhandelver);
+                    // Recovered from `dungeon`, which the legacy payload kept.
+                    assert_eq!(dungeon_name, "Lost Mine of Phandelver");
+                    assert_eq!(options, &expected);
+                    assert_eq!(options[0].text, "Create a 1/1 red Goblin creature token.");
+                }
+                other => panic!("expected ChooseDungeonRoom, got {other:?}"),
+            }
+        }
+    }
+
+    /// The migration is a rebuild, not a guess: a dungeon name this engine does
+    /// not know is corrupt state and must surface, not silently drop an option.
+    #[test]
+    fn legacy_dungeon_prompt_rejects_an_unknown_dungeon() {
+        use crate::game::dungeon::{dungeon_preview, DungeonId};
+
+        let mut state = GameState::new_two_player(42);
+        state.waiting_for = WaitingFor::ChooseDungeon {
+            player: PlayerId(0),
+            options: vec![dungeon_preview(DungeonId::LostMineOfPhandelver)],
+        };
+        let mut raw = serde_json::to_value(PersistedGameState::Raw(Box::new(state)))
+            .expect("serialize raw fixture");
+        downgrade_dungeon_prompt_to_legacy(&mut raw);
+        raw["waiting_for"]["data"]["options"][0] = serde_json::Value::from("CatacombsOfNowhere");
+
+        let error = serde_json::from_value::<PersistedGameState>(raw)
+            .expect_err("an unknown dungeon must not migrate");
+        assert!(
+            error.to_string().contains("unknown dungeon"),
+            "expected an unknown-dungeon rejection, got {error}"
+        );
     }
 
     fn ordinary_pending_trigger(source: ObjectId, turn_number: u32) -> PendingTrigger {
@@ -29757,6 +30075,101 @@ mod tests {
             loop_states_equal(&first.normalize_for_loop(), &second.normalize_for_loop()),
             "CR 104.4b: positions differing only in the resolution-scoped mode-boundary \
              latch must confirm as a repeat"
+        );
+    }
+
+    /// CR 608.2c + CR 104.4b: the chain-local tracked-set pointer is resolution-scoped
+    /// and is narrowed only at scope ENTRY, so between resolutions it still names the
+    /// last resolution's set as pure residue. Two identical positions — the SAME
+    /// published set at the SAME counter — must still confirm as a repeated position
+    /// when only the pointer differs.
+    ///
+    /// DISCRIMINATION: delete `clone.chain_tracked_set_id = None;` from
+    /// `normalize_for_loop` and this test FAILS on the equality assertion — the field
+    /// is eq-compared, so the residue alone defeats the repeat. The `!=` assertion is
+    /// the paired non-vacuity witness: it proves the two inputs really do differ
+    /// BEFORE normalization.
+    #[test]
+    fn normalize_for_loop_clears_the_chain_tracked_set_residue() {
+        let mut first = GameState::new_two_player(7);
+        // Content authority identical in both — the published set and the advanced
+        // counter are established BEFORE the clone, so the pointer is the only
+        // difference.
+        first
+            .tracked_object_sets
+            .insert(TrackedSetId(1), Vec::new());
+        first.next_tracked_set_id = 2;
+        let mut second = first.clone();
+        first.chain_tracked_set_id = Some(TrackedSetId(1));
+        second.chain_tracked_set_id = None;
+
+        assert!(
+            first != second,
+            "non-vacuity: the two states must differ before normalization, else the \
+             equality assertion below proves nothing"
+        );
+
+        assert!(
+            loop_states_equal(&first.normalize_for_loop(), &second.normalize_for_loop()),
+            "CR 104.4b: positions naming the same published set must confirm as a repeat \
+             whether or not the resolution-scoped pointer still holds it"
+        );
+    }
+
+    /// CR 104.4b: `tracked_object_sets` and `next_tracked_set_id` are the tracked-set
+    /// CONTENT authority — real accumulated progress, not resolution-scoped residue.
+    /// `normalize_for_loop` neutralizes the chain POINTER into that arena and must
+    /// leave the arena and its mint compared: normalizing them would collapse two
+    /// genuinely different positions into one and draw a game that is still
+    /// progressing.
+    ///
+    /// DISCRIMINATION: this row's failing arrangement is not the clear this change
+    /// adds but a widening of it — add `clone.tracked_object_sets.clear();` or
+    /// `clone.next_tracked_set_id = 0;` to `normalize_for_loop` and the matching
+    /// inequality FAILS. The first assertion is the paired reach-guard: it differs
+    /// only in a field normalization does neutralize, so a normalization that stopped
+    /// running reddens it instead of leaving the inequalities to pass by default.
+    #[test]
+    fn normalize_for_loop_leaves_the_tracked_set_content_authority_compared() {
+        let mut base = GameState::new_two_player(7);
+        base.tracked_object_sets
+            .insert(TrackedSetId(1), vec![ObjectId(90_001)]);
+        base.next_tracked_set_id = 2;
+        base.chain_tracked_set_id = Some(TrackedSetId(1));
+
+        let mut volatile_only = base.clone();
+        volatile_only.state_revision = 99;
+        assert!(
+            loop_states_equal(
+                &base.normalize_for_loop(),
+                &volatile_only.normalize_for_loop()
+            ),
+            "reach guard: holding the arena equal, this pair must still confirm — else the \
+             inequalities below say nothing about the arena"
+        );
+
+        let mut other_members = base.clone();
+        other_members
+            .tracked_object_sets
+            .insert(TrackedSetId(1), vec![ObjectId(90_002)]);
+        assert!(
+            !loop_states_equal(
+                &base.normalize_for_loop(),
+                &other_members.normalize_for_loop()
+            ),
+            "CR 104.4b: differing tracked-set membership is real accumulated content and \
+             must not be normalized into a repeat"
+        );
+
+        let mut other_counter = base.clone();
+        other_counter.next_tracked_set_id = 3;
+        assert!(
+            !loop_states_equal(
+                &base.normalize_for_loop(),
+                &other_counter.normalize_for_loop()
+            ),
+            "CR 104.4b: a further minted tracked set is real accumulated content and must \
+             not be normalized into a repeat"
         );
     }
 

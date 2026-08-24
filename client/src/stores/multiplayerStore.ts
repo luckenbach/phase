@@ -471,6 +471,7 @@ async function startActiveP2PHostGame(
   saveActiveGame({ id: gameId, mode: "p2p-host", difficulty: "" });
   useGameStore.setState({ gameId });
   setState({
+    activePlayerId: 0,
     pendingGameRoute: `/game/${gameId}?mode=p2p-host`,
     hostGameCode: null,
     hostingStatus: "idle",
@@ -497,10 +498,12 @@ export function isLobbyEntryCompatible(
 }
 
 /**
- * True when the client's wire-protocol can speak to the server's advertised
- * mode. Delegates to `serverProtocolRejection` — the same decision the
+ * True when the client's wire-protocol can speak to `info` on the FULL-GAME
+ * surface — the surface that decides whether a game can actually be played.
+ * Delegates to `serverProtocolRejection` — the same decision the game
  * handshake makes — so the compatibility badge can never disagree with whether
- * the connection actually succeeds.
+ * the connection actually succeeds. A `LobbyOnly` server has no full-game
+ * surface, so it is judged on its lobby version instead.
  */
 export function isServerCompatible(info: ServerInfo | null): boolean {
   return info !== null && serverProtocolRejection(info) === null;
@@ -1300,7 +1303,13 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
 
           subscriptionReconnect = withReconnect(
             () =>
-              openPhaseSocket(addr).catch((err) => {
+              // The shared subscription socket carries lobby frames only —
+              // `SubscribeLobby`, the join-target RPCs, `PlayerCount`. Declaring
+              // the surface keeps it usable against a server whose full-game
+              // protocol has drifted from this build's, which is the whole point
+              // of versioning the lobby separately. Server-run hosting and
+              // joining open their own sockets and keep the exact-match window.
+              openPhaseSocket(addr, { surface: "lobby" }).catch((err) => {
                 // Protocol mismatch is not retryable — surface the toast
                 // on the *first* handshake attempt, then let
                 // `withReconnect` treat subsequent attempts as plain

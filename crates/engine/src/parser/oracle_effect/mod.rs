@@ -6380,6 +6380,18 @@ pub(crate) fn classify_and_parse_counter_choice_list(
     Some(classify_counter_choice_list(&lower)?.entries)
 }
 
+/// CR 122.1b: Parse a bare "from among" counter list ("menace, deathtouch, and
+/// lifelink") into typed entries. Shares the item authority
+/// (`parse_counter_choice_list_entries`) with `classify_counter_choice_list`'s
+/// FromAmong arm — the caller has already consumed the "from among" preamble.
+pub(crate) fn classify_and_parse_from_among_counter_list(
+    list_text: &str,
+) -> Option<Vec<(CounterType, QuantityExpr)>> {
+    let lower = list_text.to_lowercase();
+    let items = split_choice_list_items(&lower)?;
+    parse_counter_choice_list_entries(ChoiceListShape::FromAmong, &items)
+}
+
 /// CR 122.1 + CR 122.1a + CR 122.1b: Parse shared-target counter choices of the form
 /// "put your choice of A counter-pattern, B counter-pattern, or C
 /// counter-pattern on TARGET" (N-ary branches).
@@ -26658,7 +26670,7 @@ fn type_str_to_target_filter(s: &str) -> Option<TargetFilter> {
         return Some(TargetFilter::Typed(TypedFilter::new(ct)));
     }
 
-    // CR 205.4b: Negated types — "nonland", "noncreature", etc.
+    // CR 205.2a: Negated card types — "nonland", "noncreature", etc.
     if let Some(negated) = s.strip_prefix("non") {
         // Card type negation
         let inner = match negated {
