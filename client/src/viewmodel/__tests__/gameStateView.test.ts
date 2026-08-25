@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type {
   GameAction,
@@ -587,7 +587,7 @@ describe("getBoardChoiceView", () => {
       type: "PayCost",
       data: {
         player: 0,
-        kind: { type: "TapCreatures" },
+        kind: { type: "TapCreatures", mode: "Fixed" },
         choices: [4, 5],
         count: 2,
         min_count: 2,
@@ -622,7 +622,7 @@ describe("getBoardChoiceView", () => {
       type: "PayCost",
       data: {
         player: 0,
-        kind: { type: "TapCreatures" },
+        kind: { type: "TapCreatures", mode: "VariableX" },
         choices: [4, 5, 6],
         count: 3,
         min_count: 1,
@@ -649,6 +649,106 @@ describe("getBoardChoiceView", () => {
       type: "SelectCards",
       data: { cards: [4] },
     });
+  });
+
+  it("gates an aggregate TapCreatures PayCost by total power, mirroring CrewVehicle", () => {
+    const waitingFor: WaitingFor = {
+      type: "PayCost",
+      data: {
+        player: 0,
+        kind: {
+          type: "TapCreatures",
+          mode: { Aggregate: { stat: "TotalPower", comparator: "GE", value: 2 } },
+        },
+        choices: [4, 5],
+        count: 2,
+        min_count: 0,
+        resume: { type: "Resolution" },
+      },
+    };
+    const objects = buildObjectMap(
+      buildGameObject({ id: 4, power: 1, zone: "Battlefield" }),
+      buildGameObject({ id: 5, power: 1, zone: "Battlefield" }),
+    );
+
+    const choice = getBoardChoiceView(waitingFor, objects);
+
+    expect(choice).not.toBeNull();
+    if (!choice) return;
+    expect(choice.selection).toEqual({ type: "totalPowerAtLeast", power: 2 });
+    // One 1-power creature (total power 1) does not satisfy "total power 2 or
+    // greater" — this is the exact scenario the reviewer flagged: the old
+    // `confirmedCountSelection(2, 0)` mapping would have rendered this as an
+    // enabled 0-to-2 range selection, letting Confirm activate for a payment
+    // the engine rejects.
+    expect(canConfirmBoardChoice(choice, [4], objects)).toBe(false);
+    expect(canConfirmBoardChoice(choice, [4, 5], objects)).toBe(true);
+    expect(buildBoardChoiceAction(choice, [4, 5])).toEqual({
+      type: "SelectCards",
+      data: { cards: [4, 5] },
+    });
+  });
+
+  // Reach guard for the engine's positive-power-only clamp over the CR 208.1
+  // power axis: a negative-power creature must not "cancel out" a positive one
+  // to help satisfy the threshold, and must not count negatively either —
+  // mirrors `tap_creature_power_contribution`'s `max(power, 0)`, NOT
+  // `totalPowerAtMost`'s signed-sum semantics.
+  it("clamps negative power to zero for an aggregate TapCreatures PayCost", () => {
+    const waitingFor: WaitingFor = {
+      type: "PayCost",
+      data: {
+        player: 0,
+        kind: {
+          type: "TapCreatures",
+          mode: { Aggregate: { stat: "TotalPower", comparator: "GE", value: 2 } },
+        },
+        choices: [4, 5],
+        count: 2,
+        min_count: 0,
+        resume: { type: "Resolution" },
+      },
+    };
+    const objects = buildObjectMap(
+      buildGameObject({ id: 4, power: 1, zone: "Battlefield" }),
+      buildGameObject({ id: 5, power: -1, zone: "Battlefield" }),
+    );
+
+    const choice = getBoardChoiceView(waitingFor, objects);
+
+    expect(choice).not.toBeNull();
+    if (!choice) return;
+    // 1 + max(-1, 0) = 1, not 0 — the negative creature contributes 0, it
+    // does not subtract.
+    expect(boardChoiceSelectedPower(choice, [4, 5], objects)).toBe(1);
+    expect(canConfirmBoardChoice(choice, [4, 5], objects)).toBe(false);
+  });
+
+  it("blocks confirmation for a TapCreatures aggregate comparator with no client representation", () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const waitingFor: WaitingFor = {
+      type: "PayCost",
+      data: {
+        player: 0,
+        kind: {
+          type: "TapCreatures",
+          mode: { Aggregate: { stat: "TotalPower", comparator: "LE", value: 2 } },
+        },
+        choices: [4],
+        count: 1,
+        min_count: 0,
+        resume: { type: "Resolution" },
+      },
+    };
+
+    const choice = getBoardChoiceView(
+      waitingFor,
+      buildObjectMap(buildGameObject({ id: 4, power: 1, zone: "Battlefield" })),
+    );
+
+    expect(choice?.selection).toEqual({ type: "rangeCount", min: 0, max: 0 });
+    expect(errorSpy).toHaveBeenCalled();
+    errorSpy.mockRestore();
   });
 
   it("keeps PayCost choices modal-only unless every candidate is on the battlefield", () => {

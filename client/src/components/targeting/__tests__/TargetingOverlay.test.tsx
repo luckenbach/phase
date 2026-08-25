@@ -186,7 +186,7 @@ describe("TargetingOverlay", () => {
         type: "PayCost",
         data: {
           player: 0,
-          kind: { type: "TapCreatures" },
+          kind: { type: "TapCreatures", mode: "VariableX" },
           choices: [7],
           count: 1,
           min_count: 0,
@@ -235,7 +235,7 @@ describe("TargetingOverlay", () => {
         type: "PayCost",
         data: {
           player: 0,
-          kind: { type: "TapCreatures" },
+          kind: { type: "TapCreatures", mode: "VariableX" },
           choices: [7],
           count: 1,
           min_count: 0,
@@ -289,7 +289,7 @@ describe("TargetingOverlay", () => {
         type: "PayCost",
         data: {
           player: 0,
-          kind: { type: "TapCreatures" },
+          kind: { type: "TapCreatures", mode: "VariableX" },
           choices: [7, 8, 9],
           // The engine offers X = 1..3 here; paying X = 1 must be confirmable.
           count: 3,
@@ -321,6 +321,56 @@ describe("TargetingOverlay", () => {
     expect(dispatch).toHaveBeenCalledWith({
       type: "SelectCards",
       data: { cards: [7] },
+    });
+  });
+
+  it("gates an aggregate TapCreatures PayCost and submits SelectCards on a qualifying subset", () => {
+    const dispatch = vi.fn().mockResolvedValue([]);
+    const gameState = createGameState({
+      objects: buildObjectMap(
+        buildGameObjectWithCoreTypes(["Creature"], { id: 7, name: "Memnite", power: 1 }),
+        buildGameObjectWithCoreTypes(["Creature"], { id: 8, name: "Ornithopter", power: 1 }),
+      ),
+      waiting_for: {
+        type: "PayCost",
+        data: {
+          player: 0,
+          kind: {
+            type: "TapCreatures",
+            mode: { Aggregate: { stat: "TotalPower", comparator: "GE", value: 2 } },
+          },
+          choices: [7, 8],
+          count: 2,
+          min_count: 0,
+          resume: { type: "Resolution" },
+        },
+      },
+    });
+
+    act(() => {
+      useGameStore.setState({ gameState, waitingFor: gameState.waiting_for, dispatch });
+    });
+
+    render(<TargetingOverlay />);
+
+    // Below threshold: one 1-power creature selected, but the cost needs 2.
+    act(() => {
+      useUiStore.setState({ selectedCardIds: [7] });
+    });
+    expect(screen.getByRole("button", { name: "Confirm (1/2 power)" })).toBeDisabled();
+
+    // Qualifying subset: both creatures selected, total power 2.
+    act(() => {
+      useUiStore.setState({ selectedCardIds: [7, 8] });
+    });
+    const aggregateConfirm = screen.getByRole("button", { name: "Confirm (2/2 power)" });
+    expect(aggregateConfirm).not.toBeDisabled();
+
+    fireEvent.click(aggregateConfirm);
+
+    expect(dispatch).toHaveBeenCalledWith({
+      type: "SelectCards",
+      data: { cards: [7, 8] },
     });
   });
 

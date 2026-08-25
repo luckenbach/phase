@@ -5,6 +5,7 @@ import type {
   ObjectCounterDisplay,
   ObjectId,
   PlayerId,
+  TapCreaturesAggregate,
   TargetRef,
   WaitingFor,
 } from "../adapter/types";
@@ -413,6 +414,40 @@ function confirmedCountSelection(count: number, minCount: number): BoardChoiceSe
   return { type: "rangeCount", min: minCount, max: count };
 }
 
+/**
+ * CR 208.1 + CR 601.2f (Crew CR 702.122a / Saddle CR 702.171a / Teamwork
+ * CR 702.194a): map a TapCreatures Aggregate cost's advertised comparator to
+ * the board-choice selection that gates confirmation on summed power — the
+ * same `totalPowerAtLeast` mechanism CrewVehicle/SaddleMount already use.
+ * Only `GE` ("total power N or greater") is constructible by any current
+ * engine registration site (`TapCreaturesRequirement::total_power_at_least`
+ * is the sole non-test constructor of the `Aggregate` requirement shape, and
+ * it hardcodes `GE`). `totalPowerAtMost` is deliberately NOT reused for a
+ * hypothetical `LE`: its Slaughter-the-Strong keep-set (CR 107.1c's "any
+ * number") sums SIGNED power, so a negative-power creature genuinely lowers
+ * the total, whereas the engine's tap-cost total over the same CR 208.1 power
+ * axis sums POSITIVE power only (`tap_creature_power_contribution` clamps to
+ * `max(power, 0)`) — reusing it would silently diverge from the engine the
+ * instant a non-GE aggregate cost existed. Any comparator other than `GE`
+ * therefore has no correct client representation yet; fail loud and block
+ * confirmation rather than guess.
+ */
+function tapCreaturesAggregateSelection(aggregate: TapCreaturesAggregate): BoardChoiceSelection {
+  switch (aggregate.comparator) {
+    case "GE":
+      return { type: "totalPowerAtLeast", power: aggregate.value };
+    case "GT":
+    case "LT":
+    case "LE":
+    case "EQ":
+    case "NE":
+      console.error(
+        `Unsupported TapCreatures aggregate comparator "${aggregate.comparator}"; blocking confirmation.`,
+      );
+      return { type: "rangeCount", min: 0, max: 0 };
+  }
+}
+
 export function getBoardChoiceView(
   waitingFor: WaitingFor | null | undefined,
   objects?: Record<ObjectId, GameObject | undefined>,
@@ -522,16 +557,21 @@ export function getBoardChoiceView(
             sourceId: payCostSourceId(waitingFor.data),
             cancelAction: waitingFor.data.resume.type === "Spell" ? { type: "CancelCast" } : undefined,
           };
-        case "TapCreatures":
+        case "TapCreatures": {
+          const { mode } = waitingFor.data.kind;
           return {
             player: waitingFor.data.player,
             objectIds: waitingFor.data.choices,
             intent: "tap",
-            selection: confirmedCountSelection(waitingFor.data.count, waitingFor.data.min_count),
+            selection:
+              typeof mode === "object"
+                ? tapCreaturesAggregateSelection(mode.Aggregate)
+                : confirmedCountSelection(waitingFor.data.count, waitingFor.data.min_count),
             response: { type: "SelectCards" },
             sourceId: payCostSourceId(waitingFor.data),
             cancelAction: waitingFor.data.resume.type === "Spell" ? { type: "CancelCast" } : undefined,
           };
+        }
         default:
           return null;
       }
