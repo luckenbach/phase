@@ -1214,12 +1214,13 @@ impl ClauseDraft<'_> {
             // a printed window — measured, Dovin Baan, Edifice of Authority and
             // Mythos of Vadrok carry a link stuck at `UntilEndOfTurn` under an
             // `UntilNextTurnOf` head. Teferi's Protection is a fourth instance in a
-            // different shape (carrier `None`, injected `UntilEndOfTurn` on the
-            // EMBEDDED effect duration, different recognizer). That is a KNOWN
-            // REMAINING GAP, not something this seam fixes, and closing it is work
-            // against the injected-default CLASS rather than any one recognizer;
-            // see the U1 section note in the 7923 integration test and tasks
-            // #138/#144 in `game/effects/effect.rs`.
+            // different shape and from a DIFFERENT CAUSE — carrier `None` (which
+            // would PASS the walk's gate), injected `UntilEndOfTurn` on the EMBEDDED
+            // effect duration, different recognizer — so the head window never
+            // reaches that link at all. Both are KNOWN REMAINING GAPS this seam does
+            // not fix, and the second is not closed by the injected-default class
+            // remedy alone; see the U1 section note in the 7923 integration test for
+            // the measured detail and tasks #138/#144 in `game/effects/effect.rs`.
             //
             // COUPLING: `strip_trailing_duration` finds only trailing windows, so a
             // conjunct printing a LEADING window of its own would read as unprinted.

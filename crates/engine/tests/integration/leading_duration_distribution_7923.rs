@@ -296,23 +296,39 @@ fn object_has_static_mode(
 //     declines. Head is `UntilNextTurnOf{Controller}`; the prohibition ends a
 //     full turn early.
 //
-//   * Teferi's Protection — a DIFFERENT recognizer and a different failure. Its
-//     "you gain protection from everything" link carries `def.duration: None`
-//     with an injected `UntilEndOfTurn` on the EMBEDDED `GenericEffect.duration`
-//     instead, under the same `UntilNextTurnOf{Controller}` head, so protection
-//     from everything expires a turn early.
+//   * Teferi's Protection — a DIFFERENT recognizer and, measured, a DIFFERENT
+//     CAUSE. Its "you gain protection from everything" link carries
+//     `def.duration: None` with an injected `UntilEndOfTurn` on the EMBEDDED
+//     `GenericEffect.duration`, under the same `UntilNextTurnOf{Controller}`
+//     head, so protection from everything expires a turn early.
 //
-// None is a regression — all four are byte-identical at BASE_SHA — and none
-// reaches the severed-conjunct seam this PR adds: `starts_clause_text_or_conjugated`
-// excludes "its"/"their", so those sentences never split.
+//     Note carefully what this is NOT: a `None` carrier PASSES the sub-link
+//     walk's gate (probed at this head, Abeyance's `AddRestriction` and Kiora's
+//     second `PreventDamage` link both have `None` carriers and both ARE stamped
+//     by that walk). So the carrier gate is not what fails here — the head window
+//     simply never reaches this link. The precise mechanism is NOT diagnosed in
+//     this PR; only the parse state and the symptom above are measured.
 //
-// SCOPING NOTE for whoever picks this up: the `subject.rs` verbatim-emit remedy
-// (the fix `try_parse_gain_all_activated_abilities_of_target` received here)
-// closes the first shape ONLY. Teferi's Protection is not a `subject.rs`
-// prohibition, so the work is against the injected-default CLASS — there are ~16
-// `.or(Some(Duration::UntilEndOfTurn))` injection sites across `subject.rs`,
-// `imperative.rs` and `oracle_effect/mod.rs` — not against one recognizer. See
-// tasks #138/#144 in `game/effects/effect.rs`.
+// None of the four is a regression — all are byte-identical at BASE_SHA.
+//
+// The three PROHIBITION cards additionally never reach the severed-conjunct seam
+// this PR adds, because `starts_clause_text_or_conjugated` excludes "its" (explicit
+// list) and "their" (the `ends_with('s')` pre-filter), so those sentences never
+// split. That reasoning does NOT extend to Teferi's Protection: `tag("you ")` IS a
+// clause-start token, so its sentence does split.
+//
+// SCOPING NOTE for whoever picks this up — both halves matter:
+//   1. The `subject.rs` verbatim-emit remedy (the fix
+//      `try_parse_gain_all_activated_abilities_of_target` received here) closes
+//      shape 1 ONLY.
+//   2. Applying that remedy across the injected-default CLASS (~16
+//      `.or(Some(Duration::UntilEndOfTurn))` / `unwrap_or(Duration::UntilEndOfTurn)`
+//      sites in `subject.rs`, `imperative.rs`, `oracle_effect/mod.rs`) is NOT
+//      sufficient for shape 2: leaving the embedded field `None` just moves the
+//      default downstream, where `game/effects/effect.rs` resolves
+//      `ability.duration.or(duration).unwrap_or(UntilEndOfTurn)` to end-of-turn
+//      anyway. Shape 2 needs the printed head window to actually REACH the link,
+//      which is precisely what tasks #138/#144 in `game/effects/effect.rs` track.
 // ===========================================================================
 
 /// **V-U1a — `[BASE]`, SHAPE.** CR 611.2a (`:2908`).
