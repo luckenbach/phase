@@ -280,6 +280,22 @@ fn object_has_static_mode(
 
 // ===========================================================================
 // U1 — a stated duration reaches every governed link of a recognizer-built chain
+// whose links carry NO duration of their own.
+//
+// SCOPE, stated precisely because the unqualified form is FALSE: the sub-link
+// walk in `with_clause_chain_duration` gates on the link's CARRIER
+// (`def.duration.is_none() || Some(Permanent)`), so a link whose recognizer
+// INJECTED a duration default is indistinguishable from one that printed a
+// window, and the walk declines. Measured, two corpus cards sit in that gap —
+// Dovin Baan and Edifice of Authority, whose "and its activated abilities can't
+// be activated" link is injected `UntilEndOfTurn` by `oracle_effect/subject.rs`
+// and so keeps end-of-turn under an `UntilNextTurnOf{Controller}` head. Neither
+// is a regression (both behave identically at BASE_SHA) and neither reaches the
+// severed-conjunct seam this PR adds — `starts_clause_text_or_conjugated`
+// excludes "its", so that sentence never splits. Closing the gap needs the
+// verbatim-emit remedy applied to `subject.rs`'s prohibition recognizer, the
+// same fix `try_parse_gain_all_activated_abilities_of_target` received here;
+// see tasks #138/#144 in `game/effects/effect.rs`.
 // ===========================================================================
 
 /// **V-U1a — `[BASE]`, SHAPE.** CR 611.2a (`:2908`).

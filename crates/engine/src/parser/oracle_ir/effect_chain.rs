@@ -1192,33 +1192,45 @@ impl ClauseDraft<'_> {
         // clause passes through — and through the same chain-distributing authority
         // U1 installed, so a recovered conjunct that is itself a chain-building
         // recognizer distributes to its own governed links too.
-        // Yield to an explicitly stated inner window: a recovered conjunct is
-        // arbitrary printed text and may state its own duration, which the
-        // sentence's leading duration must NOT clobber (CR 608.2c: read the whole
-        // text). Gated exactly as the trailing-duration peel in
-        // `oracle_effect/mod.rs` gates its own `with_clause_duration` call; a
-        // `Permanent` injected by a sub-parser is an unset sentinel, not a window.
+        // CR 608.2c (read the whole text): a recovered conjunct is arbitrary printed
+        // text and may state its OWN window, which the sentence's leading duration
+        // must not clobber.
         if self.builder.pending_leading_duration.is_some() {
-            // Which window governs this conjunct and the links BELOW it: its own, if
-            // it PRINTED one, otherwise the sentence's leading duration. Either way
-            // the walk runs, so the conjunct's governed sub-links always inherit a
-            // window rather than falling through to the resolver's default.
-            //
-            // "Printed its own" is a TEXTUAL fact, deliberately NOT read off
+            // "Printed its own window" is a TEXTUAL fact, deliberately NOT read off
             // `ParsedEffectClause.duration`: several recognizers inject
             // `Some(Duration::UntilEndOfTurn)` into that field as a DEFAULT which is
-            // byte-identical to a printed window, so the parsed carrier cannot
-            // distinguish the two. `oracle_effect/subject.rs`'s tapped-bound
-            // prohibition is the proof — the same recognizer emits a printed
-            // `ForAsLongAs{SourceIsTapped}` (Braided Net) or an injected
-            // `UntilEndOfTurn` (Dovin Baan, Xathrid Gorgon) depending only on a
-            // suffix. Asking the source text answers the question the carrier can't.
+            // byte-identical to a printed window, so the carrier cannot distinguish
+            // the two. `oracle_effect/subject.rs`'s tapped-bound prohibition is the
+            // proof — one recognizer emits a printed `ForAsLongAs{SourceIsTapped}`
+            // (Braided Net) or an injected `UntilEndOfTurn` (Dovin Baan, Xathrid
+            // Gorgon) depending only on a suffix.
+            //
+            // NOTE those two cards are cited for the RECOGNIZER's behaviour, not as
+            // traffic through this seam: `starts_clause_text_or_conjugated` excludes
+            // "its", so Dovin Baan's bare " and its ..." never splits and never
+            // reaches `push` at all. Its link is governed by
+            // `with_clause_chain_duration`'s sub-link walk, whose gate is still
+            // CARRIER-based and therefore still cannot tell an injected default from
+            // a printed window — measured, Dovin Baan and Edifice of Authority carry
+            // a link stuck at `UntilEndOfTurn` under an `UntilNextTurnOf` head. That
+            // is a KNOWN REMAINING GAP, not something this seam fixes; it needs the
+            // verbatim-emit remedy applied at `subject.rs` (cf. tasks #138/#144 in
+            // `game/effects/effect.rs`).
+            //
+            // COUPLING: `strip_trailing_duration` finds only trailing windows, so a
+            // conjunct printing a LEADING window of its own would read as unprinted.
+            // Unreachable today only because no duration phrase is a member of
+            // `starts_clause_text_lower`, so no split ever cuts a chunk immediately
+            // before "until ". If that changes, ask `strip_leading_duration` here too.
             let printed_own_window = strip_trailing_duration(&self.source_text).1.is_some();
             let governing = if printed_own_window {
-                self.parsed
-                    .duration
-                    .clone()
-                    .or_else(|| self.builder.pending_leading_duration.clone())
+                // The text printed a window. If the carrier holds it, distribute THAT
+                // down the links. If the carrier is empty, the recognizer routed the
+                // printed window into an embedded effect field instead — stamping the
+                // sentence's window here would have `apply_duration_to_effect`
+                // overwrite it, the exact clobber this gate exists to prevent — so
+                // leave the clause untouched.
+                self.parsed.duration.clone()
             } else {
                 self.builder.pending_leading_duration.clone()
             };
@@ -1299,7 +1311,8 @@ mod tests {
         // a window, so a degenerate fixture ("a" / "b") would take the unprinted
         // branch and never exercise row 1 at all.
         let mut b = ClauseIrBuilder::new(
-            "tap target creature until end of combat. it can't block. its activated abilities can't be activated",
+            "tap target creature until end of combat. it can't block. its activated \
+             abilities can't be activated. it gains flying until end of turn",
         );
         // Deliberately NOT `UntilEndOfTurn`: row 3's injected default IS
         // `UntilEndOfTurn`, so an identical leading window would let that row pass
@@ -1329,8 +1342,10 @@ mod tests {
         // conjunct PRINTS no window, but a recognizer injected
         // `Some(UntilEndOfTurn)` into the parsed carrier — exactly what
         // `oracle_effect/subject.rs`'s tapped-bound prohibition does for Dovin
-        // Baan. Reading the carrier would mistake that default for a printed
-        // window and skip the stamp, expiring the effect a turn early.
+        // Baan's PROHIBITION RECOGNIZER — cited for the recognizer, not because
+        // Dovin Baan itself reaches this seam (it never splits, so its link is
+        // governed by the sub-link walk instead). Reading the carrier would mistake
+        // that default for a printed window and skip the stamp.
         let mut injected = parsed_clause(governed());
         injected.duration = Some(Duration::UntilEndOfTurn);
         b.clause(
@@ -1341,8 +1356,20 @@ mod tests {
         )
         .push();
 
+        // Row 4: the text PRINTS a window but the carrier is empty — the recognizer
+        // routed it into an embedded effect field. Stamping the sentence's window
+        // here would clobber that printed inner window, so the clause is left
+        // untouched. (Fourth of the four (printed, carrier) combinations.)
+        b.clause(
+            "it gains flying until end of turn",
+            parsed_clause(governed()),
+            None,
+            emit(),
+        )
+        .push();
+
         let clauses = b.finish();
-        assert_eq!(clauses.len(), 3);
+        assert_eq!(clauses.len(), 4);
         assert_eq!(
             clauses[0].parsed.duration,
             Some(Duration::UntilEndOfCombat),
@@ -1371,6 +1398,11 @@ mod tests {
             Some(leading.clone()),
             "an INJECTED `UntilEndOfTurn` on a conjunct that printed no window must \
              not be mistaken for a printed one — the leading window governs"
+        );
+        assert_eq!(
+            clauses[3].parsed.duration, None,
+            "text printed a window but the carrier is empty: the clause must be left \
+             ALONE, not stamped with the sentence's window over a printed inner one"
         );
     }
 
