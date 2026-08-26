@@ -19051,34 +19051,123 @@ fn scan_for_generic_main_phase(text: &str) -> bool {
         .is_some()
 }
 
-/// CR 503.1a / CR 507.1: Parse turn constraint from phase text using nom prefix dispatch.
+/// The English turn-owner possessive that may precede a printed phase noun:
+/// "your ", "each of your ", "an opponent's ", "each opponent's ", the four
+/// apostrophe/curly-apostrophe opponent-plural forms, "each of your opponents' ".
+/// Single authority, shared by [`parse_turn_constraint`] (which maps it to a
+/// `TriggerConstraint`) and by [`parse_dangling_phase_trigger_head`] (which only
+/// needs it consumed).
 ///
-/// Tries opponent possessives first (more specific) before bare "your" to avoid
-/// the substring ambiguity where "your opponent's" would match "your".
-/// Also checks for trailing "on your turn" suffix.
+/// NO CR ANNOTATION, deliberately: this consumes an English possessive and
+/// produces no rules verdict of its own — the verdict is `parse_turn_constraint`'s,
+/// and CR 500.1 is annotated there. Same ruling as `parse_phase_determiner_prefix`
+/// below (CLAUDE.md — annotate rules, not grammar plumbing).
+///
+/// Longest-first ordering is LOAD-BEARING, and on two axes, not one:
+/// `"each of your opponents' "` before `"each of your "` before `"your "`, and
+/// `"your opponent's "` / `"your opponents' "` before `"your "` — otherwise the
+/// bare `"your "` swallows the opponent forms and flips the constraint from
+/// `OnlyDuringOpponentsTurn` to `OnlyDuringYourTurn`.
+fn parse_turn_possessive_prefix(input: &str) -> OracleResult<'_, TriggerConstraint> {
+    alt((
+        value(
+            TriggerConstraint::OnlyDuringOpponentsTurn,
+            alt((
+                tag("an opponent's "),
+                tag("each opponent's "),
+                tag("each opponents\u{2019} "),
+                tag("each opponents' "),
+                tag("each of your opponents\u{2019} "),
+                tag("each of your opponents' "),
+                tag("your opponent's "),
+                tag("your opponents\u{2019} "),
+                tag("your opponents' "),
+            )),
+        ),
+        value(
+            TriggerConstraint::OnlyDuringYourTurn,
+            alt((tag("each of your "), tag("your "))),
+        ),
+    ))
+    .parse(input)
+}
+
+/// The English determiner that may precede a printed phase noun when no turn
+/// constraint is stated: "the ", "each ", "each player's ". Longest-first:
+/// "each player's " precedes "each ".
+///
+/// NO CR ANNOTATION, deliberately: this consumes a determiner and implements no
+/// game rule (CLAUDE.md — annotate rules, not grammar plumbing).
+///
+/// "next " is DELIBERATELY NOT IN THIS TABLE. It is an orthogonal axis that can
+/// follow either a possessive or a determiner ("your next end step", "the next end
+/// step", "each opponent's next upkeep"), and putting it here made
+/// `"your next "` UNREACHABLE: `parse_turn_possessive_prefix` contains
+/// `tag("your ")`, `alt` commits on first success, and `opt` does not backtrack, so
+/// the possessive branch consumed `your ` and stranded `next end step`.
+fn parse_phase_determiner_prefix(input: &str) -> OracleResult<'_, ()> {
+    value((), alt((tag("each player's "), tag("each "), tag("the ")))).parse(input)
+}
+
+/// CR 603.1 (docs/MagicCompRules.txt:2559) + CR 603.7 (:2614): a triggered ability
+/// is printed as "[When/Whenever/At] [trigger event], [effect]", and a DELAYED
+/// triggered ability "will contain 'when,' 'whenever,' or 'at,' although that word
+/// won't usually begin the ability" — i.e. it appears mid-sentence, with its own
+/// internal comma between head and body. This combinator matches that head,
+/// ANCHORED TO END-OF-INPUT.
+///
+/// "at the beginning of ⟨possessive|determiner⟩? ⟨'next '⟩? ⟨phase⟩ 's'?
+///  ⟨' on your turn'⟩? EOF"
+///
+/// The `eof` anchor is the whole point: it distinguishes a head that DANGLES a
+/// trigger head (its body was severed into the tail — Giant Oyster's
+/// "…, and at the beginning of each of your draw steps") from a head that contains a
+/// COMPLETE trigger ("…, and at the beginning of your upkeep, draw a card"), which is
+/// a genuine conjunct boundary and must still split.
+///
+/// Consumes the WHOLE printed phase phrase. A bare `preceded(tag("at the beginning
+/// of "), parse_phase_keyword)` does NOT: `parse_phase_keyword` is a keyword
+/// alternation and cannot consume "each of your draw steps" — measured, that form
+/// fires zero times corpus-wide.
+pub(crate) fn parse_dangling_phase_trigger_head(input: &str) -> OracleResult<'_, Phase> {
+    terminated(
+        preceded(
+            tag("at the beginning of "),
+            map(
+                (
+                    opt(alt((
+                        value((), parse_turn_possessive_prefix),
+                        parse_phase_determiner_prefix,
+                    ))),
+                    opt(tag("next ")),
+                    terminated(parse_phase_keyword, opt(tag("s"))),
+                ),
+                |(_, _, phase)| phase,
+            ),
+        ),
+        (
+            opt(preceded(
+                tag(" "),
+                alt((tag("on your turn"), tag("on each of your turns"))),
+            )),
+            eof,
+        ),
+    )
+    .parse(input)
+}
+
+/// CR 500.1 (docs/MagicCompRules.txt:2115): a printed phase or step noun names a
+/// subdivision of a TURN, which is what makes a turn-owner possessive in front of it
+/// ("each of your upkeeps", "an opponent's end step") a statement about WHOSE TURN
+/// the trigger may fire on. Migrated from `CR 503.1a / CR 507.1`, both verified
+/// misfits (upkeep triggers going on the stack; choosing a defending player).
+///
+/// The possessive table itself lives in [`parse_turn_possessive_prefix`] — one
+/// table, two consumers. Also checks for a trailing "on your turn" suffix.
 fn parse_turn_constraint(phase_text: &str) -> Option<TriggerConstraint> {
     // Prefix-based: try at the start of the text
-    if alt((
-        tag::<_, _, OracleError<'_>>("an opponent's "),
-        tag::<_, _, OracleError<'_>>("each opponent's "),
-        tag("each opponents\u{2019} "),
-        tag("each opponents' "),
-        tag("your opponent's "),
-        tag("your opponents\u{2019} "),
-        tag("your opponents' "),
-        tag("each of your opponents\u{2019} "),
-        tag("each of your opponents' "),
-    ))
-    .parse(phase_text)
-    .is_ok()
-    {
-        return Some(TriggerConstraint::OnlyDuringOpponentsTurn);
-    }
-    if alt((tag::<_, _, OracleError<'_>>("each of your "), tag("your ")))
-        .parse(phase_text)
-        .is_ok()
-    {
-        return Some(TriggerConstraint::OnlyDuringYourTurn);
+    if let Ok((_, constraint)) = parse_turn_possessive_prefix(phase_text) {
+        return Some(constraint);
     }
     // Suffix-based: "combat on your turn", "each combat on your turn"
     let mut remaining = phase_text;

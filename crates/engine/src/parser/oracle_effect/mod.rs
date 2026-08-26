@@ -4723,7 +4723,7 @@ fn try_parse_cant_cast_spells_effect(tp: TextPair<'_>) -> Option<ParsedEffectCla
         Some(Box::new(parse_effect_chain(tail, AbilityKind::Spell)))
     };
 
-    Some(ParsedEffectClause {
+    let clause = ParsedEffectClause {
         effect: Effect::AddRestriction {
             restriction: GameRestriction::ProhibitActivity {
                 source: ObjectId(0),
@@ -4732,13 +4732,24 @@ fn try_parse_cant_cast_spells_effect(tp: TextPair<'_>) -> Option<ParsedEffectCla
                 activity: ProhibitedActivity::CastSpells { spell_filter },
             },
         },
-        duration,
+        duration: None,
         sub_ability,
         distribute: None,
         multi_target: None,
         condition: None,
         optional: false,
         unless_pay: None,
+    };
+
+    // CR 611.2a (:2908) + CR 514.2 (:2442): this recognizer owns the leading duration
+    // (`strip_temporary_restriction_duration_prefix`) AND builds its own sub_ability
+    // chain from the tail conjuncts, so it must stamp through the single
+    // chain-distributing authority. Writing `duration` into the literal reached the head
+    // only — Xanathar's CastFromZone and Abeyance's second AddRestriction were emitted
+    // with `duration: None`.
+    Some(match duration {
+        Some(d) => with_clause_chain_duration(clause, d),
+        None => clause,
     })
 }
 
@@ -5032,59 +5043,6 @@ fn try_parse_cant_play_from_zone(tp: TextPair<'_>) -> Option<ParsedEffectClause>
         optional: false,
         unless_pay: None,
     })
-}
-
-/// CR 611.2a: one leading duration scopes BOTH a per-owner exile-play grant and
-/// a play-from-zone prohibition ("Until your next turn, players may play cards
-/// they exiled this way, and they can't play cards from their hand" — Memory
-/// Vessel). A pure split at ", and " would strand the shared leading duration on
-/// the grant half only (there is no general leading-duration distribution), so
-/// this recognizer OWNS the duration and re-stamps it onto both halves.
-fn try_parse_exile_play_grant_with_play_prohibition(
-    tp: TextPair<'_>,
-    ctx: &ParseContext,
-) -> Option<ParsedEffectClause> {
-    let (dur, body) = strip_leading_duration(tp.original)?;
-    let body_lower = body.to_lowercase();
-    // grant = text BEFORE ", and "; restr = text AFTER (probe-verified mapping).
-    let (grant_text, restr_text) =
-        super::oracle_nom::bridge::split_once_on_lower(body, &body_lower, ", and ")?;
-
-    let grant_lower = grant_text.to_lowercase();
-    let mut grant = try_parse_play_from_exile(TextPair::new(grant_text, &grant_lower), ctx)?;
-    if !matches!(
-        &grant.effect,
-        Effect::GrantCastingPermission {
-            permission: CastingPermission::PlayFromExile { .. },
-            ..
-        }
-    ) {
-        return None;
-    }
-
-    // Routes to `try_parse_cant_play_from_zone` via the effect-clause dispatch.
-    let mut restr_def = parse_effect_chain(restr_text, AbilityKind::Spell);
-    if !matches!(
-        &*restr_def.effect,
-        Effect::AddRestriction {
-            restriction: GameRestriction::ProhibitActivity {
-                activity: ProhibitedActivity::ProhibitPlayFromZone { .. },
-                ..
-            },
-        }
-    ) {
-        return None;
-    }
-
-    // Stamp the shared duration on both halves. `with_clause_duration` patches
-    // the grant's `PlayFromExile.duration` and `clause.duration`; the restriction
-    // def's `duration` becomes `UntilPlayerNextTurn{activator}` at AddRestriction
-    // resolution (CR 514.2 + add_restriction::fill_runtime_fields).
-    grant = with_clause_duration(grant, dur.clone());
-    restr_def.duration = Some(dur);
-    restr_def.sub_link = SubAbilityLink::SequentialSibling;
-    grant.sub_ability = Some(Box::new(restr_def));
-    Some(grant)
 }
 
 fn try_parse_cant_activate_non_mana_abilities_effect(
@@ -9824,15 +9782,14 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
         return clause;
     }
 
-    // CR 611.2a: shared-duration exile-play grant + play-from-zone prohibition
-    // ("Until your next turn, players may play cards they exiled this way, and
-    // they can't play cards from their hand" — Memory Vessel). Compound first —
-    // it owns the leading duration; the standalone prohibition below returns
-    // None on this chunk. Both precede the `strip_leading_duration` recursion so
-    // the compound sees the leading duration intact.
-    if let Some(clause) = try_parse_exile_play_grant_with_play_prohibition(tp, ctx) {
-        return clause;
-    }
+    // NOTE (#7923): the `try_parse_exile_play_grant_with_play_prohibition` one-off that
+    // used to be dispatched here — Memory Vessel's "Until your next turn, players may
+    // play cards they exiled this way, and they can't play cards from their hand" —
+    // is DELETED along with its stale claim that "there is no general leading-duration
+    // distribution". There is one now: `sequence::expand_leading_duration_chunks` runs
+    // as a pre-pass over the chunk vector, BEFORE this cascade is ever entered, and
+    // emits the prohibition as an ordinary sibling chunk carrying the printed duration.
+    // The standalone `try_parse_cant_play_from_zone` arm below then handles that chunk.
 
     // CR 116.2a + CR 305.1: "[scope] can't play cards from [zone]" prohibition
     // (Shaman's Trance's graveyard clause, Memory Vessel's hand sub-clause).
@@ -9919,7 +9876,9 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     }
 
     if let Some((duration, rest)) = strip_leading_duration(text) {
-        return with_clause_duration(parse_effect_clause(rest, ctx), duration);
+        // CR 611.2a: the stated duration governs the whole instruction, including every
+        // governed sequential sibling a recognizer built beneath this clause.
+        return with_clause_chain_duration(parse_effect_clause(rest, ctx), duration);
     }
 
     // CR 614.1a + CR 514.2: floating turn-bound zone-change redirect ("if one or
@@ -31472,46 +31431,15 @@ pub(crate) fn parse_effect_chain_ir(
     // mode is re-applied to the built chain via `rewrite_rounding_mode`.
     let (text, chain_rounding) = strip_trailing_rounding_annotation(&text);
     let text = text.as_str();
-    // CR 611.2b + CR 611.2a: A leading "For as long as <condition>," prefix that
-    // resolves to UntilHostLeavesPlay (either "you control ~" or "~ remains on the
-    // battlefield") scopes the ENTIRE following comma body, not just its first
-    // clause. When that body is HETEROGENEOUS — its first clause is a distinct effect
-    // (e.g. "gain control of that permanent") the single-clause arm cannot merge with
-    // the trailing static/restriction riders — starts_prefix_clause ("for as long as")
-    // would otherwise glue the body into one chunk and the single-clause arm would drop
-    // every sibling after the first (Opportunistic Dragon: "it loses all abilities" lost).
-    // Strip the prefix here so split_clause_sequence produces the sibling chunks; the
-    // duration is restamped onto every clause after the chunk loop.
-    //
-    // Gate is deliberately narrow (only Opportunistic Dragon fires across the full
-    // dataset): RESTRICTED to UntilHostLeavesPlay (excludes "until end of turn"
-    // animations, which the single-clause arm MERGES into one GenericEffect) AND to
-    // bodies whose first chunk is neither GenericEffect (homogeneous continuous-mod /
-    // animate merge — Kitesail) nor GrantCastingPermission (play/mana permission merge
-    // — Kotose), the two classes the single-clause arm merges across commas.
-    let leading_host_lifetime_split = strip_leading_duration(text).and_then(|(dur, body)| {
-        if !matches!(dur, Duration::UntilHostLeavesPlay) {
-            return None;
-        }
-        let body_chunks = split_clause_sequence(body);
-        if body_chunks.len() <= 1 {
-            return None;
-        }
-        // Parser-as-detector: classify the first chunk's effect; only chain-route a
-        // distinct, non-mergeable lead.
-        let mut probe_ctx = ParseContext::default();
-        let first = parse_effect_clause(body_chunks[0].text.trim(), &mut probe_ctx);
-        if matches!(
-            first.effect,
-            Effect::GenericEffect { .. } | Effect::GrantCastingPermission { .. }
-        ) {
-            return None;
-        }
-        Some((dur, body))
-    });
-    let text = leading_host_lifetime_split
-        .as_ref()
-        .map_or(text, |(_, body)| *body);
+    // NOTE (#7923): the narrow `leading_host_lifetime_split` gate that used to sit
+    // here — strip a leading `ForAsLongAs{UntilHostLeavesPlay}` prefix, re-chunk the
+    // body, and restamp the duration onto every clause after the loop — is DELETED.
+    // It is subsumed by `sequence::expand_leading_duration_chunks`, which performs the
+    // same recovery at chunk level for EVERY leading duration rather than one, with a
+    // positive parser-derived reach verdict plus three guards in place of its negative
+    // hand-tuned effect-class exclusion list. Measured: the gate fired ZERO times
+    // across the whole corpus once the pre-pass runs first, and leaving it live would
+    // double-strip Opportunistic Dragon's chunk.
     let full_text = text; // bind AFTER the strip so diagnostics track the parsed chunks
     ctx.effect_chain_full_lower = Some(full_text.to_ascii_lowercase());
     // CR 608.2c: A tracked-set source-zone binding is scoped to the chain that
@@ -31567,6 +31495,20 @@ pub(crate) fn parse_effect_chain_ir(
         lower::strip_each_copy_targets_distinct_member_suffix(text);
     let text = text.as_str();
     let chunks = split_clause_sequence(text);
+    // CR 611.2a + CR 608.2c: expand any chunk whose leading duration governs conjuncts the
+    // single-clause parse discarded. The expanded conjuncts become ORDINARY chunks of THIS
+    // chain, which is the only construction under which chain-level anaphor state
+    // (`ctx.subject`, `anchor_subject`, `chain_pending_tracked_set_origin`,
+    // `chain_declared_target_slots`) is available to them at all — a NESTED
+    // `parse_effect_chain_ir` restarts that state and binds `SelfRef` unconditionally
+    // (measured on Opportunistic Dragon). Availability is necessary, not sufficient:
+    // `severed_prefix_end` additionally declines any boundary whose recovered conjuncts
+    // include a conjugated continuation (no subject of their own for that state to bind
+    // to) or a conjunct the generic clause detector did not understand at all.
+    //
+    // Runs BEFORE `compute_sentence_where_x`, which is chunk-INDEX-keyed and must see the
+    // final vector.
+    let chunks = sequence::expand_leading_duration_chunks(chunks, ctx);
     // CR 107.3i: "Normally, all instances of X on an object have the same value."
     // Build a per-chunk sentence-scoped `where X is <expr>` binding so that when
     // one clause in a sentence binds X ("... and you gain X life, where X is <expr>"),
@@ -31658,7 +31600,31 @@ pub(crate) fn parse_effect_chain_ir(
     // recipient through it) rather than boundary-cleared, preventing leak into
     // an unrelated later sentence.
     let mut chain_parent_target_controller_scope: Option<ControllerRef> = None;
+    // CR 611.2a: carried across iterations — (clause count when the stamp was set, the
+    // stamping chunk's text). The residual this closes is a chunk that carries a
+    // distributed leading duration but pushes NO clause at all (it instead mutates an
+    // earlier clause), which would silently lose the printed duration. Checked at the
+    // TOP of the next iteration and once after the loop, because the loop body has
+    // `continue` paths that would skip an end-of-body placement; the offending chunk is
+    // out of scope by then, so its text is carried in the record rather than re-derived
+    // from the current iteration's `normalized_text`. Measured: zero occurrences
+    // corpus-wide.
+    let mut pending_stamp: Option<(usize, String)> = None;
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        // TOP of the iteration: check the PREVIOUS iteration's stamp, then re-arm.
+        debug_assert!(
+            pending_stamp
+                .as_ref()
+                .is_none_or(|(before, _)| builder.clauses().len() > *before),
+            "CR 611.2a: a chunk carrying a distributed leading duration produced no clause; \
+             the printed duration was silently lost (chunk: {:?})",
+            pending_stamp.as_ref().map(|(_, text)| text),
+        );
+        pending_stamp = chunk
+            .leading_duration
+            .as_ref()
+            .map(|_| (builder.clauses().len(), chunk.text.clone()));
+        builder.set_pending_leading_duration(chunk.leading_duration.clone());
         let normalized_text = strip_leading_sequence_connector(&chunk.text).trim();
         if normalized_text.is_empty() {
             continue;
@@ -35126,6 +35092,18 @@ pub(crate) fn parse_effect_chain_ir(
         }
     }
 
+    // Once more after the loop: the final iteration's stamp has no next-iteration
+    // top to check it. See the declaration of `pending_stamp` above.
+    debug_assert!(
+        pending_stamp
+            .as_ref()
+            .is_none_or(|(before, _)| builder.clauses().len() > *before),
+        "CR 611.2a: a chunk carrying a distributed leading duration produced no clause; \
+         the printed duration was silently lost (chunk: {:?})",
+        pending_stamp.as_ref().map(|(_, text)| text),
+    );
+    builder.set_pending_leading_duration(None);
+
     // Merge per-chunk diagnostics and any pre-loop diagnostics into the outer ctx.
     ctx.diagnostics.extend(chunk_diagnostics);
 
@@ -35146,16 +35124,6 @@ pub(crate) fn parse_effect_chain_ir(
     // CR 611.2a is "until end of the game", which is not what we want either).
     let mut clauses = builder.finish();
     try_fold_loses_other_sibling(&mut clauses);
-
-    // CR 611.2b: stamp the stripped leading "for as long as" duration onto every
-    // sibling clause of the heterogeneous body (gain control, "it loses all abilities"
-    // -> RemoveAllAbilities, "can't attack or block"). with_clause_duration patches
-    // both the clause-level duration and any inner GenericEffect.duration.
-    if let Some((dur, _)) = leading_host_lifetime_split {
-        for clause in clauses.iter_mut() {
-            clause.parsed = with_clause_duration(clause.parsed.clone(), dur.clone());
-        }
-    }
 
     EffectChainIr {
         clauses,

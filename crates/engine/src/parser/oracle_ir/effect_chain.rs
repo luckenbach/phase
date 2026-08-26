@@ -8,13 +8,14 @@
 
 use serde::Serialize;
 
-use super::ast::{ClauseBoundary, ContinuationAst, ParsedEffectClause};
+use super::ast::{with_clause_chain_duration, ClauseBoundary, ContinuationAst, ParsedEffectClause};
 use super::doc::{OracleDocBuilder, OracleSourceSpan, OracleUnitSource};
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
     ActivationManaPaymentRestriction, ActivationRestriction, ControllerRef, CostReduction,
-    DelayedTriggerCondition, MultiTargetSpec, OpponentMayScope, PlayerFilter, QuantityExpr,
-    RoundingMode, SubAbilityLink, TargetFilter, TargetSelectionMode, UnlessPayModifier,
+    DelayedTriggerCondition, Duration, MultiTargetSpec, OpponentMayScope, PlayerFilter,
+    QuantityExpr, RoundingMode, SubAbilityLink, TargetFilter, TargetSelectionMode,
+    UnlessPayModifier,
 };
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaExpiry;
@@ -922,6 +923,17 @@ pub(crate) struct ClauseIrBuilder {
     next_clause_id: u32,
     /// Accumulated clauses in source order.
     clauses: Vec<ClauseIr>,
+    /// CR 611.2a + CR 608.2c: the printed leading duration of the chunk currently
+    /// being processed, when that chunk was produced by
+    /// `sequence::expand_leading_duration_chunks` and therefore does NOT carry the
+    /// duration phrase in its own text.
+    ///
+    /// THE SINGLE FUNNEL. `ClauseDraft::push` is the one point every emitted clause
+    /// passes through — `absorb_clause` re-mints through `clause(..).push()` too — so
+    /// applying the stamp there, rather than at each of the chunk loop's many emit
+    /// sites, is what makes "every recovered conjunct carries the printed duration"
+    /// true by construction instead of by enumeration.
+    pending_leading_duration: Option<Duration>,
 }
 
 impl ClauseIrBuilder {
@@ -940,6 +952,7 @@ impl ClauseIrBuilder {
             cursor: 0,
             next_clause_id: 0,
             clauses: Vec::new(),
+            pending_leading_duration: None,
         }
     }
 
@@ -1021,6 +1034,14 @@ impl ClauseIrBuilder {
     /// Read the already-built clauses for mid-chain lookback (prior-referent
     /// checks, condition/opponent-may scans). Returns already-constructed
     /// clauses — it constructs nothing, so the single-construction gate holds.
+    /// CR 611.2a: arm (or disarm) the leading-duration stamp for the chunk about to
+    /// be processed. Called once at the top of every chunk-loop iteration with
+    /// `chunk.leading_duration`, so a chunk that carries none clears a previous
+    /// chunk's stamp rather than inheriting it.
+    pub(crate) fn set_pending_leading_duration(&mut self, duration: Option<Duration>) {
+        self.pending_leading_duration = duration;
+    }
+
     pub(crate) fn clauses(&self) -> &[ClauseIr] {
         &self.clauses
     }
@@ -1163,7 +1184,16 @@ impl ClauseDraft<'_> {
 
     /// Mint the `ClauseId` + `ChainRelative` `OracleUnitSource` and commit the
     /// clause into the builder's source-ordered list.
-    pub(crate) fn push(self) {
+    pub(crate) fn push(mut self) {
+        // CR 611.2a + CR 608.2c: a chunk severed from a leading-duration sentence
+        // carries the printed duration as a TYPED value rather than in its own text,
+        // so the duration must be applied here — the single funnel every emitted
+        // clause passes through — and through the same chain-distributing authority
+        // U1 installed, so a recovered conjunct that is itself a chain-building
+        // recognizer distributes to its own governed links too.
+        if let Some(duration) = self.builder.pending_leading_duration.clone() {
+            self.parsed = with_clause_chain_duration(self.parsed, duration);
+        }
         let id = ClauseId(self.builder.next_clause_id);
         let span = self.builder.locate(&self.source_text);
         // `allocate_with_span` validates containment + fragment/precision. A
