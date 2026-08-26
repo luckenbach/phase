@@ -2054,9 +2054,10 @@ fn apply_duration_to_effect(effect: &mut Effect, duration: &Duration) {
         // and they differ: `imperative.rs`'s Symbiote Spider-Man arm sets
         // `Some(Duration::Permanent)` to MEAN "no duration stated", which a stated
         // outer duration must replace; but `imperative.rs`'s "gain all activated
-        // abilities of" arm sets `duration.or(Some(Duration::UntilEndOfTurn))`, which
-        // carries a genuinely PRINTED inner window that an outer duration must NOT
-        // clobber. Gating on the unset sentinels distinguishes the two.
+        // abilities of" arm emits the printed trailing window recovered by
+        // `strip_trailing_duration` verbatim — a genuinely PRINTED inner window that
+        // an outer duration must NOT clobber, and `None` when nothing was printed.
+        // Gating on the unset sentinels distinguishes the two.
         // NOTE: unit-covered only. No card in the corpus reaches this arm today;
         // Mondo Gecko and Navigator's Compass, which LOOK like this case, are
         // `Effect::GenericEffect` from `build_become_clause` and take the
@@ -2589,10 +2590,10 @@ mod duration_distribution_tests_7923 {
         // `GainActivatedAbilitiesOfTarget` DOES have an arm, and that arm gates on
         // the unset sentinels. Both sides are asserted here because the two parser
         // construction sites in `oracle_effect/imperative.rs` differ: the "gain all
-        // activated abilities of" arm sets `duration.or(Some(UntilEndOfTurn))` — a
-        // genuinely PRINTED window that must survive — while the Symbiote
-        // Spider-Man arm sets `Some(Permanent)` to MEAN "no duration stated", which
-        // the outer duration must replace.
+        // activated abilities of" arm emits the printed trailing window recovered by
+        // `strip_trailing_duration` verbatim — a genuinely PRINTED window that must
+        // survive — while the Symbiote Spider-Man arm sets `Some(Permanent)` to MEAN
+        // "no duration stated", which the outer duration must replace.
         let ga_printed = gain_activated(Some(Duration::UntilEndOfCombat));
         assert_eq!(
             stamped(&ga_printed),

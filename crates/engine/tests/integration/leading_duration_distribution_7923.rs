@@ -825,23 +825,6 @@ fn leading_host_lifetime_gate_is_subsumed() {
     }
 }
 
-/// **V-U2e — `[COVER]`, SHAPE, table-driven.**
-///
-/// **PASSES AT BASE_SHA UNCHANGED, BY DESIGN — this is OVER-SPLITTING cover.**
-/// Each row asserts its exact post-fix chain shape, which EQUALS its BASE shape;
-/// the row fails only if `severed_prefix_end` becomes over-broad. The
-/// revert-failing content for the predicate lives in
-/// `opportunistic_dragon_riders_bind_stolen_permanent` and
-/// `revenge_of_the_hunted_recovers_lure_conjunct`.
-///
-/// Every row asserts an EXACT chain-link count and an EXACT total
-/// `ContinuousModification` count, plus the `Effect::Unimplemented` count. The link
-/// count is what stops the row degenerating into a vacuous equality: severing a
-/// merged conjunct necessarily ADDS a link, so an over-splitting regression turns
-/// EVERY row red — not merely the three carrying a bespoke per-card shape check
-/// below. (Before this was tightened, the loop asserted only `!links.is_empty()`
-/// plus the Unimplemented count, so five of the eight rows would have passed
-/// unchanged through exactly the regression they exist to catch.)
 /// CR 611.2a: `try_parse_gain_all_activated_abilities_of_target` emits the PARSED
 /// duration verbatim, so a card printing no window leaves `None` — a TRUE unset
 /// sentinel a governing leading duration can then stamp.
@@ -905,6 +888,23 @@ fn gain_all_activated_abilities_yields_to_a_governing_leading_duration() {
     );
 }
 
+/// **V-U2e — `[COVER]`, SHAPE, table-driven.**
+///
+/// **PASSES AT BASE_SHA UNCHANGED, BY DESIGN — this is OVER-SPLITTING cover.**
+/// Each row asserts its exact post-fix chain shape, which EQUALS its BASE shape;
+/// the row fails only if `severed_prefix_end` becomes over-broad. The
+/// revert-failing content for the predicate lives in
+/// `opportunistic_dragon_riders_bind_stolen_permanent` and
+/// `revenge_of_the_hunted_recovers_lure_conjunct`.
+///
+/// Every row asserts an EXACT chain-link count and an EXACT total
+/// `ContinuousModification` count, plus the `Effect::Unimplemented` count. The link
+/// count is what stops the row degenerating into a vacuous equality: severing a
+/// merged conjunct necessarily ADDS a link, so an over-splitting regression turns
+/// EVERY row red — not merely the three carrying a bespoke per-card shape check
+/// below. (Before this was tightened, the loop asserted only `!links.is_empty()`
+/// plus the Unimplemented count, so five of the eight rows would have passed
+/// unchanged through exactly the regression they exist to catch.)
 #[test]
 fn leading_duration_merge_cards_unchanged() {
     // (name, oracle, types, subtypes, keywords)
