@@ -286,16 +286,33 @@ fn object_has_static_mode(
 // walk in `with_clause_chain_duration` gates on the link's CARRIER
 // (`def.duration.is_none() || Some(Permanent)`), so a link whose recognizer
 // INJECTED a duration default is indistinguishable from one that printed a
-// window, and the walk declines. Measured, two corpus cards sit in that gap —
-// Dovin Baan and Edifice of Authority, whose "and its activated abilities can't
-// be activated" link is injected `UntilEndOfTurn` by `oracle_effect/subject.rs`
-// and so keeps end-of-turn under an `UntilNextTurnOf{Controller}` head. Neither
-// is a regression (both behave identically at BASE_SHA) and neither reaches the
-// severed-conjunct seam this PR adds — `starts_clause_text_or_conjugated`
-// excludes "its", so that sentence never splits. Closing the gap needs the
-// verbatim-emit remedy applied to `subject.rs`'s prohibition recognizer, the
-// same fix `try_parse_gain_all_activated_abilities_of_target` received here;
-// see tasks #138/#144 in `game/effects/effect.rs`.
+// window, and the walk declines. Measured at this head, FOUR corpus cards sit in
+// that gap, in TWO distinct shapes:
+//
+//   * Dovin Baan, Edifice of Authority, Mythos of Vadrok — the "and its/their
+//     activated abilities can't be activated" link is injected `UntilEndOfTurn`
+//     by `oracle_effect/subject.rs`'s prohibition recognizer, so the link's
+//     CARRIER holds a value indistinguishable from a printed window and the walk
+//     declines. Head is `UntilNextTurnOf{Controller}`; the prohibition ends a
+//     full turn early.
+//
+//   * Teferi's Protection — a DIFFERENT recognizer and a different failure. Its
+//     "you gain protection from everything" link carries `def.duration: None`
+//     with an injected `UntilEndOfTurn` on the EMBEDDED `GenericEffect.duration`
+//     instead, under the same `UntilNextTurnOf{Controller}` head, so protection
+//     from everything expires a turn early.
+//
+// None is a regression — all four are byte-identical at BASE_SHA — and none
+// reaches the severed-conjunct seam this PR adds: `starts_clause_text_or_conjugated`
+// excludes "its"/"their", so those sentences never split.
+//
+// SCOPING NOTE for whoever picks this up: the `subject.rs` verbatim-emit remedy
+// (the fix `try_parse_gain_all_activated_abilities_of_target` received here)
+// closes the first shape ONLY. Teferi's Protection is not a `subject.rs`
+// prohibition, so the work is against the injected-default CLASS — there are ~16
+// `.or(Some(Duration::UntilEndOfTurn))` injection sites across `subject.rs`,
+// `imperative.rs` and `oracle_effect/mod.rs` — not against one recognizer. See
+// tasks #138/#144 in `game/effects/effect.rs`.
 // ===========================================================================
 
 /// **V-U1a — `[BASE]`, SHAPE.** CR 611.2a (`:2908`).
