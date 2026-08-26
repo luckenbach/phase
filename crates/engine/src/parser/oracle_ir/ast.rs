@@ -1996,7 +1996,12 @@ pub(crate) fn with_clause_duration(
 ///   exactly that carrier, so an arm here would be redundant (measured: membership
 ///   ALONE corrects the exported AST of Dovin, Hand of Control and Kiora, the
 ///   Crashing Wave). And it would be unsafe: this function's arms overwrite
-///   UNCONDITIONALLY. Regenerate the population with the census command on
+///   UNCONDITIONALLY unless the arm carries an unset-sentinel guard, and
+///   `PreventDamage` has no sentinel to guard on — its `prevention_duration` is
+///   `None` when unstated, which is indistinguishable at this seam from "governed
+///   but not yet stamped". (The `GainActivatedAbilitiesOfTarget` arm IS guarded,
+///   on `is_none() || Some(Permanent)`; see it for the shape a guard takes when
+///   the variant does have a distinguishable sentinel.) Regenerate the population with the census command on
 ///   `duration_governs`; at the time of writing it is 47 nodes across 46 cards with a
 ///   printed `prevention_duration`, of which 46 are `UntilEndOfTurn` and exactly ONE
 ///   — `sewers of estark`, "prevent all combat damage that would be dealt THIS

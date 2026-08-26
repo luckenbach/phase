@@ -9878,6 +9878,15 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     if let Some((duration, rest)) = strip_leading_duration(text) {
         // CR 611.2a: the stated duration governs the whole instruction, including every
         // governed sequential sibling a recognizer built beneath this clause.
+        //
+        // DELIBERATELY UNGATED, unlike the two other leading-duration stamp sites (the
+        // trailing peel above and `ClauseDraft::push`). CR 608.2c: this duration is
+        // printed at the HEAD of the very sentence `rest` is the body of, so it
+        // syntactically governs that body — a duration the body parser set is its own
+        // injected default, not separately-printed text, and the printed prefix
+        // outranks it. A severed conjunct is the opposite case: separately-printed text
+        // whose own stated window outranks the sentence's prefix, which is why those
+        // two sites gate.
         return with_clause_chain_duration(parse_effect_clause(rest, ctx), duration);
     }
 

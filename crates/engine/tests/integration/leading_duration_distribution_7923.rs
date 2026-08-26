@@ -368,9 +368,11 @@ fn xanathar_leading_duration_reaches_governed_chain_links() {
 /// B4 — `PreventDamage`'s `duration_governs` MEMBERSHIP writes the printed window
 /// onto `AbilityDefinition.duration`, the carrier `prevent_damage::resolve` reads
 /// as the `.or_else` arm of `expiry_from_duration(prevention_duration)`. It must
-/// NOT write the embedded `prevention_duration` field: `apply_duration_to_effect`
-/// overwrites unconditionally, so an arm there would clobber a narrower printed
-/// window and permanently disable that fallback. Both halves are asserted here, so
+/// NOT write the embedded `prevention_duration` field: an UNGUARDED arm in
+/// `apply_duration_to_effect` overwrites unconditionally, so an arm there would
+/// clobber a narrower printed window and permanently disable that fallback — and
+/// `PreventDamage` has no unset sentinel to guard on (unlike the guarded
+/// `GainActivatedAbilitiesOfTarget` arm), so no guard can rescue it. Both halves are asserted here, so
 /// an added arm turns this test red.
 ///
 /// **SCOPE — THIS TEST MAKES NO RUNTIME CLAIM, DELIBERATELY.** Measured at
@@ -840,6 +842,69 @@ fn leading_host_lifetime_gate_is_subsumed() {
 /// below. (Before this was tightened, the loop asserted only `!links.is_empty()`
 /// plus the Unimplemented count, so five of the eight rows would have passed
 /// unchanged through exactly the regression they exist to catch.)
+/// CR 611.2a: `try_parse_gain_all_activated_abilities_of_target` emits the PARSED
+/// duration verbatim, so a card printing no window leaves `None` — a TRUE unset
+/// sentinel a governing leading duration can then stamp.
+///
+/// REVERT-FAILING: with that site restored to `duration.or(Some(UntilEndOfTurn))`,
+/// the injected default is byte-identical to a PRINTED "until end of turn", so
+/// `apply_duration_to_effect`'s unset-sentinel guard declines, the outer window is
+/// silently dropped, and row 2 below reads `UntilEndOfTurn` instead of
+/// `UntilNextTurnOf{Controller}` — a grant that expires a whole turn early.
+///
+/// Constructed directly: all three corpus cards reaching this site (Quicksilver
+/// Elemental, Havengul Lich, Grell Philosopher) print a trailing window, which is
+/// why removing the injected default is corpus-neutral.
+#[test]
+fn gain_all_activated_abilities_yields_to_a_governing_leading_duration() {
+    fn granted_duration(parsed: &engine::parser::oracle::ParsedAbilities) -> Option<Duration> {
+        parsed
+            .abilities
+            .iter()
+            .chain(parsed.triggers.iter().map(trigger_body))
+            .flat_map(chain)
+            .find_map(|d| match &*d.effect {
+                Effect::GainActivatedAbilitiesOfTarget { duration, .. } => Some(duration.clone()),
+                _ => None,
+            })
+            .expect("a GainActivatedAbilitiesOfTarget node must be present")
+    }
+
+    // Row 1 — POSITIVE REACH GUARD: a PRINTED window still reaches the node
+    // unchanged. Without this, row 2 could pass because the site stopped emitting
+    // a duration at all.
+    let printed = parse_oracle_text(
+        "{U}: This creature gains all activated abilities of target creature until end of turn.",
+        "Quicksilver Elemental",
+        &[],
+        &["Creature".to_string()],
+        &["Shapeshifter".to_string()],
+    );
+    assert_eq!(
+        granted_duration(&printed),
+        Some(Duration::UntilEndOfTurn),
+        "a printed trailing window must survive verbatim"
+    );
+
+    // Row 2 — THE DISCRIMINATING ROW: no printed window, so the leading duration
+    // governs and must be the one that lands.
+    let governed = parse_oracle_text(
+        "Until your next turn, target creature gains all activated abilities of target creature.",
+        "Constructed Governed Grant",
+        &[],
+        &["Sorcery".to_string()],
+        &[],
+    );
+    assert_eq!(
+        granted_duration(&governed),
+        Some(Duration::UntilNextTurnOf {
+            player: PlayerScope::Controller
+        }),
+        "the governing leading duration must reach the grant — an injected \
+         UntilEndOfTurn default at the parser site would silently outrank it"
+    );
+}
+
 #[test]
 fn leading_duration_merge_cards_unchanged() {
     // (name, oracle, types, subtypes, keywords)

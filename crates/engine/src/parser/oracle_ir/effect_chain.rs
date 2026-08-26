@@ -1197,10 +1197,16 @@ impl ClauseDraft<'_> {
         // text). Gated exactly as the trailing-duration peel in
         // `oracle_effect/mod.rs` gates its own `with_clause_duration` call; a
         // `Permanent` injected by a sub-parser is an unset sentinel, not a window.
-        if self.parsed.duration.is_none()
-            || matches!(self.parsed.duration, Some(Duration::Permanent))
-        {
-            if let Some(duration) = self.builder.pending_leading_duration.clone() {
+        if self.builder.pending_leading_duration.is_some() {
+            // Which window governs this conjunct and the links BELOW it: its own, if
+            // it printed one, otherwise the sentence's leading duration. Either way
+            // the walk runs, so the conjunct's governed sub-links always inherit a
+            // window rather than falling through to the resolver's default.
+            let governing = match &self.parsed.duration {
+                Some(own) if !matches!(own, Duration::Permanent) => Some(own.clone()),
+                _ => self.builder.pending_leading_duration.clone(),
+            };
+            if let Some(duration) = governing {
                 self.parsed = with_clause_chain_duration(self.parsed, duration);
             }
         }
@@ -1276,9 +1282,15 @@ mod tests {
         let mut b = ClauseIrBuilder::new("a. b");
         b.set_pending_leading_duration(Some(Duration::UntilEndOfTurn));
 
-        // Row 1: the conjunct states its own, narrower window -> PRESERVED.
+        // Row 1: the conjunct states its own, narrower window -> PRESERVED, and
+        // that window is DISTRIBUTED to the governed link beneath it (which would
+        // otherwise reach the resolver with `None` and fall back to a default).
         let mut own = parsed_clause(governed());
         own.duration = Some(Duration::UntilEndOfCombat);
+        own.sub_ability = Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            governed(),
+        )));
         b.clause("a", own, None, emit()).push();
 
         // Row 2: the conjunct states nothing -> STAMPED with the leading duration.
@@ -1292,6 +1304,17 @@ mod tests {
             Some(Duration::UntilEndOfCombat),
             "a recovered conjunct's own printed window must survive the sentence's \
              leading duration"
+        );
+        assert_eq!(
+            clauses[0]
+                .parsed
+                .sub_ability
+                .as_ref()
+                .expect("row 1 sub-link must survive")
+                .duration,
+            Some(Duration::UntilEndOfCombat),
+            "the conjunct's OWN window governs the links beneath it — skipping the \
+             walk entirely would leave this `None` and fall back to a default"
         );
         assert_eq!(
             clauses[1].parsed.duration,

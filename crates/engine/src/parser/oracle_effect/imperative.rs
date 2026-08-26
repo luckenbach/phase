@@ -6947,7 +6947,15 @@ fn try_parse_gain_all_activated_abilities_of_target(text: &str) -> Option<Effect
         recipient: TargetFilter::SelfRef,
         // CR 602.1: "all ACTIVATED abilities of" — the default scope.
         scope: GrantedAbilityScope::ActivatedOnly,
-        duration: duration.or(Some(Duration::UntilEndOfTurn)),
+        // CR 611.2a: emit the PARSED duration verbatim, so `None` is a true unset
+        // sentinel. Injecting a `Some(Duration::UntilEndOfTurn)` default here would
+        // be byte-identical to a PRINTED "until end of turn" and therefore invisible
+        // to `apply_duration_to_effect`'s unset-sentinel guard, which would then
+        // decline to distribute a governing outer duration onto this node. The
+        // default is supplied downstream instead: `gain_activated_abilities.rs`
+        // resolves `duration.or(ability.duration).unwrap_or(UntilEndOfTurn)`, so a
+        // card that prints no window still lands on `UntilEndOfTurn`.
+        duration,
     })
 }
 
