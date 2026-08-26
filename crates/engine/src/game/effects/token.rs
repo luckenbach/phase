@@ -3282,6 +3282,7 @@ fn classify_attach_host_authority(filter: &TargetFilter) -> AttachHostAuthority 
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::PlayerWhoChoseLabel { .. }
+        | TargetFilter::PlayerMatching { .. }
         | TargetFilter::Neighbor { .. }
         | TargetFilter::ScopedPlayer
         | TargetFilter::TriggeringSpellController

@@ -9,28 +9,102 @@ use crate::types::game_state::GameState;
 use crate::types::identifiers::ObjectId;
 use crate::types::replacements::ReplacementEvent;
 
+/// Whether a duration supplies a replacement expiry at the installation seam.
+///
+/// `Unstated` is deliberately distinct from `Unsupported`: only a truly absent
+/// duration may use the engine's end-of-turn fallback. A stated duration that
+/// this replacement lifecycle cannot enforce must fail closed rather than be
+/// shortened to a different window (CR 611.2a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReplacementDurationExpiry {
+    Unstated,
+    Explicit(RestrictionExpiry),
+    /// The duration is enforced by a separate applicability gate rather than an
+    /// expiry prune (`UntilHostLeavesPlay` on the untap-prevention rider).
+    GateControlled,
+    Unsupported,
+}
+
+/// CR 611.2a: map a parser-side `Duration` onto the engine's replacement-side
+/// lifecycle without conflating an absent duration with an unrepresentable one.
 pub(crate) fn expiry_from_duration(
     duration: Option<&Duration>,
     controller: crate::types::player::PlayerId,
-) -> Option<RestrictionExpiry> {
+) -> ReplacementDurationExpiry {
     match duration {
-        Some(Duration::UntilEndOfTurn) => Some(RestrictionExpiry::EndOfTurn),
-        Some(Duration::UntilEndOfCombat) => Some(RestrictionExpiry::EndOfCombat),
+        None => ReplacementDurationExpiry::Unstated,
+        Some(Duration::UntilEndOfTurn) => {
+            ReplacementDurationExpiry::Explicit(RestrictionExpiry::EndOfTurn)
+        }
+        Some(Duration::UntilEndOfCombat) => {
+            ReplacementDurationExpiry::Explicit(RestrictionExpiry::EndOfCombat)
+        }
         Some(Duration::UntilNextTurnOf {
             player: crate::types::ability::PlayerScope::Controller,
-        }) => Some(RestrictionExpiry::UntilPlayerNextTurn { player: controller }),
-        _ => None,
+        }) => ReplacementDurationExpiry::Explicit(RestrictionExpiry::UntilPlayerNextTurn {
+            player: controller,
+        }),
+        // `UntilEndOfNextTurnOf` needs replacement-side arming, while non-controller
+        // turn/step scopes need a resolution-time player binding. Neither is present
+        // at this seam, so applying an `EndOfTurn` default would be rules-incorrect.
+        Some(Duration::UntilNextTurnOf { .. })
+        | Some(Duration::UntilEndOfNextTurnOf { .. })
+        | Some(Duration::UntilNextStepOf { .. }) => ReplacementDurationExpiry::Unsupported,
+        // NOT identity-safe despite the shared name. `Duration::UntilHostLeavesPlay`
+        // means "when the SOURCE object leaves the battlefield";
+        // `RestrictionExpiry::UntilHostLeavesPlay` is pruned when the object
+        // HOSTING the definition leaves (`layers.rs`, the host-left prune, which
+        // keys on the departed id). For a shield installed on a TARGET those are
+        // different objects — Old Fat Spider Can't See Me chapter II binds to the
+        // Saga while hosting its shield on the targeted creature, so the identity
+        // mapping would strand an immortal shield when the Saga leaves first.
+        Some(Duration::UntilHostLeavesPlay) => ReplacementDurationExpiry::GateControlled,
+        // CR 611.2b conditional windows are gated by
+        // `stamp_for_as_long_as_controlled_gate` / `ReplacementCondition`, not by
+        // an expiry stamp.
+        Some(Duration::ForAsLongAs { .. })
+        | Some(Duration::UntilSourceExilesAnotherCard)
+        | Some(Duration::UntilOpponentBecomesMonarch)
+        | Some(Duration::Permanent) => ReplacementDurationExpiry::Unsupported,
     }
 }
 
 fn replacement_with_ability_expiry(
     replacement: &ReplacementDefinition,
     ability: &ResolvedAbility,
-) -> ReplacementDefinition {
+) -> Option<ReplacementDefinition> {
     let mut replacement = replacement.clone();
     if replacement.expiry.is_none() {
-        replacement.expiry = expiry_from_duration(ability.duration.as_ref(), ability.controller);
+        match expiry_from_duration(ability.duration.as_ref(), ability.controller) {
+            ReplacementDurationExpiry::Unstated => {
+                replacement = replacement.with_resolution_shield_expiry();
+            }
+            ReplacementDurationExpiry::Explicit(expiry) => replacement.expiry = Some(expiry),
+            ReplacementDurationExpiry::GateControlled => {}
+            // CR 611.2a: do not install a replacement whose stated duration the
+            // engine cannot enforce. In particular, never replace it with the
+            // end-of-turn fallback, which would shorten the printed window.
+            ReplacementDurationExpiry::Unsupported => return None,
+        }
     }
+    // CR 514.2 + CR 615.3: a SHIELD installed by a resolving spell or ability with
+    // no stated duration falls back to the engine's turn window —
+    // see `ReplacementDefinition::with_resolution_shield_expiry` (an engine
+    // default, not a CR rule). Gated on `shield_kind.is_shield()` so
+    // runtime-installed NON-shield riders that are legitimately durable keep
+    // `expiry: None`: the CR 611.2b `ControllerControlsSource` lock (ended by its
+    // own gate) and the CR 702.84a `UntilHostLeavesPlay` rider (ended by the
+    // battlefield-exit prune).
+    //
+    // CR 604.2: printed static shields never reach this seam — they are seeded
+    // into `base_replacement_definitions` by `printed_cards.rs` — so this cannot
+    // make a durable printed shield turn-bound.
+    //
+    // DEFENCE IN DEPTH: no corpus card reaches this stamp today. Exactly one
+    // `AddTargetReplacement` shield node exists in the card corpus (Impulsive
+    // Maneuvers) and the parser already stamps it `EndOfTurn`. This guard exists
+    // so that removing cleanup's `shield_kind` blanket cannot make a future
+    // unstamped runtime shield immortal.
     // CR 109.4 + CR 614.1a: Anchor the installing player onto the replacement so
     // global pending damage replacements (pushed under the sentinel `ObjectId(0)`,
     // which has no controller in `state.objects`) can resolve a controller-relative
@@ -45,7 +119,7 @@ fn replacement_with_ability_expiry(
     stamp_for_as_long_as_controlled_gate(&mut replacement, ability);
     freeze_damage_modification_x(&mut replacement, ability);
     freeze_parent_copy_target(&mut replacement, ability);
-    replacement
+    Some(replacement)
 }
 
 /// CR 603.2 + CR 603.3b + CR 117.3b: Concretize
@@ -308,7 +382,9 @@ pub fn resolve(
     // Slaughter's "If a source you control would deal damage this turn,
     // it deals that much damage plus 1 instead.").
     if matches!(target, TargetFilter::None) {
-        let mut replacement = replacement_with_ability_expiry(replacement, ability);
+        let Some(mut replacement) = replacement_with_ability_expiry(replacement, ability) else {
+            return Ok(());
+        };
         bind_replacement_to_trigger_source(&mut replacement, state);
         state.pending_damage_replacements.push(replacement);
         attached += 1;
@@ -316,7 +392,11 @@ pub fn resolve(
         for resolved_target in replacement_targets(state, ability, target) {
             match resolved_target {
                 TargetRef::Object(obj_id) => {
-                    let mut replacement = replacement_with_ability_expiry(replacement, ability);
+                    let Some(mut replacement) =
+                        replacement_with_ability_expiry(replacement, ability)
+                    else {
+                        continue;
+                    };
                     replacement.fix_legacy_parse_time_consumed_flag();
                     // CR 611.2b: A "for as long as you control [source]" gated
                     // replacement is a continuous effect that must survive every
@@ -375,7 +455,11 @@ pub fn resolve(
                     }
                 }
                 TargetRef::Player(player) => {
-                    let mut replacement = replacement_with_ability_expiry(replacement, ability);
+                    let Some(mut replacement) =
+                        replacement_with_ability_expiry(replacement, ability)
+                    else {
+                        continue;
+                    };
                     if matches!(
                         replacement.event,
                         crate::types::replacements::ReplacementEvent::DamageDone
@@ -433,6 +517,156 @@ mod tests {
             is_combat: false,
             applied: Default::default(),
         }
+    }
+
+    /// CR 514.2 + CR 615.3: a shield-carrying replacement installed by a resolving
+    /// ability that stated NO representable window gets the engine's turn window at
+    /// this seam, so `turns::execute_cleanup` — which reads `expiry` alone — can
+    /// still end it. The `EndOfTurn` value is an engine default, NOT a CR rule; see
+    /// `ReplacementDefinition::with_resolution_shield_expiry`.
+    ///
+    /// DEFENCE IN DEPTH: no corpus card reaches this stamp today — exactly one
+    /// `AddTargetReplacement` shield node exists (Impulsive Maneuvers) and the
+    /// parser already stamps it `EndOfTurn`. This guard exists so that removing
+    /// cleanup's `shield_kind` blanket cannot make a future unstamped runtime
+    /// shield immortal.
+    #[test]
+    fn unstated_duration_shield_install_gets_engine_turn_window() {
+        use crate::types::ability::{Effect, PreventionAmount, ShieldKind};
+
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let target = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+
+        // `prevention_shield` is the ONE builder that deliberately stamps no
+        // lifetime (it is shared with the printed static lowering), so the `None`
+        // reaching the install seam is genuine and not a builder artifact.
+        let shield = ReplacementDefinition::new(ReplacementEvent::DamageDone)
+            .prevention_shield(PreventionAmount::All)
+            .valid_card(TargetFilter::SelfRef);
+        assert_eq!(
+            shield.expiry, None,
+            "fixture must reach the seam with an unset expiry"
+        );
+
+        let ability = ResolvedAbility::new(
+            Effect::AddTargetReplacement {
+                replacement: Box::new(shield),
+                target: TargetFilter::Any,
+            },
+            vec![TargetRef::Object(target)],
+            source,
+            PlayerId(0),
+        );
+        assert_eq!(
+            ability.duration, None,
+            "fixture must reach the seam with both duration carriers unset"
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        // Positive reach-guard: the definition actually landed on the target.
+        let obj = state.objects.get(&target).unwrap();
+        assert_eq!(obj.replacement_definitions.len(), 1);
+        assert_eq!(
+            obj.replacement_definitions[0].shield_kind,
+            ShieldKind::Prevention {
+                amount: PreventionAmount::All
+            }
+        );
+        assert_eq!(
+            obj.replacement_definitions[0].expiry,
+            Some(RestrictionExpiry::EndOfTurn),
+            "CR 514.2: an unstated-window resolution shield takes the engine turn default"
+        );
+
+        // Negative sibling: a NON-shield rider installed the same way keeps
+        // `expiry: None` — the gate is `shield_kind.is_shield()`, not "stamp
+        // everything". CR 611.2b / CR 702.84a riders are legitimately durable.
+        let rider = ReplacementDefinition::new(ReplacementEvent::Moved)
+            .valid_card(TargetFilter::SelfRef)
+            .destination_zone(Zone::Exile);
+        let rider_ability = ResolvedAbility::new(
+            Effect::AddTargetReplacement {
+                replacement: Box::new(rider),
+                target: TargetFilter::Any,
+            },
+            vec![TargetRef::Object(target)],
+            source,
+            PlayerId(0),
+        );
+        resolve(&mut state, &rider_ability, &mut events).unwrap();
+
+        let obj = state.objects.get(&target).unwrap();
+        let installed_rider = obj
+            .replacement_definitions
+            .as_slice()
+            .iter()
+            .find(|r| r.event == ReplacementEvent::Moved)
+            .expect("non-shield rider must be installed");
+        assert!(
+            installed_rider.shield_kind.is_none(),
+            "reach-guard: the negative sibling must genuinely be a non-shield"
+        );
+        assert_eq!(
+            installed_rider.expiry, None,
+            "a non-shield rider must not acquire a turn window at this seam"
+        );
+    }
+
+    #[test]
+    fn stated_unrepresentable_duration_does_not_install_a_shield() {
+        use crate::types::ability::{Effect, PreventionAmount};
+
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let target = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        let shield = ReplacementDefinition::new(ReplacementEvent::DamageDone)
+            .prevention_shield(PreventionAmount::All)
+            .valid_card(TargetFilter::SelfRef);
+        let mut ability = ResolvedAbility::new(
+            Effect::AddTargetReplacement {
+                replacement: Box::new(shield),
+                target: TargetFilter::Any,
+            },
+            vec![TargetRef::Object(target)],
+            source,
+            PlayerId(0),
+        );
+        ability.duration = Some(Duration::UntilEndOfNextTurnOf {
+            player: crate::types::ability::PlayerScope::Controller,
+        });
+
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+
+        assert!(
+            state.objects[&target].replacement_definitions.is_empty(),
+            "CR 611.2a: a stated next-turn duration must not be shortened to EndOfTurn"
+        );
     }
 
     #[test]

@@ -4031,6 +4031,20 @@ pub(super) enum InsteadLowering {
     NotOwned,
 }
 
+/// Printed word order for a self-replacement clause.
+///
+/// The axis matters only for Teamwork today: a forward clause whose body begins
+/// with "instead" is already owned by the additional-cost fold that preserves
+/// cast-time alternative targeting. A trailing "instead" (whether the condition
+/// is leading or trailing) has no such owner and lowers through the generic
+/// `ConditionInstead` branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsteadClauseOrder {
+    ForwardLeadingInstead,
+    ForwardTrailingInstead,
+    Inverted,
+}
+
 pub(super) fn try_parse_generic_instead_clause(
     text: &str,
     kind: AbilityKind,
@@ -4038,8 +4052,8 @@ pub(super) fn try_parse_generic_instead_clause(
 ) -> InsteadLowering {
     // Forward form: "If <cond>, [body] instead." — split on the leading "If, "
     // and strip a trailing/leading "instead" from the body.
-    if let Some((cond_text, effect_text)) = split_forward_instead_clause(text) {
-        return build_instead_def(cond_text, effect_text, kind, ctx);
+    if let Some((cond_text, effect_text, order)) = split_forward_instead_clause(text) {
+        return build_instead_def(cond_text, effect_text, kind, ctx, order);
     }
 
     // CR 614.1a + CR 608.2c: Inverted form — "[body] instead if <cond>." (e.g.
@@ -4048,7 +4062,13 @@ pub(super) fn try_parse_generic_instead_clause(
     // `" instead if "` boundary mirrors the line-level `strip_instead_clause`
     // in `oracle.rs` but operates on a single chunk inside the chain loop.
     if let Some((cond_text, effect_text)) = split_inverted_instead_clause(text) {
-        return build_instead_def(cond_text, effect_text, kind, ctx);
+        return build_instead_def(
+            cond_text,
+            effect_text,
+            kind,
+            ctx,
+            InsteadClauseOrder::Inverted,
+        );
     }
 
     InsteadLowering::NotOwned
@@ -4057,7 +4077,7 @@ pub(super) fn try_parse_generic_instead_clause(
 /// Forward instead form: "If <cond>, [body] instead." Returns the trimmed
 /// `(condition_text, effect_text)` if the leading-conditional + trailing-or-
 /// leading "instead" structure matches. Returns None otherwise.
-fn split_forward_instead_clause(text: &str) -> Option<(String, String)> {
+fn split_forward_instead_clause(text: &str) -> Option<(String, String, InsteadClauseOrder)> {
     let (condition_fragment, raw_body) = split_leading_conditional(text)?;
     let condition_lower = condition_fragment.to_lowercase();
     let cond_text = nom_on_lower(&condition_fragment, &condition_lower, |i| {
@@ -4070,17 +4090,30 @@ fn split_forward_instead_clause(text: &str) -> Option<(String, String)> {
 
     let trimmed_body = raw_body.trim_end_matches('.').trim();
     let trimmed_lower = trimmed_body.to_lowercase();
-    let effect_text = if let Some(stripped) = trimmed_body.strip_suffix(" instead") {
-        stripped.trim().to_string()
+    let trailing_instead = nom_on_lower(trimmed_body, &trimmed_lower, |i| {
+        map(
+            all_consuming(terminated(take_until(" instead"), tag(" instead"))),
+            str::len,
+        )
+        .parse(i)
+    });
+    let (effect_text, order) = if let Some((stripped_len, _)) = trailing_instead {
+        (
+            trimmed_body[..stripped_len].trim().to_string(),
+            InsteadClauseOrder::ForwardTrailingInstead,
+        )
     } else if let Some((_, rest)) = nom_on_lower(trimmed_body, &trimmed_lower, |i| {
         value((), tag("instead ")).parse(i)
     }) {
-        rest.trim().to_string()
+        (
+            rest.trim().to_string(),
+            InsteadClauseOrder::ForwardLeadingInstead,
+        )
     } else {
         return None;
     };
 
-    Some((cond_text, effect_text))
+    Some((cond_text, effect_text, order))
 }
 
 /// Inverted instead form: "[body] instead if <cond>." Returns the trimmed
@@ -4161,6 +4194,7 @@ fn build_instead_def(
     effect_text: String,
     kind: AbilityKind,
     ctx: &mut ParseContext,
+    order: InsteadClauseOrder,
 ) -> InsteadLowering {
     // CR 608.2c: An additional-cost-paid "instead" fold ("if it/this spell was
     // kicked, ... instead") is owned by `strip_additional_cost_conditional`,
@@ -4180,7 +4214,19 @@ fn build_instead_def(
     // replacement. Everything that lowers today still lowers; only the failure
     // path is split, by `condition_names_an_event`, into "defer" vs "fail
     // honestly".
-    let Some(condition) = lower_instead_condition(&cond_text, ctx) else {
+    let condition = lower_instead_condition(&cond_text, ctx).or_else(|| match order {
+        // CR 601.2b/c + CR 608.2c: "if teamwork, instead [body]" remains with
+        // the established additional-cost fold, which announces alternative
+        // target requirements before targets are chosen.
+        InsteadClauseOrder::ForwardLeadingInstead => None,
+        // CR 601.2f + CR 608.2c: "[body] instead if teamwork" and "if teamwork,
+        // [body] instead" are typed resolution-time replacements gated
+        // specifically on the Teamwork cost.
+        InsteadClauseOrder::ForwardTrailingInstead | InsteadClauseOrder::Inverted => {
+            parse_cast_using_teamwork_condition_text(&cond_text)
+        }
+    });
+    let Some(condition) = condition else {
         return if condition_names_an_event(&cond_text) {
             InsteadLowering::NotOwned
         } else {

@@ -1432,7 +1432,7 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             text(if *won { "wins" } else { "loses" }),
         ],
 
-        GameEvent::RingTemptsYou { player_id } => {
+        GameEvent::RingTemptsYou { player_id, .. } => {
             vec![text("The Ring tempts "), player_seg(state, *player_id)]
         }
 
@@ -2215,6 +2215,7 @@ mod tests {
             },
             GameEvent::RingTemptsYou {
                 player_id: PlayerId(0),
+                chosen_bearer: None,
             },
             GameEvent::CrimeCommitted {
                 player_id: PlayerId(0),

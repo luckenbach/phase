@@ -2,10 +2,10 @@ use std::str::FromStr;
 
 use crate::parser::oracle_nom::error::{oracle_err, OracleError, OracleResult};
 use nom::branch::alt;
-use nom::bytes::complete::{tag, tag_no_case, take_until};
-use nom::character::complete::{char, multispace0, multispace1};
-use nom::combinator::{all_consuming, eof, map_opt, opt, peek, rest, value};
-use nom::multi::separated_list1;
+use nom::bytes::complete::{tag, tag_no_case, take_until, take_while1};
+use nom::character::complete::{anychar, char, multispace0, multispace1};
+use nom::combinator::{all_consuming, eof, map_opt, opt, peek, recognize, rest, value};
+use nom::multi::{many_till, separated_list1};
 use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
 
@@ -791,6 +791,9 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     if nom_primitives::scan_contains(&lower, "you would create a")
         && nom_primitives::scan_contains(&lower, "instead")
     {
+        if let Some(def) = parse_same_subtype_plus_additional_token_replacement(&lower, &text) {
+            return Some(def);
+        }
         if let Some(def) = parse_subtype_token_substitution(&lower, &text) {
             return Some(def);
         }
@@ -4092,7 +4095,18 @@ fn parse_enters_with_counters(
         return Some(def);
     }
 
-    let counter_entries = parse_enters_counter_entries(after_additional);
+    // The conjoined-list reader gets `after_with`, NOT
+    // `after_additional`. The caller-level "an additional " strip above exists
+    // for the single-counter path, and it eats the very article that anchors the
+    // list's leading element: "an additional +1/+1 counter and deathtouch
+    // counter on it" (March Toward Perfection) would arrive as "+1/+1 counter
+    // and …", whose head carries no count, so the whole list was rejected and
+    // every conjunct past the first silently dropped. The element grammar
+    // consumes "[an] additional" itself (`strip_additional_counter_qualifier`),
+    // so handing it the unstripped text is strictly more permissive — it also
+    // picks up "an additional +1/+1 counter and a lifelink counter on it", which
+    // the strip likewise used to break.
+    let counter_entries = parse_enters_counter_entries(after_with);
     // Detect dynamic count: "a number of [type] counters ... equal to [qty]"
     let after_prefix = tag::<_, _, OracleError<'_>>("a number of ")
         .parse(after_additional)
@@ -4206,16 +4220,43 @@ fn parse_enters_with_counters(
     // parse yields a typed filter with a concrete type/subtype (not the `Any`
     // fallback). A non-type subject parses to the `[Any]` fallback and is
     // rejected, falling through to the `SelfRef` self-ETB branch.
-    let subject = parse_distributive_subject(work_text).and_then(|(subject_text, scope)| {
-        let (filter, _) = parse_type_phrase(subject_text);
-        let is_valid = matches!(
-            &filter,
-            TargetFilter::Typed(TypedFilter { type_filters, .. })
-                if !type_filters.is_empty()
-                    && type_filters.as_slice() != [TypeFilter::Any]
-        );
-        is_valid.then_some((filter, scope))
-    });
+    let subject = parse_distributive_subject(work_text)
+        .or_else(|| {
+            // CR 614.12 + issue #7821: bare-plural distributive subject —
+            // "Colorless creatures you control enter with two additional +1/+1
+            // counters on them" (Curator Beastie). Only the PLURAL verb marks a
+            // bare subject: singular lines are the self-ETB "~ enters with"
+            // shape or carry the explicit each/other prefix handled above; the
+            // type-validity gate below still rejects non-subject plurals.
+            (nom_primitives::scan_contains(work_text, "enter with")
+                || nom_primitives::scan_contains(work_text, "escape with"))
+            .then_some((work_text, SubjectScope::Distributive))
+        })
+        .and_then(|(subject_text, scope)| {
+            // CR 105.2a-105.2c: peel a leading color-quality word ("colorless "/
+            // "monocolored "/"multicolored ") so the type detector sees the
+            // noun and the quality survives as a filter property.
+            let (after_color, color_prop) =
+                crate::parser::oracle_static::peel_color_quality_prefix(subject_text);
+            let (filter, _) = parse_type_phrase(after_color);
+            let is_valid = matches!(
+                &filter,
+                TargetFilter::Typed(TypedFilter { type_filters, .. })
+                    if !type_filters.is_empty()
+                        && type_filters.as_slice() != [TypeFilter::Any]
+            );
+            if !is_valid {
+                return None;
+            }
+            let filter = match (filter, color_prop) {
+                (TargetFilter::Typed(mut tf), Some(prop)) => {
+                    tf.properties.insert(0, prop);
+                    TargetFilter::Typed(tf)
+                }
+                (other, _) => other,
+            };
+            Some((filter, scope))
+        });
     let valid_card = if let Some((filter, scope)) = subject {
         // CR 614.12: only the "other" scope excludes the source from the subset.
         let filter = match (filter, scope) {
@@ -4759,46 +4800,117 @@ fn strip_additional_counter_qualifier(input: &str) -> &str {
 }
 
 fn parse_enters_counter_entries(after_with: &str) -> Option<Vec<(CounterType, QuantityExpr)>> {
+    parse_enters_counter_entries_with_rest(after_with).map(|(entries, _rest)| entries)
+}
+
+/// As [`parse_enters_counter_entries`], but also returns the text left AFTER the
+/// list's `" on it"` terminator.
+///
+/// The remainder is what lets a caller tell a complete clause from one that
+/// still has a printed instruction attached — "…counter and deathtouch counter
+/// on it" versus "…on it and with haste". A caller that discards it is choosing
+/// to publish whatever it parsed and drop the rest, which is only acceptable
+/// where that partial behavior already existed; a NEW route must look at this
+/// and decide deliberately. See the cast-enters trigger route, which fails
+/// closed on a non-empty remainder.
+fn parse_enters_counter_entries_with_rest(
+    after_with: &str,
+) -> Option<(Vec<(CounterType, QuantityExpr)>, &str)> {
     let mut remaining = after_with;
     let mut entries = Vec::new();
 
-    loop {
-        let (mut count_expr, rest) = parse_count_expr(remaining)?;
-        rewrite_variable_x_to_cost_x_paid(&mut count_expr);
-        // CR 122.1: strip the "additional" qualifier that follows the count word
-        // ("two additional +1/+1 counters") so it doesn't leak into the type.
-        let rest = strip_additional_counter_qualifier(rest);
-
-        let (at_counter, counter_type_raw) = take_until::<_, _, OracleError<'_>>(" counter")
-            .parse(rest)
-            .ok()?;
-        if counter_type_raw.trim().is_empty() {
-            return None;
-        }
-        let counter_type =
-            crate::parser::oracle_effect::counter::normalize_counter_type(counter_type_raw);
-        let (after_space, _) = tag::<_, _, OracleError<'_>>(" ").parse(at_counter).ok()?;
-        let (after_counter_word, _) =
-            alt((tag::<_, _, OracleError<'_>>("counters"), tag("counter")))
-                .parse(after_space)
-                .ok()?;
-
-        entries.push((counter_type, count_expr));
+    let rest_after_list = loop {
+        // Only a NON-LEADING conjunct may elide its count — the first
+        // element's mandatory count is what anchors the list.
+        let (entry, after_counter_word) =
+            parse_enters_counter_entry(remaining, !entries.is_empty())?;
+        entries.push(entry);
 
         if let Some(next) = parse_enters_counter_separator(after_counter_word) {
             remaining = next;
             continue;
         }
 
-        tag::<_, _, OracleError<'_>>(" on it")
+        let (rest, _) = tag::<_, _, OracleError<'_>>(" on it")
             .parse(after_counter_word)
             .ok()?;
-        break;
-    }
+        break rest;
+    };
 
-    (entries.len() >= 2).then_some(entries)
+    (entries.len() >= 2).then_some((entries, rest_after_list))
 }
 
+/// Whether the text trailing a counter list still carries a printed instruction.
+///
+/// Sentence-final punctuation is not an instruction; anything else is. Used to
+/// decide whether a clause was consumed WHOLE, so a route can refuse to publish
+/// a replacement that silently discards half its sentence.
+fn counter_list_remainder_is_exhausted(rest: &str) -> bool {
+    rest.trim().trim_end_matches('.').trim().is_empty()
+}
+
+/// Parse ONE element of an "enters with" counter list, returning the
+/// entry and the remainder after its `counter`/`counters` noun.
+///
+/// Two element shapes, tried in that order:
+///   * COUNTED — "two +1/+1 counters", "an additional lifelink counter",
+///     "X charge counters". The count opens with `oracle_util::parse_count_expr`,
+///     so the whole arithmetic grammar (X, `twice X`, `half X, rounded up`,
+///     `N plus/minus X`) is available and any surviving `X` is rewritten to the
+///     entering object's `CostXPaid` (CR 614.12).
+///   * ELIDED — "…and deathtouch counter on it", where the leading element's
+///     determiner distributes across the conjunction. Delegated to the shared
+///     `oracle_effect::parse_countless_counter_element` so this reader and the
+///     battlefield-rider list in `oracle_effect::lower` cannot drift on the
+///     element grammar; see that function for the recognized-type and
+///     singular-noun guards that keep an unanchored element from over-claiming.
+///
+/// `allow_elided_count` is false at the head of the list and true after any
+/// separator — the count is what anchors the leading element.
+fn parse_enters_counter_entry(
+    input: &str,
+    allow_elided_count: bool,
+) -> Option<((CounterType, QuantityExpr), &str)> {
+    if let Some(parsed) = parse_counted_enters_counter_entry(input) {
+        return Some(parsed);
+    }
+    if !allow_elided_count {
+        return None;
+    }
+    let (rest, entry) =
+        crate::parser::oracle_effect::parse_countless_counter_element(input).ok()?;
+    Some((entry, rest))
+}
+
+/// The COUNTED element shape of [`parse_enters_counter_entry`] — see there.
+fn parse_counted_enters_counter_entry(input: &str) -> Option<((CounterType, QuantityExpr), &str)> {
+    let (mut count_expr, rest) = parse_count_expr(input)?;
+    rewrite_variable_x_to_cost_x_paid(&mut count_expr);
+    // CR 122.1: strip the "additional" qualifier that follows the count word
+    // ("two additional +1/+1 counters") so it doesn't leak into the type.
+    let rest = strip_additional_counter_qualifier(rest);
+
+    let (at_counter, counter_type_raw) = take_until::<_, _, OracleError<'_>>(" counter")
+        .parse(rest)
+        .ok()?;
+    if counter_type_raw.trim().is_empty() {
+        return None;
+    }
+    let counter_type =
+        crate::parser::oracle_effect::counter::normalize_counter_type(counter_type_raw);
+    let (after_space, _) = tag::<_, _, OracleError<'_>>(" ").parse(at_counter).ok()?;
+    let (after_counter_word, _) = alt((tag::<_, _, OracleError<'_>>("counters"), tag("counter")))
+        .parse(after_space)
+        .ok()?;
+
+    Some(((counter_type, count_expr), after_counter_word))
+}
+
+/// Match a list separator AND verify the element after it parses, so a
+/// separator that is really a sentence connective ("…on it, then draw a card")
+/// leaves the list intact. This is the hand-rolled equivalent of the backtracking
+/// nom gets for free from `many0(preceded(sep, element))`; it lives here because
+/// this reader's counted element is not a pure combinator.
 fn parse_enters_counter_separator(input: &str) -> Option<&str> {
     let (after_sep, _) = alt((
         tag::<_, _, OracleError<'_>>(", and "),
@@ -4808,17 +4920,8 @@ fn parse_enters_counter_separator(input: &str) -> Option<&str> {
     .parse(input)
     .ok()?;
 
-    let (_, rest) = parse_count_expr(after_sep)?;
-    let (at_counter, counter_type_raw) = take_until::<_, _, OracleError<'_>>(" counter")
-        .parse(rest)
-        .ok()?;
-    if counter_type_raw.trim().is_empty() {
-        return None;
-    }
-    let (after_space, _) = tag::<_, _, OracleError<'_>>(" ").parse(at_counter).ok()?;
-    alt((tag::<_, _, OracleError<'_>>("counters"), tag("counter")))
-        .parse(after_space)
-        .ok()?;
+    // Post-separator position, so the elided-count form is in scope here too.
+    parse_enters_counter_entry(after_sep, true)?;
 
     Some(after_sep)
 }
@@ -4915,10 +5018,20 @@ fn build_enters_counter_ability(entries: Vec<(CounterType, QuantityExpr)>) -> Ab
 ///   "whenever you cast " → spell filter → ", that " → subject →
 ///   " enters with " → count-prefix → counter-type → " counter(s) on it"
 ///   [", where x is " → quantity ref] [trailing punctuation]
-fn parse_whenever_you_cast_enters_with(
-    norm_lower: &str,
-    original_text: &str,
-) -> Option<ReplacementDefinition> {
+/// CR 603.1: The SHAPE half of the cast-enters recognizer — everything up to and
+/// including `"enters with "`. Split out so "is this the cast-enters shape?" and
+/// "does its payload parse?" are separate questions.
+///
+/// The dispatcher needs both answers. A line that is not this shape must fall
+/// through to the generic replacement route; a line that IS this shape but whose
+/// payload is unsupported must NOT, because that route would model a cast
+/// TRIGGER as an object-hosted replacement — the exact rules error called out
+/// above (CR 603.1 + CR 603.3: the effect must outlive the source leaving the
+/// battlefield). Answering both from one parse keeps the grammar in one place.
+///
+/// Returns the (controller-constrained) spell filter and the text after
+/// `"enters with "`.
+fn parse_cast_enters_with_prefix(norm_lower: &str) -> Option<(TypedFilter, &str)> {
     // Prefix.
     let (rest, _) = tag::<_, _, OracleError<'_>>("whenever you cast ")
         .parse(norm_lower)
@@ -4961,6 +5074,63 @@ fn parse_whenever_you_cast_enters_with(
     let (rest, _) = tag::<_, _, OracleError<'_>>("enters with ")
         .parse(rest)
         .ok()?;
+
+    Some((spell_typed, rest))
+}
+
+fn parse_whenever_you_cast_enters_with(
+    norm_lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    let (spell_typed, rest) = parse_cast_enters_with_prefix(norm_lower)?;
+
+    // A CONJOINED counter list ("an additional +1/+1 counter and deathtouch
+    // counter on it") routes through `parse_enters_counter_entries` — the same
+    // reader the self-ETB replacement path uses, so this grammar has ONE
+    // authority instead of the bespoke single-counter parse below. The bespoke
+    // parse stays as the fallback for everything the list reader declines.
+    //
+    // Gated on every count being `Fixed`, which is what keeps the two count
+    // axes from silently crossing. The shared reader rewrites a bare `X` to the
+    // entering object's `CostXPaid` (right for a self-ETB "enters with X
+    // counters", CR 614.12), but `X` in THIS shape is bound by the trailing
+    // "where X is …" clause and is resolved below from that clause instead —
+    // Communal Brewing ("enters with X additional +1/+1 counters on it, where X
+    // is the number of ingredient counters on this enchantment") would silently
+    // become CostXPaid without the gate. No printed card puts a conjoined list
+    // and an X count in this position together, so the gate costs no coverage.
+    if let Some((entries, after_list)) =
+        parse_enters_counter_entries_with_rest(rest).filter(|(entries, _)| {
+            entries
+                .iter()
+                .all(|(_, count)| matches!(count, QuantityExpr::Fixed { .. }))
+        })
+    {
+        // FAIL CLOSED on an unconsumed rider. The list stops at " on it", so a
+        // trailing instruction ("… on it and with haste") would otherwise be
+        // dropped while this route published a complete-looking trigger — a
+        // rules-bearing sentence reported as fully supported when half of it was
+        // discarded. Returning `None` for the WHOLE recognizer (rather than
+        // falling through to the single-counter parse below) is deliberate:
+        // falling through would re-publish the same partial ability with even
+        // fewer counters.
+        //
+        // This gate is scoped to THIS route on purpose. The self-ETB path shares
+        // `parse_enters_counter_entries` and has always tolerated a trailing
+        // rider; tightening it there would fail closed on the nine Invasion
+        // kicker cards and drop the counters they place today (#7721), trading a
+        // partial parse for no parse at all.
+        if !counter_list_remainder_is_exhausted(after_list) {
+            return None;
+        }
+        return Some(
+            ReplacementDefinition::new(ReplacementEvent::ChangeZone)
+                .execute(build_enters_counter_ability(entries))
+                .valid_card(TargetFilter::Typed(spell_typed))
+                .destination_zone(Zone::Battlefield)
+                .description(original_text.to_string()),
+        );
+    }
 
     // Count prefix: "an additional" | "N additional" | plain "N" | "x additional" | "x".
     // Mirrors `try_parse_enters_with_additional_counters` — the Wildgrowth
@@ -5069,6 +5239,54 @@ fn parse_whenever_you_cast_enters_with(
 /// object named by `state.current_trigger_event` (this trigger's own
 /// originating `SpellCast` event — CR 603.2) at install time, so only that
 /// exact spell's entry can ever satisfy it.
+/// CR 603.1 + CR 603.3: What the dispatcher learned about a
+/// `"Whenever you cast …, that … enters with …"` line.
+///
+/// The presence axis is decided independently of the parse axis, the same shape
+/// as [`EntersWithLeadingIfOutcome`]: once the cast-enters PREFIX matches, the
+/// line belongs to this recognizer's authority, so an unsupported payload yields
+/// `ShapeUnsupported` and never `NotThisShape`.
+///
+/// That distinction is load-bearing rather than cosmetic. Collapsing both to
+/// `None` lets the caller fall through to the generic replacement route, which
+/// re-parses a cast TRIGGER as an object-hosted replacement — the effect would
+/// then die with its source instead of surviving to affect the cast spell, the
+/// rules error this module's dispatcher note warns against.
+pub(crate) enum CastEntersWithOutcome {
+    /// Not the cast-enters shape. The caller should keep dispatching.
+    NotThisShape,
+    /// The cast-enters shape, fully parsed.
+    Parsed(Box<TriggerDefinition>),
+    /// The cast-enters shape, but its clause carries something this recognizer
+    /// does not support (e.g. a trailing rider the counter list cannot consume).
+    /// The caller MUST fail the line closed rather than fall through.
+    ShapeUnsupported,
+}
+
+/// Tri-state form of [`parse_whenever_you_cast_enters_with_trigger`] — see
+/// [`CastEntersWithOutcome`] for why the caller needs more than `Option`.
+pub(crate) fn parse_whenever_you_cast_enters_with_outcome(
+    text: &str,
+    card_name: &str,
+) -> CastEntersWithOutcome {
+    match parse_whenever_you_cast_enters_with_trigger(text, card_name) {
+        Some(trigger) => CastEntersWithOutcome::Parsed(Box::new(trigger)),
+        None => {
+            // Re-run ONLY the shape prefix against the same normalized text the
+            // recognizer uses, so "my shape, unsupported" is distinguished from
+            // "not my shape" without duplicating the grammar.
+            let stripped = strip_reminder_text(text);
+            let normalized = replace_self_refs(&stripped, card_name);
+            let norm_lower = normalized.to_lowercase();
+            if parse_cast_enters_with_prefix(&norm_lower).is_some() {
+                CastEntersWithOutcome::ShapeUnsupported
+            } else {
+                CastEntersWithOutcome::NotThisShape
+            }
+        }
+    }
+}
+
 pub(crate) fn parse_whenever_you_cast_enters_with_trigger(
     text: &str,
     card_name: &str,
@@ -7203,8 +7421,11 @@ fn parse_continuous_redirect_recipient(input: &str) -> OracleResult<'_, DamageRe
 /// rather than a CR 614.5 one-opportunity shield: "all damage that would be dealt
 /// …" for a stated window applies to EVERY matching damage event in that window,
 /// unlike "the next time …"/"the next N damage …", which are spent by their first
-/// event. The window itself is end-of-turn cleanup (CR 514.2), which
-/// `ShieldKind::is_shield()` already enforces — the two spellings the corpus uses
+/// event. The window itself is end-of-turn cleanup (CR 611.2a + CR 514.2),
+/// stamped as `RestrictionExpiry::EndOfTurn` by
+/// `ReplacementDefinition::redirection_shield` at install and read by
+/// `turns::execute_cleanup`; `ShieldKind` classifies the effect and carries no
+/// lifetime meaning of its own — the two spellings the corpus uses
 /// are Heroic Sacrifice's leading "Until end of turn," (lifted to the ability's
 /// own `duration` by the chunker before this parser sees the clause) and Gideon's
 /// Sacrifice / Saving Grace's inline "this turn".
@@ -9529,6 +9750,60 @@ fn parse_xorn_subtype_token_replacement(
     )
 }
 
+/// CR 614.1a + CR 111.1: Parse subtype-gated replacements that preserve the
+/// original token batch and append an equal-sized batch of another subtype:
+///
+/// ```text
+/// If you would create a <S> token, instead create a <S> token and a <T> token.
+/// ```
+///
+/// The repeated primary subtype must match the antecedent. Keeping that check
+/// here prevents a substitution such as Food -> Clue plus Treasure from being
+/// misrepresented as an additional-token effect.
+fn parse_same_subtype_plus_additional_token_replacement(
+    lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    let subtype = |input| {
+        take_while1::<_, _, OracleError<'_>>(|c: char| {
+            c.is_alphanumeric() || matches!(c, '-' | '\'')
+        })
+        .parse(input)
+    };
+    let article = || alt((tag::<_, _, OracleError<'_>>("a "), tag("an ")));
+    let (_, (antecedent, _, repeated, _, additional, _, _)) = all_consuming((
+        preceded(tag("if you would create "), preceded(article(), subtype)),
+        tag(" token, instead create "),
+        preceded(article(), subtype),
+        tag(" token and "),
+        preceded(article(), subtype),
+        tag(" token."),
+        eof,
+    ))
+    .parse(lower)
+    .ok()?;
+
+    if !antecedent.eq_ignore_ascii_case(repeated) {
+        return None;
+    }
+
+    let descriptor = format!("a {additional} token");
+    let token = super::oracle_effect::parse_token_description(&descriptor)?;
+    let spec = token_description_to_spec(&token)?;
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::CreateToken)
+            .condition(ReplacementCondition::TokenSubtypeMatches {
+                subtypes: vec![canonicalize_subtype(antecedent)],
+            })
+            // CR 109.5 + CR 111.2: "you" is the source controller, and only
+            // token batches that player creates are affected.
+            .token_owner_scope(ControllerRef::You)
+            .additional_token_spec(spec)
+            .description(original_text.to_string()),
+    )
+}
+
 /// CR 614.1a + CR 111.1: Tippy-Toe class — generic additional token without subtype gate.
 fn parse_generic_additional_token_replacement(
     lower: &str,
@@ -10698,7 +10973,7 @@ pub(crate) fn parse_bidirectional_damage_prevention(
 
     let subject_raw = nom_primitives::scan_at_word_boundaries(norm_lower, |input| {
         preceded(
-            tag::<_, _, OracleError<'_>>("dealt to and dealt by "),
+            tag::<_, _, OracleError<'_>>(BIDIRECTIONAL_ELLIPSIS_ANCHOR),
             take_damage_source_subject_clause,
         )
         .parse(input)
@@ -10720,11 +10995,312 @@ pub(crate) fn parse_bidirectional_damage_prevention(
     if let Some(cs) = combat_scope {
         base = base.combat_scope(cs);
     }
+    // CR 611.2a + CR 514.2: Stamp the clause's own stated window through the SAME
+    // authority the single-definition path uses, on `base` — BEFORE the two halves
+    // are cloned, so the recipient half and the source half can never disagree
+    // about the lifetime of one physical sentence. Without this, the ellipsis form
+    // ("...dealt to and dealt by enchanted creature this turn.") produced two
+    // shields with `expiry: None`, i.e. an immortal, game-wide combat-damage
+    // lockout on any PERMANENT host — the exact defect this commit fixes for the
+    // single-definition shape. Not corpus-reachable today (all six cards this
+    // recognizer claims are windowless printed statics), but the class has
+    // permanent-hosted members one printing away: Deftblade Elite, Urborg Phantom
+    // and Moonlight Geist all carry this sentence as an ability body.
+    //
+    // The anchor passed here is this recognizer's OWN ellipsis phrase — the same
+    // `BIDIRECTIONAL_ELLIPSIS_ANCHOR` the subject extraction above matched — not
+    // the prevention verb. A multi-sentence line ("Prevent all damage that would
+    // be dealt to you this turn. Prevent all combat damage that would be dealt to
+    // and dealt by enchanted creature.") carries the verb in BOTH sentences, so a
+    // verb anchor would read sentence 1's window onto two halves built entirely
+    // from sentence 2 — pruning a correct printed static at the first cleanup
+    // step, which is the Solitary Confinement defect wearing a different hat.
+    // Anchoring on the ellipsis phrase makes the window come from the same
+    // sentence the subject did, by construction.
+    match stated_clause_expiry(norm_lower, BIDIRECTIONAL_ELLIPSIS_ANCHOR) {
+        StatedClauseExpiry::Explicit(expiry) => base = base.expiry(expiry),
+        StatedClauseExpiry::Durable => {}
+        StatedClauseExpiry::Unsupported => return None,
+    }
 
     let recipient_half = base.clone().valid_card(subject.clone());
     let source_half = base.damage_source_filter(subject);
 
     Some(vec![recipient_half, source_half])
+}
+
+/// The prevention verb the single-definition path anchors on, both to select the
+/// sentence whose window it may read and to locate the start of the clause whose
+/// gates are then checked. Carries its trailing space deliberately — see
+/// `sentence_carrying_anchor`.
+const PREVENTION_VERB_ANCHOR: &str = "prevent ";
+
+/// The ellipsis phrase `parse_bidirectional_damage_prevention` anchors on. Shared
+/// between that recognizer's subject extraction and its `stated_clause_expiry`
+/// call so the SUBJECT and the WINDOW are provably read from the same sentence of
+/// a multi-sentence line — the two cannot drift because there is only one phrase.
+const BIDIRECTIONAL_ELLIPSIS_ANCHOR: &str = "dealt to and dealt by ";
+
+/// CR 611.2a + CR 514.2: The window a prevention clause states FOR ITSELF,
+/// mapped to the `RestrictionExpiry` the runtime prunes read.
+///
+/// `window_anchor` names the phrase that identifies WHICH sentence of the line is
+/// the clause in question — `PREVENTION_VERB_ANCHOR` for the single-definition
+/// path, `BIDIRECTIONAL_ELLIPSIS_ANCHOR` for the two-definition ellipsis
+/// recognizer. This function is the ONE window authority both recognizers read
+/// through; parameterizing the anchor rather than forking the function is what
+/// keeps them from disagreeing about one physical line (see gate 1 in
+/// `prevention_clause_owns_trailing_window`).
+///
+/// `turns::execute_cleanup` reads `expiry` and only `expiry` — no prune infers a
+/// lifetime from `shield_kind` — so a stated window the parser drops produces a
+/// definition nothing can ever remove. That is not hypothetical: Urza's Science
+/// Fair Project's die-roll result row "Prevent all combat damage it would deal
+/// this turn." lowers to a printed, object-hosted `DamageDone` shield with
+/// neither `valid_card` nor `damage_target_filter`, on an Artifact Creature — a
+/// PERMANENT, so unlike the eight Instant/Sorcery hosts of the same shape it is
+/// not neutralized by `object_replacement_candidate_applies`' `[Battlefield,
+/// Command]` zone gate. Unstamped, it prevents ALL combat damage in the game, to
+/// or from either player, for the rest of the game.
+///
+/// POSITION IS THE WHOLE POINT. `oracle_effect::lower::strip_trailing_duration`
+/// is the phrase→`Duration` authority and owns the *per-turn-quantity* lookback
+/// guards ("where X is the number of tokens you created this turn"), but it does
+/// NOT own the judgement this function needs, and it is deliberately not extended
+/// to: it is a shared authority every effect line in the parser runs through, and
+/// its own relative-clause guard (`target_relative_clause_owns_suffix`) anchors on
+/// the FIRST `" that "` in its input, so a NESTED relative clause
+/// ("...dealt to creatures that attacked this turn") slips past it. This function
+/// therefore adds its own positional gates on top, scoped to the prevention class
+/// where a wrong answer is destructive (see `prevention_clause_owns_trailing_window`).
+/// The asymmetry is intentional: not stamping leaves a durable definition (the
+/// pre-existing, safe behaviour); stamping wrongly deletes a correct printed
+/// static off a format-legal permanent at the next cleanup step, which is exactly
+/// the Solitary Confinement bug this commit exists to fix.
+///
+/// CR 604.2: a printed static ability states no window at all, so the ordinary
+/// case returns `None` and the definition stays durable — exactly what Solitary
+/// Confinement, Fog Bank, Nine Lives and Pariah require.
+///
+/// SCOPE NOTE on "`expiry` is the single lifetime authority": that premise is
+/// true for definitions the runtime can ever consult, which is MODULO
+/// `object_replacement_candidate_applies`' `[Battlefield, Command]` zone gate.
+/// Five turn-windowed printed shield defs in the corpus (Head to Head, Sex
+/// Appeal, That's No Moonmist, Torrent of Lava, Winds of Qal Sisma) still emit
+/// `expiry: null` and are inert only because they are Instants/Sorceries that
+/// never reach the battlefield. The premise holds unconditionally only for
+/// PERMANENT hosts.
+enum StatedClauseExpiry {
+    Explicit(crate::types::ability::RestrictionExpiry),
+    Durable,
+    Unsupported,
+}
+
+fn stated_clause_expiry(clause_lower: &str, window_anchor: &str) -> StatedClauseExpiry {
+    use crate::types::ability::RestrictionExpiry;
+
+    let Some(sentence) = prevention_clause_owns_trailing_window(clause_lower, window_anchor) else {
+        return StatedClauseExpiry::Durable;
+    };
+    let (_, duration) = super::oracle_effect::lower::strip_trailing_duration(sentence);
+    match duration {
+        None => StatedClauseExpiry::Durable,
+        // CR 514.2: "this turn" / "until end of turn" ends at the cleanup step.
+        Some(Duration::UntilEndOfTurn) => {
+            StatedClauseExpiry::Explicit(RestrictionExpiry::EndOfTurn)
+        }
+        // CR 511.2: "this combat" / "until end of combat" expires at the end of
+        // the combat phase; `complete_end_combat_teardown` catches the live and
+        // pending surfaces and the cleanup prune catches the base surface.
+        Some(Duration::UntilEndOfCombat) => {
+            StatedClauseExpiry::Explicit(RestrictionExpiry::EndOfCombat)
+        }
+        // CR 611.2a + CR 500.4: a parsed static replacement has no installation
+        // context from which to bind these player/step-relative windows. Rejecting
+        // the definition keeps coverage honest; mapping them to EndOfTurn would
+        // silently shorten the card's stated duration.
+        Some(Duration::UntilNextTurnOf { .. })
+        | Some(Duration::UntilEndOfNextTurnOf { .. })
+        | Some(Duration::UntilNextStepOf { .. }) => StatedClauseExpiry::Unsupported,
+        // Not turn windows: these end on an event or a condition, so `None` is the
+        // CORRECT answer, not an unmapped one — the battlefield-exit prune in
+        // `layers.rs` and the CR 611.2b `ReplacementCondition` gate end them, and
+        // stamping any turn window here would cut them short.
+        Some(Duration::UntilHostLeavesPlay)
+        | Some(Duration::ForAsLongAs { .. })
+        | Some(Duration::UntilSourceExilesAnotherCard)
+        | Some(Duration::UntilOpponentBecomesMonarch) => StatedClauseExpiry::Durable,
+        // CR 604.2: an explicitly permanent window is the printed-static case —
+        // no expiry, and the definition must survive every cleanup step.
+        Some(Duration::Permanent) => StatedClauseExpiry::Durable,
+    }
+}
+
+/// CR 611.2a: Narrow `clause_lower` to the prevention clause whose OWN trailing
+/// window `stated_clause_expiry` may read, or `None` when no such window can be
+/// attributed.
+///
+/// Three positional gates, each closing a measured overreach of the bare
+/// `strip_trailing_duration` call this replaces. All three fail CLOSED (return
+/// `None` → no stamp → durable definition), which is the pre-existing behaviour.
+///
+/// 1. SENTENCE. A prevention line can span sentences — `extract_prevention_followup`
+///    exists precisely for the Vigor / Phyrexian Hydra / Stormwild Capridor /
+///    Hostility cohort — and the whole line reaches this parser as one string. A
+///    duration at the END of the line therefore need not belong to the prevention
+///    clause at all ("Prevent all damage that would be dealt to you. Target
+///    creature gets +1/+1 until end of turn." must NOT inherit that +1/+1's
+///    window). So the window is read from the sentence carrying `window_anchor`,
+///    never from the line. The CALLER supplies that anchor, because "which
+///    sentence is this definition's clause" is the caller's fact, not this
+///    function's: the single-definition path builds from the first `"prevent "`
+///    verb and passes `PREVENTION_VERB_ANCHOR`, while the ellipsis recognizer
+///    builds both halves from whichever sentence carries
+///    `BIDIRECTIONAL_ELLIPSIS_ANCHOR` and passes that instead. A line carrying
+///    the prevention verb in TWO sentences ("Prevent all damage that would be
+///    dealt to you this turn. Prevent all combat damage that would be dealt to
+///    and dealt by enchanted creature.") is exactly where a single hard-coded
+///    verb anchor makes the two recognizers disagree, and it is the Fog Bank /
+///    Gaseous Form printed-static shape, so the disagreement would prune a
+///    correct printed static.
+/// 2. SUBORDINATING CONJUNCTION. A subordinate clause after the prevention verb
+///    ("...dealt to you if you've gained 3 or more life this turn", "...as long as
+///    a permanent left the battlefield under your control this turn") owns its own
+///    "this turn"; the prevention grammar itself contains no subordinator, so the
+///    presence of one means the trailing window cannot be attributed.
+/// 3. NESTED RELATIVE CLAUSE. "...dealt to creatures that attacked this turn"
+///    binds "this turn" to the recipient filter — the parser proves it, emitting
+///    `FilterProp::AttackedThisTurn`. Delegates the judgement to
+///    `oracle_target::parse_that_clause_suffix`, the same authority
+///    `strip_trailing_duration`'s own guard uses, but scanned at EVERY word
+///    boundary rather than only the first `" that "`, so a relative clause nested
+///    inside the prevention clause's own "that would be dealt ..." is seen.
+///
+///    Gate 3 is deliberately EXACTLY as complete as `parse_that_clause_suffix`,
+///    and that coupling is the design, not an oversight: the gate declines iff
+///    the filter parser actually bound the relative clause, so it can never
+///    claim a binding the AST does not show. A relative clause the filter parser
+///    does not recognize therefore still lets the window through — but in every
+///    such case that same non-recognition already leaves the definition with
+///    `valid_card: null`, i.e. an over-broad shield. Bounding an over-broad
+///    shield to one turn is strictly the LESSER error, so the boundary is safe
+///    in the direction it fails. Widening gate 3 past the filter parser would
+///    mean guessing at bindings the parser cannot prove; the way to widen it is
+///    to teach `parse_that_clause_suffix` the missing relative clause, which
+///    fixes `valid_card` and this gate in one move.
+fn prevention_clause_owns_trailing_window<'a>(
+    clause_lower: &'a str,
+    window_anchor: &str,
+) -> Option<&'a str> {
+    let sentence = sentence_carrying_anchor(clause_lower, window_anchor)?;
+    // The prevention grammar (`parse_damage_prevention_replacement` step 1) anchors
+    // its amount at the "prevent " verb, so the segment after it is exactly the
+    // clause whose window is in question. This is the VERB anchor regardless of
+    // which anchor selected the sentence: gates 2 and 3 ask "what follows the
+    // prevention verb inside this sentence", a question the ellipsis phrase does
+    // not answer. A selected sentence that carries no prevention verb fails closed
+    // here (no stamp → durable definition), matching the other two gates.
+    let after_prevent = strip_after(sentence, PREVENTION_VERB_ANCHOR)?;
+
+    let subordinate_clause_intervenes =
+        nom_primitives::scan_at_word_boundaries(after_prevent, |input: &str| {
+            alt((
+                tag::<_, _, OracleError<'_>>("whenever "),
+                tag("when "),
+                tag("as long as "),
+                tag("if "),
+                tag("while "),
+                tag("unless "),
+            ))
+            .parse(input)
+        })
+        .is_some();
+    if subordinate_clause_intervenes {
+        return None;
+    }
+
+    let relative_clause_owns_suffix =
+        nom_primitives::scan_at_word_boundaries(after_prevent, |input: &str| {
+            let fail = || nom::Err::Error(OracleError::new(input, nom::error::ErrorKind::Fail));
+            let (_, consumed) =
+                super::oracle_target::parse_that_clause_suffix(input, None).ok_or_else(fail)?;
+            let remaining = input.get(consumed..).ok_or_else(fail)?;
+            // The relative clause owns the suffix only if it runs to the end of the
+            // clause; a genuine OUTER window after it ("... that attacked this turn
+            // until end of turn") leaves a remainder and is still readable.
+            (
+                multispace0,
+                opt(alt((tag::<_, _, OracleError<'_>>("."), tag(",")))),
+                multispace0,
+                eof,
+            )
+                .parse(remaining)
+        })
+        .is_some();
+    if relative_clause_owns_suffix {
+        return None;
+    }
+
+    Some(sentence)
+}
+
+/// The FIRST sentence of `clause_lower` that carries `anchor`, or `None` if no
+/// sentence does.
+///
+/// Sentence boundaries are walked with nom combinators rather than a string split,
+/// recognizing space and newline sentence separators. The anchor is matched at word
+/// boundaries only, so it cannot fire mid-word.
+///
+/// FIRST is the right answer for both callers because each caller passes the same
+/// phrase its own definition-building anchored on: `parse_damage_prevention_replacement`
+/// extracts its amount at the first `strip_after(.., "prevent ")`, and
+/// `parse_bidirectional_damage_prevention` extracts its subject at the first
+/// word-boundary `BIDIRECTIONAL_ELLIPSIS_ANCHOR`. Same phrase, same scan
+/// direction, therefore same sentence as the definition — which is precisely the
+/// property that keeps the two recognizers from disagreeing about one line.
+///
+/// `PREVENTION_VERB_ANCHOR` deliberately carries its trailing space: it must match
+/// the verb ("prevent all", "prevent the next 3", "prevent 2 of that damage") and
+/// NOT the past participle in a follow-up rider ("if damage is prevented this
+/// way", Stormwild Capridor), which states no window of its own.
+fn sentence_carrying_anchor<'a>(clause_lower: &'a str, anchor: &str) -> Option<&'a str> {
+    let mut remaining = clause_lower;
+    loop {
+        // `many_till(anychar, peek(sentence_boundary))` stops at the FIRST supported
+        // sentence separator, so a later ". " cannot swallow an earlier newline
+        // boundary. Pairing it with the same boundary parser consumes exactly that
+        // separator and preserves the traversal grammar.
+        let (sentence, tail) = match (
+            recognize(many_till(
+                anychar::<_, OracleError<'_>>,
+                peek(alt((
+                    tag::<_, _, OracleError<'_>>(". "),
+                    tag(".\r\n"),
+                    tag(".\n"),
+                ))),
+            )),
+            alt((tag::<_, _, OracleError<'_>>(". "), tag(".\r\n"), tag(".\n"))),
+        )
+            .parse(remaining)
+        {
+            Ok((tail, (sentence, _))) => (sentence, tail),
+            // No further sentence boundary: the rest of the line is one sentence.
+            Err(nom::Err::Error(_) | nom::Err::Failure(_) | nom::Err::Incomplete(_)) => {
+                (remaining, "")
+            }
+        };
+        let carries_anchor = nom_primitives::scan_at_word_boundaries(sentence, |input: &str| {
+            tag::<_, _, OracleError<'_>>(anchor).parse(input)
+        })
+        .is_some();
+        if carries_anchor {
+            return Some(sentence);
+        }
+        if tail.is_empty() {
+            return None;
+        }
+        remaining = tail;
+    }
 }
 
 /// CR 615: Parse damage prevention replacement effects.
@@ -10997,6 +11573,25 @@ fn parse_damage_prevention_replacement(
     }
     if let Some(sf) = damage_source_filter {
         def = def.damage_source_filter(sf);
+    }
+    // CR 611.2a + CR 514.2: record the window this clause states for ITSELF, so
+    // `expiry` — the single lifetime authority `turns::execute_cleanup` reads —
+    // carries what the card actually says instead of silently dropping it. A
+    // CR 604.2 printed static states no window, so `stated_clause_expiry`
+    // returns `None` for it and the definition stays durable.
+    //
+    // The `is_none()` guard is VACUOUSLY TRUE today and is kept only as a
+    // never-clobber assertion: nothing between `ReplacementDefinition::new` above
+    // and this line writes `expiry` (`prevention_shield` deliberately does not
+    // stamp one). It is not guarding a real prior write — if a future arm starts
+    // setting `expiry` earlier, that arm's answer is the more specific one and
+    // must win over this generic clause-window read.
+    if def.expiry.is_none() {
+        match stated_clause_expiry(working_lower, PREVENTION_VERB_ANCHOR) {
+            StatedClauseExpiry::Explicit(expiry) => def = def.expiry(expiry),
+            StatedClauseExpiry::Durable => {}
+            StatedClauseExpiry::Unsupported => return None,
+        }
     }
     // Capture whether the recipient filter was event-driven (typed
     // `valid_card`) before moving it onto `def` — the follow-up rewrite
@@ -12160,7 +12755,8 @@ mod tests {
     use crate::parser::oracle::parse_oracle_text;
     use crate::types::ability::{
         AbilityCondition, Comparator, ControllerRef, CountScope, QuantityExpr,
-        QuantityModification, QuantityRef, ReplacementCondition, ShieldKind, ZoneRef,
+        QuantityModification, QuantityRef, ReplacementCondition, RestrictionExpiry, ShieldKind,
+        ZoneRef,
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::keywords::Keyword;
@@ -14094,6 +14690,279 @@ mod tests {
                 );
             }
             other => panic!("expected Typed opponent-controlled source filter, got {other:?}"),
+        }
+    }
+
+    /// CR 611.2a + CR 514.2 vs CR 604.2: `expiry` records the window a prevention
+    /// clause states FOR ITSELF, and nothing else. Shape-level companion to the
+    /// runtime pin in
+    /// `tests/integration/printed_damage_prevention_survives_turn.rs::turn_windowed_printed_shield_is_stamped_and_does_not_survive_cleanup`.
+    ///
+    /// The discriminating half is `TRAILING-POSITION` block: every one of those
+    /// four inputs ends in `"this turn"` / `"until end of turn"` at the very END of
+    /// the line, so a stamp that merely reads the last duration phrase passes them
+    /// all; only the positional gates in `prevention_clause_owns_trailing_window`
+    /// reject them. Each would otherwise delete a correct printed static off a
+    /// format-legal permanent at the next cleanup step — the reported Solitary
+    /// Confinement bug, reintroduced card by card.
+    ///
+    /// (A mid-sentence "this turn", e.g. Neriv, Heart of the Storm's "that entered
+    /// this turn would deal damage", does NOT discriminate here: the bare
+    /// `strip_trailing_duration` call these gates replaced already declined it,
+    /// because the phrase is not in trailing position at all.)
+    #[test]
+    fn prevention_expiry_records_only_a_clause_final_stated_window() {
+        // Verbatim Urza's Science Fair Project, result row 2. A trailing "this
+        // turn" IS this effect's own window.
+        let windowed = parse_replacement_line(
+            "Prevent all combat damage it would deal this turn.",
+            "Urza's Science Fair Project",
+        )
+        .expect("the prevention clause must still parse");
+        assert!(windowed.shield_kind.is_shield());
+        assert_eq!(
+            windowed.expiry,
+            Some(RestrictionExpiry::EndOfTurn),
+            "CR 611.2a: a clause-final 'this turn' is the effect's stated window"
+        );
+
+        // Verbatim Solitary Confinement, line 3. CR 604.2: a printed static
+        // states no window, so it must stay durable.
+        let durable = parse_replacement_line(
+            "Prevent all damage that would be dealt to you.",
+            "Solitary Confinement",
+        )
+        .expect("the printed static must still parse");
+        assert!(durable.shield_kind.is_shield());
+        assert_eq!(
+            durable.expiry, None,
+            "CR 604.2: a printed static's shield carries no window"
+        );
+
+        // TRAILING-POSITION discrimination. Every input below ends in a duration
+        // phrase at the very end of the line, so `strip_trailing_duration` alone
+        // reports `UntilEndOfTurn` for all four; the window nevertheless belongs to
+        // a subordinate clause or to a different sentence, never to the shield.
+        for (text, why) in [
+            (
+                // The parser itself proves the binding: it emits
+                // `FilterProp::AttackedThisTurn` on the recipient filter from this
+                // very phrase, then must not also read it as the shield's window.
+                "Prevent all damage that would be dealt to creatures that attacked this turn.",
+                "a nested relative clause owns its own 'this turn'",
+            ),
+            (
+                "Prevent all combat damage that would be dealt to you by creatures \
+                 that entered the battlefield this turn.",
+                "a nested relative clause on the SOURCE owns its own 'this turn'",
+            ),
+            (
+                "Prevent all damage that would be dealt to you if you've gained 3 \
+                 or more life this turn.",
+                "a trailing 'if' condition owns its own 'this turn'",
+            ),
+            (
+                // The SUFFIX form of the "as long as" condition; only the PREFIX
+                // form is lifted by `strip_as_long_as_condition_prefix`.
+                "Prevent all damage that would be dealt to you as long as a permanent \
+                 left the battlefield under your control this turn.",
+                "a trailing 'as long as' condition owns its own 'this turn'",
+            ),
+            (
+                "Prevent all damage that would be dealt to you. Target creature gets \
+                 +1/+1 until end of turn.",
+                "a DIFFERENT sentence's duration is not this shield's window",
+            ),
+        ] {
+            let def = parse_replacement_line(text, "Probe Card")
+                .unwrap_or_else(|| panic!("the prevention clause must still parse: {text}"));
+            // Reach-guard: the shield really was built, so `expiry: None` below is
+            // a decision this parser made and not an early bail-out.
+            assert!(
+                def.shield_kind.is_shield(),
+                "reach-guard: {text} must still produce a prevention shield"
+            );
+            assert_eq!(
+                def.expiry, None,
+                "CR 604.2 + CR 611.2a: {why} — a printed static must not acquire a \
+                 turn window from it ({text})"
+            );
+        }
+    }
+
+    /// CR 611.2a + CR 514.2: the bidirectional "dealt to and dealt by <subject>"
+    /// ellipsis recognizer emits TWO definitions from ONE physical sentence, so
+    /// both halves must agree about that sentence's stated window — and must apply
+    /// the same positional discipline as the single-definition path.
+    ///
+    /// `parse_bidirectional_damage_prevention` is a standalone dispatch arm that
+    /// bypasses `parse_damage_prevention_replacement` entirely (see `oracle.rs`
+    /// `dispatch`), so it is exercised directly here; `parse_replacement_line` can
+    /// only ever return one definition and cannot reach it.
+    #[test]
+    fn bidirectional_prevention_halves_share_the_clause_stated_window() {
+        let windowed = "prevent all combat damage that would be dealt to and dealt by \
+                        enchanted creature this turn.";
+        let halves = parse_bidirectional_damage_prevention(windowed, windowed)
+            .expect("the ellipsis form must still parse");
+        assert_eq!(halves.len(), 2, "recipient half + source half");
+        for half in &halves {
+            assert!(half.shield_kind.is_shield(), "reach-guard: shield built");
+            assert_eq!(
+                half.expiry,
+                Some(RestrictionExpiry::EndOfTurn),
+                "CR 514.2: both halves of one sentence carry that sentence's window"
+            );
+        }
+        // The two halves are distinguished only by which role they scope.
+        assert!(halves[0].valid_card.is_some() && halves[0].damage_source_filter.is_none());
+        assert!(halves[1].valid_card.is_none() && halves[1].damage_source_filter.is_some());
+
+        // CR 604.2: the windowless printed static (Fog Bank / Statecraft / Gaseous
+        // Form cohort) stays durable on both halves.
+        let durable = "prevent all combat damage that would be dealt to and dealt by \
+                       creatures you control.";
+        for half in parse_bidirectional_damage_prevention(durable, durable)
+            .expect("Statecraft's printed static must still parse")
+        {
+            assert!(half.shield_kind.is_shield(), "reach-guard: shield built");
+            assert_eq!(
+                half.expiry, None,
+                "CR 604.2: a printed static's shield carries no window"
+            );
+        }
+
+        // Same positional discipline as the single-definition path: a duration
+        // belonging to a DIFFERENT sentence must not be inherited by either half.
+        let other_sentence = "prevent all combat damage that would be dealt to and dealt by \
+                              enchanted creature. target creature gets +1/+1 until end of turn.";
+        for half in parse_bidirectional_damage_prevention(other_sentence, other_sentence)
+            .expect("the ellipsis form must still parse")
+        {
+            assert!(half.shield_kind.is_shield(), "reach-guard: shield built");
+            assert_eq!(
+                half.expiry, None,
+                "CR 611.2a: the two recognizers must agree on what a stated window is"
+            );
+        }
+
+        // ANCHOR DISCRIMINATION. Both lines below carry the prevention verb in
+        // BOTH sentences, so selecting the sentence by the prevention verb picks
+        // the FIRST one while the two halves are built entirely from the sentence
+        // carrying the ellipsis. Reading the window from the definition-bearing
+        // sentence is the only way to get both of these right, and getting the
+        // second one wrong prunes a correct Fog Bank / Gaseous Form printed static
+        // at the first cleanup step.
+        for (text, expected, why) in [
+            (
+                // The ellipsis sentence states the window; the earlier prevention
+                // sentence does not. A verb anchor reads sentence 1 and finds no
+                // duration, dropping a window the clause really did state.
+                "prevent all damage that would be dealt to you. prevent all combat damage \
+                 that would be dealt to and dealt by enchanted creature this turn.",
+                Some(RestrictionExpiry::EndOfTurn),
+                "the window stated BY the ellipsis sentence is the halves' own window",
+            ),
+            (
+                // The mirror: an earlier prevention sentence states a window the
+                // ellipsis sentence does not. A verb anchor reads sentence 1 and
+                // stamps a window belonging to a different definition entirely.
+                "prevent all damage that would be dealt to you this turn. prevent all combat \
+                 damage that would be dealt to and dealt by enchanted creature.",
+                None,
+                "a window stated by a DIFFERENT prevention sentence is not the halves' window",
+            ),
+        ] {
+            let halves = parse_bidirectional_damage_prevention(text, text)
+                .unwrap_or_else(|| panic!("the ellipsis form must still parse: {text}"));
+            assert_eq!(halves.len(), 2, "recipient half + source half: {text}");
+            // PROVENANCE REACH-GUARD: both halves are scoped by the ELLIPSIS
+            // sentence's subject ("enchanted creature" → `AttachedTo`), never by
+            // the other prevention sentence's recipient ("you" → a player filter).
+            // This is what makes the `expiry` assertions below a statement about
+            // sentence agreement rather than an early bail-out.
+            assert_eq!(
+                halves[0].valid_card,
+                Some(TargetFilter::AttachedTo),
+                "reach-guard: recipient half is built from the ellipsis sentence ({text})"
+            );
+            assert_eq!(
+                halves[1].damage_source_filter,
+                Some(TargetFilter::AttachedTo),
+                "reach-guard: source half is built from the ellipsis sentence ({text})"
+            );
+            for half in &halves {
+                assert!(half.shield_kind.is_shield(), "reach-guard: shield built");
+                assert_eq!(
+                    half.expiry, expected,
+                    "CR 611.2a: {why} — both recognizers read the window from the sentence \
+                     their definition was built from ({text})"
+                );
+            }
+        }
+    }
+
+    /// CR 611.2a + CR 500.4: a stated window that cannot be bound at the
+    /// replacement-installation seam must fail closed, never become a different
+    /// end-of-turn window or a durable shield.
+    #[test]
+    fn stated_but_unmappable_printed_window_fails_closed() {
+        for (text, why) in [
+            (
+                // "until your next turn" lowers to `Duration::UntilNextTurnOf`,
+                // whose `RestrictionExpiry` counterpart needs a `PlayerId` that
+                // does not exist at parse time.
+                "Prevent all damage that would be dealt to you until your next turn.",
+                "the player-relative turn window (`UntilNextTurnOf`)",
+            ),
+            (
+                // "until the end of your next turn" lowers to
+                // `Duration::UntilEndOfNextTurnOf`, a SECOND player-relative turn
+                // window that is a whole turn later than `UntilNextTurnOf` and
+                // likewise needs a `PlayerId` the parse seam cannot supply.
+                "Prevent all damage that would be dealt to you until the end of your next turn.",
+                "the end-of-next-turn window (`UntilEndOfNextTurnOf`)",
+            ),
+            (
+                // CR 500.4: "until your next upkeep" lowers to
+                // `Duration::UntilNextStepOf`, a STEP-keyed window with no
+                // replacement prune at all. It is the leg furthest from its stated
+                // window — an upkeep deadline is a whole opponent turn away — so
+                // approximating it to `EndOfTurn` is the most consequential of the
+                // three legs and the one most in need of a pin.
+                "Prevent all damage that would be dealt to you until your next upkeep.",
+                "the step-keyed window (`UntilNextStepOf`)",
+            ),
+        ] {
+            assert!(
+                parse_replacement_line(text, "Probe Card").is_none(),
+                "CR 611.2a: {why} cannot be represented at this seam, so the parser must \
+                 not install a replacement with an invented lifetime ({text})"
+            );
+        }
+
+        // CR 604.2: the contrast case — a clause that states NO window at all is
+        // durable by design and must NOT pick up the same fallback.
+        let durable = parse_replacement_line(
+            "Prevent all damage that would be dealt to you.",
+            "Solitary Confinement",
+        )
+        .expect("the printed static must still parse");
+        assert_eq!(durable.expiry, None);
+    }
+
+    #[test]
+    fn prevention_window_does_not_cross_newline_sentence_boundary() {
+        for separator in ["\n", "\r\n"] {
+            let text = format!(
+                "Prevent all damage that would be dealt to you.{separator}Target creature gets +1/+1 until end of turn."
+            );
+            let definition = parse_replacement_line(&text, "Boundary Probe")
+                .expect("the first prevention sentence must still parse");
+            assert_eq!(
+                definition.expiry, None,
+                "the later sentence's duration must not be attached across {separator:?}"
+            );
         }
     }
 
@@ -16431,6 +17300,246 @@ mod tests {
         }
     }
 
+    /// CR 614.1c: a conjoined "enters with" counter list must survive a GATE.
+    /// `self_enters_with_multiple_counter_types` pins the ungated, all-singular
+    /// list (Agent's Toolkit); this pins the two axes that card does not cover,
+    /// because both are places the list could be truncated to its first element:
+    ///
+    ///   * a gate is peeled BEFORE the payload is read — sentence-initial
+    ///     "If <game state>, " (CR 614.1c, Dust Animus) and kicker-conditional
+    ///     "If ~ was kicked, " (CR 702.33d). The gate must land on the
+    ///     definition's single condition slot AND leave the whole list.
+    ///   * a multi-count leading element ("two +1/+1 counters") over a conjoined
+    ///     list — Agent's Toolkit's elements are all bare articles, so the count
+    ///     axis and the conjunct axis have never been exercised together.
+    ///
+    /// Only the kicker case is synthetic. Voidpouncer prints that gate, but its
+    /// line ends in a keyword rider this parser drops (#7721), and a fixture
+    /// asserting only its counters would certify a parse that discards a printed
+    /// instruction — see the note at the fixture.
+    ///
+    /// This is the direct-evidence pin for the claim in
+    /// `oracle_effect::lower::parse_enter_counters_clause_body`'s doc comment
+    /// that the replacement seam needs no routing through that list.
+    #[test]
+    fn gated_self_enters_with_conjoined_counters() {
+        let assert_chain = |text: &str, card: &str, expected: &[(CounterType, i32)]| {
+            let def = parse_replacement_line(text, card)
+                .unwrap_or_else(|| panic!("{card}: gated conjoined enters-with must parse"));
+            assert_eq!(def.event, ReplacementEvent::Moved, "{card}: self-ETB event");
+            assert_eq!(
+                def.valid_card,
+                Some(TargetFilter::SelfRef),
+                "{card}: self-referential subject"
+            );
+            assert!(
+                def.condition.is_some(),
+                "{card}: the gate must reach the condition slot, not be dropped"
+            );
+
+            let mut cursor = Some(def.execute.as_deref().expect("execute ability"));
+            for (index, (counter, count)) in expected.iter().enumerate() {
+                let ability = cursor.unwrap_or_else(|| {
+                    panic!("{card}: conjunct {index} ({counter:?}) was dropped from the chain")
+                });
+                assert!(
+                    matches!(
+                        &*ability.effect,
+                        Effect::PutCounter {
+                            counter_type,
+                            count: QuantityExpr::Fixed { value },
+                            target: TargetFilter::SelfRef,
+                        } if counter_type == counter && value == count
+                    ),
+                    "{card}: conjunct {index} expected {counter:?} x{count}, got {:?}",
+                    ability.effect
+                );
+                cursor = ability.sub_ability.as_deref();
+            }
+            assert!(
+                cursor.is_none(),
+                "{card}: a non-counter conjunct was swallowed as an extra PutCounter"
+            );
+        };
+
+        // Dust Animus — leading game-state gate.
+        assert_chain(
+            "If you control five or more untapped lands, this creature enters with two +1/+1 \
+             counters and a lifelink counter on it.",
+            "Dust Animus",
+            &[
+                (CounterType::Plus1Plus1, 2),
+                (
+                    CounterType::Keyword(crate::types::keywords::KeywordKind::Lifelink),
+                    1,
+                ),
+            ],
+        );
+
+        // A kicker gate, over a synthetic line that prints NO trailing rider.
+        //
+        // Voidpouncer's real text is deliberately not used here. It ends "… on it
+        // and with haste", and that keyword rider is dropped by a separate
+        // pre-existing bug (the nine-card Invasion kicker class, #7721). Asserting
+        // its counters would have this test certify a parse that silently discards
+        // a printed instruction — the partial-parse endorsement is the problem,
+        // not just the missing assertion, so the fixture is out rather than
+        // annotated. #7768 owns that rider; once it lands, a Voidpouncer case
+        // belongs there, asserting counters AND haste together.
+        assert_chain(
+            "If this creature was kicked, it enters with two +1/+1 counters and a trample \
+             counter on it.",
+            "Test Kicker Creature",
+            &[
+                (CounterType::Plus1Plus1, 2),
+                (
+                    CounterType::Keyword(crate::types::keywords::KeywordKind::Trample),
+                    1,
+                ),
+            ],
+        );
+    }
+
+    /// A conjunct whose count is ELIDED must still place its counter.
+    /// English coordination lets the leading determiner distribute — "an
+    /// additional [+1/+1 counter] and [deathtouch counter]" — and every conjunct
+    /// past the first used to be dropped on the floor, so these cards entered
+    /// with only their +1/+1.
+    ///
+    /// These three are the entire printed class (corpus sweep over every
+    /// "enters/enter with … counter" and battlefield-rider line), and they cover
+    /// both separator shapes: bare `" and "` and the Oxford `", …, and "` list.
+    /// The last one also pins that the longer "enters the battlefield with"
+    /// spelling takes the same path as the short "enters with".
+    #[test]
+    fn enters_with_elided_count_conjuncts() {
+        use crate::types::keywords::KeywordKind;
+
+        let assert_chain = |text: &str, card: &str, expected: &[CounterType]| {
+            let def = parse_replacement_line(text, card)
+                .unwrap_or_else(|| panic!("{card}: elided-count conjunct list must parse"));
+            let mut cursor = Some(def.execute.as_deref().expect("execute ability"));
+            for (index, counter) in expected.iter().enumerate() {
+                let ability = cursor.unwrap_or_else(|| {
+                    panic!("{card}: conjunct {index} ({counter:?}) was dropped from the chain")
+                });
+                assert!(
+                    matches!(
+                        &*ability.effect,
+                        // An elided count is exactly one counter (singular noun).
+                        Effect::PutCounter {
+                            counter_type,
+                            count: QuantityExpr::Fixed { value: 1 },
+                            ..
+                        } if counter_type == counter
+                    ),
+                    "{card}: conjunct {index} expected {counter:?} x1, got {:?}",
+                    ability.effect
+                );
+                cursor = ability.sub_ability.as_deref();
+            }
+            assert!(
+                cursor.is_none(),
+                "{card}: trailing text was swallowed as an extra PutCounter"
+            );
+        };
+
+        assert_chain(
+            "When you cast a Phyrexian creature spell, that creature enters with an additional \
+             +1/+1 counter and deathtouch counter on it.",
+            "March Toward Perfection",
+            &[
+                CounterType::Plus1Plus1,
+                CounterType::Keyword(KeywordKind::Deathtouch),
+            ],
+        );
+
+        assert_chain(
+            "When you cast a creature spell, that creature enters with an additional +1/+1 \
+             counter, reach counter, and trample counter on it.",
+            "Arcane Archery",
+            &[
+                CounterType::Plus1Plus1,
+                CounterType::Keyword(KeywordKind::Reach),
+                CounterType::Keyword(KeywordKind::Trample),
+            ],
+        );
+
+        assert_chain(
+            "When you cast a creature spell, that creature enters the battlefield with an \
+             additional +1/+1 counter, trample counter, and vigilance counter on it.",
+            "Tenacious Pup",
+            &[
+                CounterType::Plus1Plus1,
+                CounterType::Keyword(KeywordKind::Trample),
+                CounterType::Keyword(KeywordKind::Vigilance),
+            ],
+        );
+    }
+
+    /// The elided-count element is unanchored (no leading number), so it must not
+    /// widen what the list as a whole claims. Each case below stays on the
+    /// single-counter path — one `PutCounter`, no chain — rather than growing a
+    /// bogus second entry:
+    ///
+    ///   * a non-counter conjunct after the list ("and you draw a card")
+    ///   * a conjunct naming something that is not a counter type — the guard
+    ///     against `parse_strict_counter_type`'s absent `Generic` fallback
+    ///   * a PLURAL elided conjunct, which is ambiguous about whether the head
+    ///     count distributes and so fails closed rather than guessing
+    #[test]
+    fn elided_count_conjunct_does_not_over_claim() {
+        // The expected leading COUNT travels with each fixture. Matching the
+        // type alone with `..` on `count` left the third row provable by a
+        // single +1/+1 — the quantity is exactly what the elided-count work
+        // touches, so it has to be asserted, not elided in the pattern.
+        for (text, expected_count) in [
+            (
+                "This creature enters with an additional +1/+1 counter and you draw a card.",
+                1,
+            ),
+            (
+                "This creature enters with an additional +1/+1 counter and haste on it.",
+                1,
+            ),
+            (
+                "This creature enters with two +1/+1 counters and trample counters on it.",
+                2,
+            ),
+        ] {
+            // Every fixture is REQUIRED to parse. An earlier revision skipped a
+            // `None` with `else { continue }`, which meant a parser that stopped
+            // recognizing the replacement entirely ran no assertion at all and
+            // still went green — indistinguishable from the behavior under test.
+            let def = parse_replacement_line(text, "Test Enterer").unwrap_or_else(|| {
+                panic!(
+                    "{text:?} must still parse as a replacement — a rejection here is a \
+                     coverage regression, not a passing over-claim guard"
+                )
+            });
+            let execute = def.execute.as_deref().expect("execute ability");
+            // The leading counter is claimed, at its exact printed quantity...
+            assert!(
+                matches!(
+                    &*execute.effect,
+                    Effect::PutCounter {
+                        counter_type: CounterType::Plus1Plus1,
+                        count: QuantityExpr::Fixed { value },
+                        ..
+                    } if *value == expected_count
+                ),
+                "{text:?} must still claim its leading +1/+1 x{expected_count}, got {:?}",
+                execute.effect
+            );
+            // ...and nothing after it is.
+            assert!(
+                execute.sub_ability.is_none(),
+                "elided-count element over-claimed on {text:?}: {:?}",
+                execute.sub_ability
+            );
+        }
+    }
+
     #[test]
     fn enters_with_x_counters_uses_cost_x_paid() {
         // CR 107.3m: "This artifact enters with X charge counters on it" — X is the
@@ -16535,6 +17644,72 @@ mod tests {
                 CounterType::Keyword(KeywordKind::Lifelink),
             ],
         );
+    }
+
+    /// Issue #7821 (Curator Beastie): the bare-plural distributive subject —
+    /// "Colorless creatures you control enter with two additional +1/+1
+    /// counters on them." Without the bare-plural arm the subject is silently
+    /// swallowed and the replacement anchors to the source's own entry
+    /// (valid_card AND counter target become SelfRef). CR 614.12: this is the
+    /// general-subset scope — the filter includes the source iff it matches
+    /// (Beastie is GU, so it simply doesn't), and no `Another` is injected.
+    #[test]
+    fn bare_plural_colorless_subject_scopes_the_enters_with_replacement() {
+        use crate::types::ability::Comparator;
+
+        let def = parse_replacement_line(
+            "Colorless creatures you control enter with two additional +1/+1 counters on them.",
+            "Curator Beastie",
+        )
+        .unwrap();
+
+        match def.valid_card.as_ref() {
+            Some(TargetFilter::Typed(tf)) => {
+                assert!(
+                    tf.type_filters.contains(&TypeFilter::Creature),
+                    "creature type filter, got {:?}",
+                    tf.type_filters
+                );
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+                assert!(
+                    tf.properties.iter().any(|p| matches!(
+                        p,
+                        FilterProp::ColorCount {
+                            comparator: Comparator::EQ,
+                            count: 0
+                        }
+                    )),
+                    "colorless must survive as a color property, got {:?}",
+                    tf.properties
+                );
+                assert!(
+                    !tf.properties.contains(&FilterProp::Another),
+                    "general subset includes the source (CR 614.12), got {:?}",
+                    tf.properties
+                );
+            }
+            other => panic!("expected the typed colorless filter, got {other:?}"),
+        }
+
+        let execute = def.execute.as_ref().unwrap();
+        match &*execute.effect {
+            Effect::PutCounter {
+                counter_type,
+                count,
+                ..
+            } => {
+                assert_eq!(counter_type, &CounterType::Plus1Plus1);
+                assert!(
+                    matches!(count, QuantityExpr::Fixed { value: 2 }),
+                    "two counters, got {count:?}"
+                );
+            }
+            other => panic!("expected PutCounter, got {other:?}"),
+        }
+
+        // CR 614.12: external ETB placements ride ChangeZone so tokens are
+        // covered too (mirrors the each/other forms).
+        assert_eq!(def.event, ReplacementEvent::ChangeZone);
     }
 
     /// CR 614.12a + CR 608.2d: Grimdancer — "enters with your choice of two
@@ -16967,12 +18142,24 @@ mod tests {
     fn plural_subject_escape_with_counter_keeps_escape_condition() {
         // CR 702.138c: plural-subject "escape with" is still escape-gated, not
         // an unconditional battlefield-entry counter replacement.
+        //
+        // Since the #7821 bare-plural subject arm, the plural subject anchors
+        // the replacement to "creatures you control" (ChangeZone scope) instead
+        // of the source's own entry — the escape gate is the invariant pinned
+        // here and must survive that re-anchoring.
         let def = parse_replacement_line(
             "Creatures you control escape with a +1/+1 counter on them.",
             "Escape Anthem",
         )
         .unwrap();
-        assert_eq!(def.event, ReplacementEvent::Moved);
+        assert_eq!(def.event, ReplacementEvent::ChangeZone);
+        match def.valid_card.as_ref() {
+            Some(TargetFilter::Typed(tf)) => {
+                assert!(tf.type_filters.contains(&TypeFilter::Creature));
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+            }
+            other => panic!("expected the plural-subject filter, got {other:?}"),
+        }
         assert!(matches!(
             *def.execute.as_ref().unwrap().effect,
             Effect::PutCounter {
@@ -21204,6 +22391,211 @@ mod tests {
     /// trigger resolves but before the cast spell does). The trigger's
     /// resolution installs a floating, one-shot `ChangeZone` replacement via
     /// `Effect::AddTargetReplacement`.
+    /// PRODUCTION PATH coverage for the conjoined counter list. The self-ETB
+    /// tests elsewhere in this module call `parse_replacement_line`, but a
+    /// `"Whenever you cast …, that creature enters with …"` line is intercepted
+    /// upstream (`oracle.rs`, Priority 5-pre) and routed to
+    /// `parse_whenever_you_cast_enters_with_trigger` instead — a DIFFERENT
+    /// reader, which until now parsed exactly one `+1/+1`/`-1/-1` counter and so
+    /// truncated any list handed to it.
+    ///
+    /// Every assertion is anchored by a positive reach guard: the trigger must
+    /// be `Some` with the expected mode and a floating one-shot replacement, so
+    /// a parse that never reached this path cannot satisfy the counter-chain
+    /// assertions vacuously.
+    #[test]
+    fn whenever_you_cast_trigger_lifts_conjoined_counter_list() {
+        let text = "Whenever you cast a creature spell, that creature enters with an additional \
+                    +1/+1 counter and deathtouch counter on it.";
+        let trigger = parse_whenever_you_cast_enters_with_trigger(text, "Test Enchantment")
+            .expect("reach guard: the conjoined list must still reach the trigger recognizer");
+        assert_eq!(trigger.mode, TriggerMode::SpellCast);
+
+        let exec = trigger.execute.as_ref().expect("execute set");
+        let Effect::AddTargetReplacement { replacement, .. } = &*exec.effect else {
+            panic!(
+                "reach guard: expected the floating AddTargetReplacement install, got {:?}",
+                exec.effect
+            );
+        };
+        assert_eq!(replacement.event, ReplacementEvent::ChangeZone);
+
+        // Both conjuncts, in printed order, chained as sub-abilities.
+        let mut cursor = Some(replacement.execute.as_deref().expect("execute set"));
+        for (index, (expected_type, expected_count)) in [
+            (CounterType::Plus1Plus1, 1),
+            (
+                CounterType::Keyword(crate::types::keywords::KeywordKind::Deathtouch),
+                1,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ability = cursor.unwrap_or_else(|| {
+                panic!("conjunct {index} ({expected_type:?}) was truncated off the trigger payload")
+            });
+            assert!(
+                matches!(
+                    &*ability.effect,
+                    Effect::PutCounter { counter_type, count: QuantityExpr::Fixed { value }, target: TargetFilter::SelfRef }
+                        if *counter_type == expected_type && *value == expected_count
+                ),
+                "conjunct {index} expected {expected_type:?} x{expected_count}, got {:?}",
+                ability.effect
+            );
+            cursor = ability.sub_ability.as_deref();
+        }
+        assert!(
+            cursor.is_none(),
+            "trailing text must not be swallowed as an extra counter"
+        );
+    }
+
+    /// The list route must not capture the DYNAMIC count shape. Communal
+    /// Brewing's X is bound by the trailing "where X is …" clause, and the
+    /// shared list reader would rewrite a bare X to the entering object's
+    /// `CostXPaid` (right for a self-ETB "enters with X counters", wrong here).
+    /// The `Fixed`-only gate on the list route is what keeps the two count axes
+    /// apart; without it this count silently becomes `CostXPaid`.
+    /// The shared-list route must not publish a trigger for a clause it only
+    /// half-consumed. `parse_enters_counter_entries` stops at `" on it"`, so a
+    /// printed instruction after it ("… on it and with haste") would otherwise
+    /// be dropped while this route returned a complete-looking
+    /// `AddTargetReplacement` — a rules-bearing sentence reported as fully
+    /// supported with half of it discarded.
+    ///
+    /// Asserted at the production entry point, and paired with the clean line as
+    /// a reach guard so the `None` is provably the RIDER's doing and not the
+    /// recognizer failing to match the shape at all.
+    ///
+    /// SCOPE, measured rather than assumed: this closes the route, not the whole
+    /// pipeline. `oracle.rs` Priority 5-pre falls through to
+    /// `parse_replacement_line_ir` when the trigger recognizer declines, and that
+    /// path still lifts both counters without the rider. That fallthrough is
+    /// unchanged by this PR — the pre-existing single-counter parse also rejected
+    /// this line (its `" counter on it"` tag cannot match `" counter and …"`), so
+    /// the recognizer returned `None` here before this route existed too, and the
+    /// same partial replacement was produced. Closing it end-to-end needs either
+    /// the rider parsed (#7721/#7768) or the self-ETB path tightened, which would
+    /// drop the counters the nine Invasion kicker cards place today.
+    /// END-TO-END fail-closed boundary, through the production `parse_oracle_text`
+    /// pipeline rather than the recognizer alone.
+    ///
+    /// Closing the recognizer is not enough on its own: `oracle.rs` Priority 5-pre
+    /// used to fall through to `parse_replacement_line_ir` whenever the
+    /// recognizer declined, and that route accepted the same line through
+    /// `parse_enters_with_counters` — republishing the counters without the rider,
+    /// AND as an object-hosted replacement. Per CR 603.1 + CR 603.3 that is the
+    /// wrong authority for a cast trigger: the effect must outlive its source
+    /// leaving the battlefield, which a permanent-hosted replacement does not.
+    ///
+    /// So the assertion is about what must NOT be emitted — no replacement, no
+    /// trigger — paired with the rider-free line as a positive control proving
+    /// the pipeline still produces the trigger for the supported shape.
+    #[test]
+    fn cast_enters_with_rider_emits_no_partial_ability_end_to_end() {
+        let rider = "Whenever you cast a creature spell, that creature enters with an \
+                     additional +1/+1 counter and deathtouch counter on it and with haste.";
+        let parsed = parse_oracle_text(
+            rider,
+            "Test Enchantment",
+            &[],
+            &["Enchantment".to_string()],
+            &[],
+        );
+        assert!(
+            parsed.replacements.is_empty(),
+            "the rider line must not publish an object-hosted replacement, got {:?}",
+            parsed.replacements
+        );
+        assert!(
+            parsed.triggers.is_empty(),
+            "nor a trigger, got {:?}",
+            parsed.triggers
+        );
+        assert!(
+            parsed
+                .abilities
+                .iter()
+                .any(|ability| matches!(&*ability.effect, Effect::Unimplemented { .. })),
+            "the unsupported rider must remain an explicit Effect::Unimplemented residual, got {:?}",
+            parsed.abilities
+        );
+
+        // Positive control: the same clause WITHOUT the rider still reaches the
+        // dedicated cast-enters trigger authority end-to-end.
+        let clean = "Whenever you cast a creature spell, that creature enters with an \
+                     additional +1/+1 counter and deathtouch counter on it.";
+        let ok = parse_oracle_text(
+            clean,
+            "Test Enchantment",
+            &[],
+            &["Enchantment".to_string()],
+            &[],
+        );
+        assert_eq!(
+            ok.triggers.len(),
+            1,
+            "reach guard: the rider-free clause must still produce its trigger, got {ok:?}"
+        );
+        assert!(
+            ok.replacements.is_empty(),
+            "and must stay a trigger, not an object-hosted replacement, got {:?}",
+            ok.replacements
+        );
+    }
+
+    #[test]
+    fn whenever_you_cast_trigger_fails_closed_on_unconsumed_rider() {
+        let rider = "Whenever you cast a creature spell, that creature enters with an \
+                     additional +1/+1 counter and deathtouch counter on it and with haste.";
+        assert!(
+            parse_whenever_you_cast_enters_with_trigger(rider, "Test Enchantment").is_none(),
+            "a trailing rider must fail the recognizer closed, not publish a partial trigger"
+        );
+
+        // Reach guard: the identical clause WITHOUT the rider still parses, so
+        // the `None` above is the rider's doing.
+        let clean = "Whenever you cast a creature spell, that creature enters with an \
+                     additional +1/+1 counter and deathtouch counter on it.";
+        assert!(
+            parse_whenever_you_cast_enters_with_trigger(clean, "Test Enchantment").is_some(),
+            "reach guard: the rider-free clause must still parse"
+        );
+    }
+
+    #[test]
+    fn whenever_you_cast_trigger_keeps_where_x_count_dynamic() {
+        let text = "Whenever you cast a creature spell, that creature enters with X additional \
+                    +1/+1 counters on it, where X is the number of ingredient counters on this \
+                    enchantment.";
+        let trigger = parse_whenever_you_cast_enters_with_trigger(text, "Communal Brewing")
+            .expect("reach guard: the where-X shape must still parse");
+        let exec = trigger.execute.as_ref().expect("execute set");
+        let Effect::AddTargetReplacement { replacement, .. } = &*exec.effect else {
+            panic!("expected AddTargetReplacement, got {:?}", exec.effect);
+        };
+        let put = replacement.execute.as_ref().expect("execute set");
+        let Effect::PutCounter { count, .. } = &*put.effect else {
+            panic!("expected PutCounter, got {:?}", put.effect);
+        };
+        assert!(
+            !matches!(
+                count,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::CostXPaid
+                }
+            ),
+            "the where-X count must not be rewritten to CostXPaid by the shared list reader, \
+             got {count:?}"
+        );
+        assert!(
+            !matches!(count, QuantityExpr::Fixed { .. }),
+            "the where-X count must stay dynamic, got {count:?}"
+        );
+    }
+
     #[test]
     fn parses_wildgrowth_archaic_trigger() {
         let text = "Whenever you cast a creature spell, that creature enters with X additional +1/+1 counters on it, where X is the number of colors of mana spent to cast it.";
@@ -21559,6 +22951,59 @@ mod tests {
                 .any(|s| s.eq_ignore_ascii_case("Treasure")),
             "appended spec must be a Treasure token, got {:?}",
             spec.characteristics.subtypes
+        );
+    }
+
+    /// CR 614.1a + CR 111.10a-b: Bilbo preserves each Food token in the
+    /// proposed batch and appends one Treasure token for each of them.
+    #[test]
+    fn parses_same_subtype_plus_additional_token_replacement() {
+        let text =
+            "If you would create a Food token, instead create a Food token and a Treasure token.";
+        let def = parse_replacement_line(text, "Bilbo, Fellow Conspirator")
+            .expect("Bilbo replacement must parse");
+
+        assert_eq!(def.event, ReplacementEvent::CreateToken);
+        assert_eq!(def.token_owner_scope, Some(ControllerRef::You));
+        assert!(matches!(
+            def.condition,
+            Some(ReplacementCondition::TokenSubtypeMatches { ref subtypes })
+                if subtypes == &["Food".to_string()]
+        ));
+        let additional = def
+            .additional_token_spec
+            .expect("Bilbo must append a token spec");
+        assert_eq!(
+            additional.characteristics.subtypes,
+            vec!["Treasure".to_string()]
+        );
+    }
+
+    #[test]
+    fn same_subtype_plus_additional_rejects_changed_primary_subtype() {
+        let text =
+            "If you would create a Food token, instead create a Clue token and a Treasure token.";
+        assert!(
+            parse_same_subtype_plus_additional_token_replacement(text, text).is_none(),
+            "a changed primary token is substitution plus addition, not Bilbo's class"
+        );
+    }
+
+    #[test]
+    fn same_subtype_plus_additional_rejects_malformed_second_token() {
+        let text = "If you would create a Food token, instead create a Food and a Treasure token.";
+        assert!(
+            parse_same_subtype_plus_additional_token_replacement(text, text).is_none(),
+            "the repeated primary must be a complete token description"
+        );
+    }
+
+    #[test]
+    fn same_subtype_plus_additional_rejects_semantic_tail() {
+        let text = "If you would create a Food token, instead create a Food token and a Treasure token if it is your turn.";
+        assert!(
+            parse_same_subtype_plus_additional_token_replacement(text, text).is_none(),
+            "all-consuming grammar must not swallow a semantic tail"
         );
     }
 

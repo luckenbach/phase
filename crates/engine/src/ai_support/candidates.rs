@@ -2375,19 +2375,23 @@ pub fn candidate_actions_broad_with_probe(
         } => bounded_select_card_candidates(*player, legal_targets, *min_targets..=*max_targets),
         WaitingFor::CastOffer {
             player,
-            kind: CastOfferKind::Adventure { .. },
-        } => vec![
-            candidate(
-                GameAction::ChooseAdventureFace { creature: true },
-                TacticalClass::Selection,
-                Some(*player),
-            ),
-            candidate(
-                GameAction::ChooseAdventureFace { creature: false },
-                TacticalClass::Selection,
-                Some(*player),
-            ),
-        ],
+            kind: CastOfferKind::Adventure { object_id, .. },
+        } => [true, false]
+            .into_iter()
+            // CR 715.3a: A cast offer may expose only faces whose own
+            // characteristics make them castable. This matters for land-front
+            // Adventure cards, whose normal face cannot be cast as a spell.
+            .filter(|&creature| {
+                casting::can_cast_adventure_face_now(state, *player, *object_id, creature)
+            })
+            .map(|creature| {
+                candidate(
+                    GameAction::ChooseAdventureFace { creature },
+                    TacticalClass::Selection,
+                    Some(*player),
+                )
+            })
+            .collect(),
         // CR 712.12: Both MDFC land faces are playable — offer front or back
         WaitingFor::ModalFaceChoice { player, .. } => vec![
             candidate(
@@ -7611,12 +7615,37 @@ mod tests {
     }
 
     #[test]
-    fn ai_adventure_generates_face_choice() {
+    fn ai_land_front_adventure_generates_only_spell_face_choice() {
         let mut state = GameState::new_two_player(42);
+        let player = PlayerId(0);
+        state.phase = Phase::PreCombatMain;
+        state.active_player = player;
+        state.priority_player = player;
+        let object_id = create_object(
+            &mut state,
+            CardId(70),
+            player,
+            "Land Adventure".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&object_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Land);
+            obj.mana_cost = ManaCost::NoCost;
+
+            let mut adventure = prepare_back_face_with_cost(ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::Red],
+            });
+            adventure.card_types.subtypes.push("Adventure".to_string());
+            adventure.layout_kind = Some(LayoutKind::Adventure);
+            obj.back_face = Some(adventure);
+        }
+        give_player_mana(&mut state, 0, ManaType::Red);
         state.waiting_for = WaitingFor::CastOffer {
-            player: PlayerId(0),
+            player,
             kind: CastOfferKind::Adventure {
-                object_id: crate::types::identifiers::ObjectId(1),
+                object_id,
                 card_id: CardId(70),
                 payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
@@ -7625,12 +7654,9 @@ mod tests {
         let actions = candidate_actions(&state);
         assert_eq!(
             actions.len(),
-            2,
-            "Should generate creature and adventure face options"
+            1,
+            "a land-front Adventure must offer only its castable spell face"
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a.action, GameAction::ChooseAdventureFace { creature: true })));
         assert!(actions.iter().any(|a| matches!(
             a.action,
             GameAction::ChooseAdventureFace { creature: false }

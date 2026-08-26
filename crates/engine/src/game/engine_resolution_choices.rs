@@ -6480,11 +6480,21 @@ pub(super) fn handle_resolution_choice(
             }
             state.ring_bearer.insert(player, Some(target));
             crate::game::layers::mark_layers_full(state);
+            // CR 701.54a + CR 701.54d: the temptation's actions are complete
+            // only now — emit the trigger-visible event carrying the completed
+            // choice, so a bearer-dependent intervening-if (CR 603.4) reads
+            // this immutable record at collection AND at resolution, never the
+            // mutable `state.ring_bearer` designation.
+            let event_start = events.len();
+            events.push(GameEvent::RingTemptsYou {
+                player_id: player,
+                chosen_bearer: Some(target),
+            });
             let waiting_for = finish_with_continuation(state, player, events);
             // CR 603.2 + CR 701.54: RingTemptsYou observer triggers are batched
             // while ChooseRingBearer pauses spell resolution (issue #1017).
             if let Some(outcome) =
-                batch_or_drain_observer_triggers(state, events, events.len(), events.len(), false)
+                batch_or_drain_observer_triggers(state, events, event_start, events.len(), false)
             {
                 return Ok(outcome);
             }

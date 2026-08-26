@@ -2883,7 +2883,13 @@ pub(crate) fn should_propagate_parent_targets(
     ability: &ResolvedAbility,
     sub: &ResolvedAbility,
 ) -> bool {
-    !ability.targets.is_empty() && can_inherit_parent_targets(sub)
+    !ability.targets.is_empty()
+        && can_inherit_parent_targets(sub)
+        // CR 608.2d: each-player damage resolves its own per-player work. A
+        // Resolution-timed continuation following that work must choose its
+        // own subject rather than inherit an object used to calculate damage.
+        && !(matches!(ability.effect, Effect::DamageEachPlayer { .. })
+            && sub.target_choice_timing == TargetChoiceTiming::Resolution)
 }
 
 /// Whether an empty-targeted child can inherit the parent's bound targets.
@@ -2892,6 +2898,10 @@ pub(crate) fn should_propagate_parent_targets(
 pub(crate) fn can_inherit_parent_targets(sub: &ResolvedAbility) -> bool {
     sub.targets.is_empty()
         && (sub.target_choice_timing != TargetChoiceTiming::Resolution
+            // CR 608.2c: a resolution-time instruction can still consume an
+            // object selected by its parent. `ParentTarget` is not a fresh
+            // choice, so retain the already-bound target for continuations.
+            || effect_refs_parent_target(&sub.effect)
             // CR 608.2c + CR 303.4f: TargetOnly → ChangeZone[+Attach ParentTarget]
             // (Necrotic Plague) stamps Resolution on the return clause, but the
             // chosen host is still the parent's bound target — propagate it so

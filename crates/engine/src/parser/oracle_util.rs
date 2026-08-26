@@ -1415,17 +1415,56 @@ pub fn has_unconsumed_conditional(text: &str) -> bool {
 /// For comma-form names, the short self-reference is the span before the comma
 /// after removing MTGJSON's structural Alchemy `A-` prefix.
 pub(crate) fn comma_short_self_name(card_name: &str) -> Option<&str> {
-    let effective_name = if card_name.as_bytes().get(0..2) == Some(b"A-") {
-        &card_name[2..]
-    } else {
-        card_name
-    };
+    let effective_name = alchemy_effective_name(card_name);
     let (_, (short_name, _)) = nom_primitives::split_once_on(effective_name, ", ").ok()?;
     if short_name.len() >= 2 {
         Some(short_name)
     } else {
         None
     }
+}
+
+/// Remove MTGJSON's structural Alchemy prefix while accepting either casing.
+fn alchemy_effective_name(card_name: &str) -> &str {
+    card_name
+        .get(..2)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("A-"))
+        .and_then(|_| card_name.get(2..))
+        .unwrap_or(card_name)
+}
+
+/// CR 201.5c: derive the printed first-and-last-word short name used by some
+/// multi-word legendary names (for example, "Captain James T. Kirk" →
+/// "Captain Kirk").
+///
+/// The leading word must be a proper-name/title word, not an article, game
+/// term, keyword, verb, or subtype. This rejects ambiguous prose and flavor
+/// labels such as "The Minstrel's Ballad" for "The Wandering Minstrel"
+/// (CR 207.2c–d) while keeping the rule independent of any individual card.
+fn compound_short_self_name(card_name: &str) -> Option<String> {
+    let effective_name = alchemy_effective_name(card_name);
+    let words: Vec<&str> = effective_name.split_whitespace().collect();
+    if comma_short_self_name(card_name).is_some() || words.contains(&"//") || words.len() < 3 {
+        return None;
+    }
+    let first = words[0];
+    let last = *words.last()?;
+    let lower_first = first.to_lowercase();
+    if first.eq_ignore_ascii_case(last)
+        || matches!(
+            lower_first.as_str(),
+            "the" | "a" | "an" | "of" | "in" | "on" | "to" | "for" | "at" | "by"
+        )
+        || is_core_type_name(&lower_first)
+        || is_non_subtype_subject_name(&lower_first)
+        || is_supertype_word(&lower_first)
+        || super::oracle_nom::primitives::is_keyword_word(&lower_first)
+        || super::oracle_nom::primitives::is_verb_word(&lower_first)
+        || is_subtype_word(&lower_first)
+    {
+        return None;
+    }
+    Some(format!("{first} {last}"))
 }
 
 /// Replace all occurrences of `needle` in `haystack` with `replacement`,
@@ -2129,34 +2168,39 @@ const GRANTER_SELF_REF_VERB_PREFIXES: &[&str] = &[
 /// everywhere else (outside quotes, or in-quote QuantityRef / condition /
 /// damage-source / exclusion / name-filter positions) the card name still
 /// normalizes to `~` (host self-ref), byte-identical to pre-fix. Only the
-/// deterministic proper-noun variants (full multi-word name and comma-separated
-/// short name) are masked, mirroring `normalize_card_name_refs` strategies 1–2;
-/// the risky single-word / of-short fallbacks are skipped to avoid matching
-/// English words.
+/// deterministic proper-noun variants (full multi-word name, comma-separated
+/// short name, and guarded compound first/last short name) are masked, mirroring
+/// `normalize_card_name_refs`; the risky single-word / of-short fallbacks are
+/// skipped to avoid matching English words.
 fn mask_granting_self_reference_in_quotes(text: &str, card_name: &str) -> String {
     // allow-noncombinator: structural masking of a card-name self-reference
     // before `~` normalization (mirrors `mask_card_name_keyword_action`), not
     // parsing dispatch.
     // allow-noncombinator: strip MTGJSON A- prefix (structural, mirrors normalize_card_name_refs)
-    let effective_name = card_name.strip_prefix("A-").unwrap_or(card_name);
+    let effective_name = alchemy_effective_name(card_name);
     // (name, case_sensitive). Multi-word / comma-short are case-insensitive
     // (proper nouns); a single-word name is matched case-sensitively so it only
     // hits the capitalized card-name occurrence — mirroring
     // `normalize_card_name_refs`' single-word discipline. Position-gating (the
     // verb-object allowlist) makes even single-word masking safe here.
-    let mut variants: Vec<(&str, bool)> = Vec::new();
+    let mut variants: Vec<(String, bool)> = Vec::new();
     if effective_name.contains(' ') {
-        variants.push((effective_name, false));
+        variants.push((effective_name.to_string(), false));
     } else if effective_name.len() >= 3 {
         // `>= 3`: skip 1-2 char names, matching normalize_card_name_refs guards.
-        variants.push((effective_name, true));
+        variants.push((effective_name.to_string(), true));
     }
     // allow-noncombinator: comma-short name extraction (structural, not parsing dispatch)
     if let Some(comma_pos) = effective_name.find(", ") {
         let short = &effective_name[..comma_pos];
         // `>= 2`: matches the comma-short guard in `normalize_card_name_refs`.
         if short.len() >= 2 && short.contains(' ') {
-            variants.push((short, false));
+            variants.push((short.to_string(), false));
+        }
+    }
+    if let Some(compound) = compound_short_self_name(card_name) {
+        if !variants.iter().any(|(name, _)| name == &compound) {
+            variants.push((compound, false));
         }
     }
     if variants.is_empty() {
@@ -2170,8 +2214,8 @@ fn mask_granting_self_reference_in_quotes(text: &str, card_name: &str) -> String
         }
         if seg_idx % 2 == 1 {
             let mut masked = segment.to_string();
-            for &(name, case_sensitive) in &variants {
-                masked = mask_name_occurrences_in_segment(&masked, name, case_sensitive);
+            for (name, case_sensitive) in &variants {
+                masked = mask_name_occurrences_in_segment(&masked, name, *case_sensitive);
             }
             result.push_str(&masked);
         } else {
@@ -2262,7 +2306,7 @@ pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
     };
     let (text, card_named_originals) = mask_card_named_literal_spans(&text);
     // Strip A- prefix (Alchemy rebalanced cards in MTGJSON)
-    let effective_name = card_name.strip_prefix("A-").unwrap_or(card_name);
+    let effective_name = alchemy_effective_name(card_name);
 
     // Alchemy rebalanced cards (CR n/a — MTGJSON convention): the Oracle
     // text often references the prefixed name literally ("Return A-~ from
@@ -2303,6 +2347,14 @@ pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
     } else {
         replace_all_words_case_sensitive(&result, effective_name, "~")
     };
+
+    // CR 201.5c: some multi-word names use a first-and-last-word printed short
+    // name. Run this independently of full-name replacement because one Oracle
+    // paragraph may contain both forms. Word boundaries prevent partial-name
+    // collisions; candidate construction rejects ambiguous game/prose words.
+    if let Some(short_name) = compound_short_self_name(card_name) {
+        result = replace_all_words(&result, &short_name, "~");
+    }
 
     // Comma-based legendary short name: "Haliya, Guided by Light" → "Haliya"
     // CR 201.3a: A legendary creature's name is the full name printed on the card;
@@ -3041,6 +3093,83 @@ mod tests {
                 "Haliya, Guided by Light"
             ),
             "Whenever ~ or another creature enters"
+        );
+    }
+
+    #[test]
+    fn normalize_compound_printed_short_names() {
+        // CR 201.5c: printed shortened names are the same object reference.
+        assert_eq!(
+            normalize_card_name_refs(
+                "Whenever Captain Kirk enters or attacks, choose one.",
+                "Captain James T. Kirk",
+            ),
+            "Whenever ~ enters or attacks, choose one."
+        );
+        assert_eq!(
+            normalize_card_name_refs(
+                "Whenever Captain Janeway or another creature you control enters, that creature explores.",
+                "Captain Kathryn Janeway",
+            ),
+            "Whenever ~ or another creature you control enters, that creature explores."
+        );
+        assert_eq!(
+            normalize_card_name_refs(
+                "Whenever you gain life, put a +1/+1 counter on Dr. Crusher.",
+                "Dr. Beverly Crusher",
+            ),
+            "Whenever you gain life, put a +1/+1 counter on ~."
+        );
+    }
+
+    #[test]
+    fn normalize_compound_short_name_rejects_ambiguous_prose_and_labels() {
+        // CR 207.2c–d: an ability/flavor label has no rules meaning and is not
+        // a shortened self-reference merely because it shares the outer words.
+        assert_eq!(
+            normalize_card_name_refs(
+                "The Minstrel's Ballad — At the beginning of combat on your turn, create a token.",
+                "The Wandering Minstrel",
+            ),
+            "The Minstrel's Ballad — At the beginning of combat on your turn, create a token."
+        );
+        // The same candidate guard rejects an ordinary imperative/game-word
+        // collision rather than rewriting prose as a self-reference.
+        assert_eq!(
+            normalize_card_name_refs("Search Tomorrow for a card.", "Search for Tomorrow"),
+            "Search Tomorrow for a card."
+        );
+    }
+
+    #[test]
+    fn normalize_compound_short_name_preserves_named_literals() {
+        assert_eq!(
+            normalize_card_name_refs(
+                "A deck can have only one card named Captain Kirk.",
+                "Captain James T. Kirk",
+            ),
+            "A deck can have only one card named Captain Kirk."
+        );
+        assert_eq!(
+            normalize_card_name_refs(
+                "Create a legendary 1/1 Human creature token named Captain Kirk.",
+                "Captain James T. Kirk",
+            ),
+            "Create a legendary 1/1 Human creature token named Captain Kirk."
+        );
+    }
+
+    #[test]
+    fn normalize_compound_short_name_masks_quoted_granter_reference() {
+        let normalized = normalize_card_name_refs(
+            "Creatures you control have \"Sacrifice Captain Kirk: Draw a card.\" Whenever Captain Kirk attacks, draw a card.",
+            "Captain James T. Kirk",
+        );
+        assert_eq!(
+            normalized,
+            format!(
+                "Creatures you control have \"Sacrifice {GRANTING_SELF_PLACEHOLDER}: Draw a card.\" Whenever ~ attacks, draw a card."
+            )
         );
     }
 

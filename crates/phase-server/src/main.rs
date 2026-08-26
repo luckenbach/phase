@@ -11389,13 +11389,16 @@ mod metrics_tests {
                     Err(other) => panic!("expected an HTTP 503, got {other:?}"),
                 }
             }
-            (admitted.len() as u64, refused)
+            (admitted, refused)
         })
         .await;
-        server.abort();
 
         let (admitted, refused) = outcome.expect("connection race timed out");
-        assert_eq!(admitted, 1, "more than one racer took the single slot");
+        assert_eq!(
+            admitted.len(),
+            1,
+            "more than one racer took the single slot"
+        );
         assert_eq!(refused, RACERS - 1);
         assert_eq!(
             player_count.load(std::sync::atomic::Ordering::Relaxed),
@@ -11406,6 +11409,21 @@ mod metrics_tests {
             counters.reject_count(RejectReason::ConnectionLimit),
             RACERS - 1
         );
+        // Torn down only after `player_count` is read. `on_upgrade` spawns its
+        // callback as an independent task, and that callback owns the armed
+        // `ConnectionSlot` until `handle_socket` disarms it. The callback only
+        // runs once `hyper::upgrade::OnUpgrade` resolves, which is driven by the
+        // connection task inside `server` — so aborting first makes the upgrade
+        // fail, and axum drops the closure, and with it the still-armed guard,
+        // without ever calling `handle_socket`. `Drop` then releases the
+        // reservation and the assertion above reads 0 instead of 1. The racer
+        // has already been handed its 101 by that point, so the client sees a
+        // live connection either way; the held-open sockets keep the
+        // reservation alive on their own and nothing here needs the server
+        // stopped first. The `reject_count` reads are safe in either order,
+        // since rejection counters are monotonic and no release path touches
+        // them — `player_count` is the only counter teardown mutates.
+        server.abort();
     }
 
     /// Every full-mode creation path must check capacity under the same lock
