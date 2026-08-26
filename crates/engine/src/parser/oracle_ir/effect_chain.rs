@@ -1031,9 +1031,6 @@ impl ClauseIrBuilder {
         self.clauses.is_empty()
     }
 
-    /// Read the already-built clauses for mid-chain lookback (prior-referent
-    /// checks, condition/opponent-may scans). Returns already-constructed
-    /// clauses — it constructs nothing, so the single-construction gate holds.
     /// CR 611.2a: arm (or disarm) the leading-duration stamp for the chunk about to
     /// be processed. Called once at the top of every chunk-loop iteration with
     /// `chunk.leading_duration`, so a chunk that carries none clears a previous
@@ -1042,6 +1039,9 @@ impl ClauseIrBuilder {
         self.pending_leading_duration = duration;
     }
 
+    /// Read the already-built clauses for mid-chain lookback (prior-referent
+    /// checks, condition/opponent-may scans). Returns already-constructed
+    /// clauses — it constructs nothing, so the single-construction gate holds.
     pub(crate) fn clauses(&self) -> &[ClauseIr] {
         &self.clauses
     }
@@ -1191,8 +1191,18 @@ impl ClauseDraft<'_> {
         // clause passes through — and through the same chain-distributing authority
         // U1 installed, so a recovered conjunct that is itself a chain-building
         // recognizer distributes to its own governed links too.
-        if let Some(duration) = self.builder.pending_leading_duration.clone() {
-            self.parsed = with_clause_chain_duration(self.parsed, duration);
+        // Yield to an explicitly stated inner window: a recovered conjunct is
+        // arbitrary printed text and may state its own duration, which the
+        // sentence's leading duration must NOT clobber (CR 608.2c: read the whole
+        // text). Gated exactly as the trailing-duration peel in
+        // `oracle_effect/mod.rs` gates its own `with_clause_duration` call; a
+        // `Permanent` injected by a sub-parser is an unset sentinel, not a window.
+        if self.parsed.duration.is_none()
+            || matches!(self.parsed.duration, Some(Duration::Permanent))
+        {
+            if let Some(duration) = self.builder.pending_leading_duration.clone() {
+                self.parsed = with_clause_chain_duration(self.parsed, duration);
+            }
         }
         let id = ClauseId(self.builder.next_clause_id);
         let span = self.builder.locate(&self.source_text);
@@ -1236,6 +1246,60 @@ mod tests {
     use super::*;
     use crate::parser::oracle_ir::ast::parsed_clause;
     use crate::types::ability::{Duration, Effect};
+
+    /// CR 608.2c + CR 611.2a: `ClauseDraft::push` stamps the sentence's leading
+    /// duration onto a recovered conjunct, but a recovered conjunct is arbitrary
+    /// printed text and may state its OWN window, which the leading duration must
+    /// NOT clobber. Both sides are asserted: the printed window survives, the unset
+    /// clause is stamped. Removing the gate in `push` turns the first row red.
+    ///
+    /// Latent by measurement: no corpus card today pairs a leading-duration sentence
+    /// with a conjunct carrying a differing printed duration, so this shape is
+    /// CONSTRUCTED DIRECTLY rather than drawn from a card.
+    #[test]
+    fn push_yields_to_a_recovered_conjuncts_own_printed_duration() {
+        fn governed() -> Effect {
+            Effect::GenericEffect {
+                static_abilities: Vec::new(),
+                duration: None,
+                target: None,
+                end_cost: None,
+            }
+        }
+        fn emit() -> ClauseDisposition {
+            ClauseDisposition::Emit {
+                followup: None,
+                intrinsic: None,
+            }
+        }
+
+        let mut b = ClauseIrBuilder::new("a. b");
+        b.set_pending_leading_duration(Some(Duration::UntilEndOfTurn));
+
+        // Row 1: the conjunct states its own, narrower window -> PRESERVED.
+        let mut own = parsed_clause(governed());
+        own.duration = Some(Duration::UntilEndOfCombat);
+        b.clause("a", own, None, emit()).push();
+
+        // Row 2: the conjunct states nothing -> STAMPED with the leading duration.
+        b.clause("b", parsed_clause(governed()), None, emit())
+            .push();
+
+        let clauses = b.finish();
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(
+            clauses[0].parsed.duration,
+            Some(Duration::UntilEndOfCombat),
+            "a recovered conjunct's own printed window must survive the sentence's \
+             leading duration"
+        );
+        assert_eq!(
+            clauses[1].parsed.duration,
+            Some(Duration::UntilEndOfTurn),
+            "POSITIVE REACH GUARD: the stamp still fires on an unset conjunct, so \
+             row 1 is not passing because the stamp was disabled outright"
+        );
+    }
 
     #[test]
     fn effect_chain_ir_empty_construction() {

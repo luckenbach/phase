@@ -832,9 +832,14 @@ fn leading_host_lifetime_gate_is_subsumed() {
 /// `opportunistic_dragon_riders_bind_stolen_permanent` and
 /// `revenge_of_the_hunted_recovers_lure_conjunct`.
 ///
-/// Every row asserts a POSITIVE shape (a modification count or an effect variant),
-/// never merely "unchanged" — that is what stops it degenerating into a vacuous
-/// equality.
+/// Every row asserts an EXACT chain-link count and an EXACT total
+/// `ContinuousModification` count, plus the `Effect::Unimplemented` count. The link
+/// count is what stops the row degenerating into a vacuous equality: severing a
+/// merged conjunct necessarily ADDS a link, so an over-splitting regression turns
+/// EVERY row red — not merely the three carrying a bespoke per-card shape check
+/// below. (Before this was tightened, the loop asserted only `!links.is_empty()`
+/// plus the Unimplemented count, so five of the eight rows would have passed
+/// unchanged through exactly the regression they exist to catch.)
 #[test]
 fn leading_duration_merge_cards_unchanged() {
     // (name, oracle, types, subtypes, keywords)
@@ -851,16 +856,27 @@ fn leading_duration_merge_cards_unchanged() {
         /// Asserted as an exact count rather than waived, so an over-splitting
         /// regression that ADDED a placeholder here would still turn the row red.
         unimplemented: usize,
+        /// Exact chain-link count. THIS is the row's anti-over-splitting assertion:
+        /// severing a merged conjunct necessarily ADDS a link, so a regression in
+        /// `severed_prefix_end` turns every row red, not merely the three that
+        /// carry a bespoke per-card shape check below.
+        links: usize,
+        /// Exact total `ContinuousModification` count across all links — catches a
+        /// regression that keeps the link count but drops or redistributes the
+        /// modifications. Zero for the two rows whose effects are not
+        /// modification-bearing (Stolen Strategy: casting permission; Embiggen:
+        /// dynamic P/T), where `links` alone carries the row.
+        mods: usize,
     }
     let rows = [
-        Row { name: "Jump Scare", text: "Until end of turn, target creature gets +2/+2, gains flying, and becomes a Horror enchantment creature in addition to its other types.", types: &["Instant"], subtypes: &[], keywords: &[], unimplemented: 0 },
-        Row { name: "Stolen Strategy", text: "At the beginning of your upkeep, exile the top card of each opponent's library. Until end of turn, you may cast spells from among those exiled cards, and you may spend mana as though it were mana of any color to cast those spells.", types: &["Enchantment"], subtypes: &[], keywords: &[], unimplemented: 0 },
-        Row { name: "Titanic Ultimatum", text: "Until end of turn, creatures you control get +5/+5 and gain first strike, trample, and lifelink.", types: &["Sorcery"], subtypes: &[], keywords: &[], unimplemented: 0 },
-        Row { name: "Embiggen", text: "Until end of turn, target non-Brushwagg creature gets +1/+1 for each supertype, card type, and subtype it has.", types: &["Instant"], subtypes: &[], keywords: &[], unimplemented: 0 },
-        Row { name: "Sylvan Awakening", text: "Until your next turn, all lands you control become 2/2 Elemental creatures with reach, indestructible, and haste. They're still lands.", types: &["Sorcery"], subtypes: &[], keywords: &["Indestructible"], unimplemented: 0 },
-        Row { name: "Kitesail Larcenist", text: "Flying, ward {1}\nWhen this creature enters, for each player, choose up to one other target artifact or creature that player controls. For as long as this creature remains on the battlefield, the chosen permanents become Treasure artifacts with \"{T}, Sacrifice this artifact: Add one mana of any color\" and lose all other abilities.", types: &["Creature"], subtypes: &["Human", "Pirate"], keywords: &["Flying", "Ward"], unimplemented: 1 },
-        Row { name: "Dominaria's Judgment", text: "Until end of turn, creatures you control gain protection from white if you control a Plains, from blue if you control an Island, from black if you control a Swamp, from red if you control a Mountain, and from green if you control a Forest.", types: &["Instant"], subtypes: &[], keywords: &[], unimplemented: 0 },
-        Row { name: "Arm the Cathars", text: "Until end of turn, target creature gets +3/+3, up to one other target creature gets +2/+2, and up to one other target creature gets +1/+1. Those creatures gain vigilance until end of turn.", types: &["Sorcery"], subtypes: &[], keywords: &[], unimplemented: 0 },
+        Row { name: "Jump Scare", text: "Until end of turn, target creature gets +2/+2, gains flying, and becomes a Horror enchantment creature in addition to its other types.", types: &["Instant"], subtypes: &[], keywords: &[], unimplemented: 0, links: 1, mods: 6 },
+        Row { name: "Stolen Strategy", text: "At the beginning of your upkeep, exile the top card of each opponent's library. Until end of turn, you may cast spells from among those exiled cards, and you may spend mana as though it were mana of any color to cast those spells.", types: &["Enchantment"], subtypes: &[], keywords: &[], unimplemented: 0, links: 2, mods: 0 },
+        Row { name: "Titanic Ultimatum", text: "Until end of turn, creatures you control get +5/+5 and gain first strike, trample, and lifelink.", types: &["Sorcery"], subtypes: &[], keywords: &[], unimplemented: 0, links: 1, mods: 5 },
+        Row { name: "Embiggen", text: "Until end of turn, target non-Brushwagg creature gets +1/+1 for each supertype, card type, and subtype it has.", types: &["Instant"], subtypes: &[], keywords: &[], unimplemented: 0, links: 1, mods: 0 },
+        Row { name: "Sylvan Awakening", text: "Until your next turn, all lands you control become 2/2 Elemental creatures with reach, indestructible, and haste. They're still lands.", types: &["Sorcery"], subtypes: &[], keywords: &["Indestructible"], unimplemented: 0, links: 2, mods: 9 },
+        Row { name: "Kitesail Larcenist", text: "Flying, ward {1}\nWhen this creature enters, for each player, choose up to one other target artifact or creature that player controls. For as long as this creature remains on the battlefield, the chosen permanents become Treasure artifacts with \"{T}, Sacrifice this artifact: Add one mana of any color\" and lose all other abilities.", types: &["Creature"], subtypes: &["Human", "Pirate"], keywords: &["Flying", "Ward"], unimplemented: 1, links: 2, mods: 5 },
+        Row { name: "Dominaria's Judgment", text: "Until end of turn, creatures you control gain protection from white if you control a Plains, from blue if you control an Island, from black if you control a Swamp, from red if you control a Mountain, and from green if you control a Forest.", types: &["Instant"], subtypes: &[], keywords: &[], unimplemented: 0, links: 1, mods: 5 },
+        Row { name: "Arm the Cathars", text: "Until end of turn, target creature gets +3/+3, up to one other target creature gets +2/+2, and up to one other target creature gets +1/+1. Those creatures gain vigilance until end of turn.", types: &["Sorcery"], subtypes: &[], keywords: &[], unimplemented: 0, links: 2, mods: 1 },
     ];
 
     for row in rows {
@@ -884,6 +900,23 @@ fn leading_duration_merge_cards_unchanged() {
             .flat_map(chain)
             .collect();
         assert!(!links.is_empty(), "{}: parsed to nothing", row.name);
+        assert_eq!(
+            links.len(),
+            row.links,
+            "{}: chain-link count must be UNCHANGED — a higher count is the \
+             over-splitting regression this row exists to catch: {links:#?}",
+            row.name
+        );
+        let mods: usize = links
+            .iter()
+            .flat_map(|d| statics_of(&d.effect))
+            .flat_map(|s| s.modifications.iter())
+            .count();
+        assert_eq!(
+            mods, row.mods,
+            "{}: total ContinuousModification count must be UNCHANGED: {links:#?}",
+            row.name
+        );
         let unimplemented = links
             .iter()
             .filter(|d| matches!(&*d.effect, Effect::Unimplemented { .. }))

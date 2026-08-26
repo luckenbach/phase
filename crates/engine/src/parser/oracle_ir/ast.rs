@@ -2043,17 +2043,25 @@ fn apply_duration_to_effect(effect: &mut Effect, duration: &Duration) {
         } => {
             *effect_duration = Some(duration.clone());
         }
-        // CR 611.2a: `Some(Duration::Permanent)` from `imperative.rs` MEANS "no
-        // duration stated" (its own comment says so); a stated outer duration
-        // replaces it.
+        // CR 611.2a: yield to an explicitly stated inner duration, exactly as the
+        // `sub_ability` walk in `with_clause_chain_duration` and the trailing-duration
+        // peel in `oracle_effect/mod.rs` do. TWO parser sites construct this variant
+        // and they differ: `imperative.rs`'s Symbiote Spider-Man arm sets
+        // `Some(Duration::Permanent)` to MEAN "no duration stated", which a stated
+        // outer duration must replace; but `imperative.rs`'s "gain all activated
+        // abilities of" arm sets `duration.or(Some(Duration::UntilEndOfTurn))`, which
+        // carries a genuinely PRINTED inner window that an outer duration must NOT
+        // clobber. Gating on the unset sentinels distinguishes the two.
         // NOTE: unit-covered only. No card in the corpus reaches this arm today;
         // Mondo Gecko and Navigator's Compass, which LOOK like this case, are
         // `Effect::GenericEffect` from `build_become_clause` and take the
         // GenericEffect arm above.
+        // A failed guard falls through to the `_ => {}` arm below, i.e. the node is
+        // left exactly as printed — which is the intended yield-to-explicit result.
         Effect::GainActivatedAbilitiesOfTarget {
             duration: ref mut effect_duration,
             ..
-        } => {
+        } if effect_duration.is_none() || matches!(effect_duration, Some(Duration::Permanent)) => {
             *effect_duration = Some(duration.clone());
         }
         Effect::BecomeCopy {
@@ -2572,6 +2580,34 @@ mod duration_distribution_tests_7923 {
         // `UntilEndOfTurn` and nothing would move.
         let pd_same = prevent_damage(Some(Duration::UntilEndOfTurn));
         assert_eq!(stamped(&pd_same), pd_same);
+
+        // `GainActivatedAbilitiesOfTarget` DOES have an arm, and that arm gates on
+        // the unset sentinels. Both sides are asserted here because the two parser
+        // construction sites in `oracle_effect/imperative.rs` differ: the "gain all
+        // activated abilities of" arm sets `duration.or(Some(UntilEndOfTurn))` — a
+        // genuinely PRINTED window that must survive — while the Symbiote
+        // Spider-Man arm sets `Some(Permanent)` to MEAN "no duration stated", which
+        // the outer duration must replace.
+        let ga_printed = gain_activated(Some(Duration::UntilEndOfCombat));
+        assert_eq!(
+            stamped(&ga_printed),
+            ga_printed,
+            "a printed inner window on GainActivatedAbilitiesOfTarget must survive a \
+             wider outer duration — ungating this arm silently widens the grant"
+        );
+        let ga_sentinel = gain_activated(Some(Duration::Permanent));
+        assert_eq!(
+            stamped(&ga_sentinel),
+            gain_activated(Some(outer())),
+            "the Permanent sentinel MEANS unset and must be overwritten — gating this \
+             arm on `is_none()` alone would make it dead code"
+        );
+        let ga_unset = gain_activated(None);
+        assert_eq!(
+            stamped(&ga_unset),
+            gain_activated(Some(outer())),
+            "an unset inner duration takes the outer stated duration"
+        );
     }
 
     /// CR 611.2a: `with_clause_chain_duration` walks ONLY `sub_ability`, stamps only
