@@ -2383,6 +2383,10 @@ mod duration_distribution_tests_7923 {
             single_use: false,
             cast_cost_raise: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            // #7948: a self-standing play permission with full cast authority,
+            // which is what this duration fixture models — NOT the
+            // `LandLookCompanion` half of an alternative-cost grant.
+            provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
         }
     }
 
