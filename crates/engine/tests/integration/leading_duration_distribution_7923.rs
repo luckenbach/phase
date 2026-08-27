@@ -63,7 +63,7 @@ use engine::types::actions::GameAction;
 use engine::types::game_state::{TransientContinuousEffect, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
-use engine::types::mana::{ManaType, ManaUnit};
+use engine::types::mana::{ManaCost, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;
@@ -80,6 +80,7 @@ const AURELIA: &str = "Flying\nMentor (Whenever this creature attacks, put a +1/
 const GIANT_OYSTER: &str = "You may choose not to untap this creature during your untap step.\n{T}: For as long as this creature remains tapped, target tapped creature doesn't untap during its controller's untap step, and at the beginning of each of your draw steps, put a -1/-1 counter on that creature. When this creature leaves the battlefield or becomes untapped, remove all -1/-1 counters from the creature.";
 const BELLIGERENT: &str = "Whenever The Belligerent attacks, create a Treasure token. Until end of turn, you may look at the top card of your library any time, and you may play lands and cast spells from the top of your library.\nCrew 3";
 const OPPORTUNISTIC_DRAGON: &str = "Flying\nWhen this creature enters, choose target Human or artifact an opponent controls. For as long as this creature remains on the battlefield, gain control of that permanent, it loses all abilities, and it can't attack or block.";
+const MURDER: &str = "Destroy target creature.";
 const ABEYANCE: &str = "Until end of turn, target player can't cast instant or sorcery spells, and that player can't activate abilities that aren't mana abilities.\nDraw a card.";
 const REVENGE: &str = "Until end of turn, target creature gets +6/+6 and gains trample, and all creatures able to block it this turn do so.\nMiracle {G} (You may cast this card for its miracle cost when you draw it if it's the first card you drew this turn.)";
 
@@ -1261,6 +1262,10 @@ fn opportunistic_dragon_riders_expire_with_the_host() {
         .add_creature_from_oracle(P1, "Stolen Human", 3, 3, "{T}: Draw a card.")
         .with_subtypes(vec!["Human"])
         .id();
+    let murder = scenario
+        .add_spell_to_hand_from_oracle(P0, "Murder", false, MURDER)
+        .with_mana_cost(ManaCost::zero())
+        .id();
     let mut runner = scenario.build();
 
     let outcome = runner
@@ -1273,11 +1278,10 @@ fn opportunistic_dragon_riders_expire_with_the_host() {
     assert!(outcome.state().objects[&victim].abilities.is_empty());
     assert!(creature_cant_attack(outcome.state(), victim));
 
-    // The host leaves the battlefield.
-    let events = &mut Vec::new();
-    engine::game::zones::move_to_zone(runner.state_mut(), dragon, Zone::Graveyard, events);
-    runner.state_mut().layers_dirty.mark_full();
-    evaluate_layers(runner.state_mut());
+    // Destroy the host through the production cast/zone-change pipeline, then
+    // let normal priority and layer processing settle its host-lifetime effects.
+    runner.cast(murder).target_object(dragon).resolve();
+    runner.advance_until_stack_empty();
 
     // All three revert TOGETHER — one printed duration, one expiry.
     assert_eq!(
