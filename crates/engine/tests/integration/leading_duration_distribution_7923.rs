@@ -412,6 +412,63 @@ fn xanathar_leading_duration_reaches_governed_chain_links() {
     );
 }
 
+/// **V5 — `[GUARD:unset-sentinel]`, SHAPE.** CR 611.2a (`docs/MagicCompRules.txt:2908`).
+///
+/// **ANCHORED AGAINST NARROWING THE GUARD, NOT AGAINST BASE_SHA — it passes at
+/// BASE_SHA and is a POSITIVE REACH GUARD, not a discriminator.** The named removal
+/// that turns it red: narrowing `oracle_ir::ast::duration_is_unset_sentinel` so that
+/// `None` is no longer in the unset set. The link's embedded window then stays
+/// `None`, the leading "Until end of turn," never reaches it, and the play
+/// permission lasts for the rest of the game (CR 611.2a's second sentence) instead
+/// of being pruned at cleanup (CR 514.2, `:2442`).
+///
+/// Its value is that it drives a REAL CARD through the production parser, so it
+/// covers the one way this PR's guard could break the PR's own headline fix.
+/// **Not redundant** with `xanathar_leading_duration_reaches_governed_chain_links`,
+/// which binds an `&AbilityDefinition` and asserts the CARRIER; it never reads the
+/// embedded field.
+///
+/// The mixed-duration rows — a WRITTEN embedded window under a DIFFERING governing
+/// prefix — are unit rows in `oracle_ir::ast::duration_distribution_tests_7923`
+/// (`narrower_printed_window_survives_a_wider_outer_duration`, and links 4/5 of
+/// `chain_duration_walks_governed_links_and_yields_to_explicit`), constructed
+/// directly for the reason that file's `PreventDamage` row already gives. The PR
+/// body records which effect types a card can supply that shape for today.
+#[test]
+fn xanathar_unset_cast_window_still_takes_the_leading_duration() {
+    let parsed = parse_oracle_text(
+        XANATHAR,
+        "Xanathar, Guild Kingpin",
+        &[],
+        &["Legendary".to_string(), "Creature".to_string()],
+        &["Beholder".to_string()],
+    );
+    assert_eq!(parsed.triggers.len(), 1, "one upkeep trigger");
+    let links = chain(trigger_body(&parsed.triggers[0]));
+
+    // Positive reach guard: the clause parsed at all.
+    assert_no_unimplemented(&links, "Xanathar");
+
+    let cast_from_zone = links
+        .iter()
+        .find(|d| matches!(&*d.effect, Effect::CastFromZone { .. }))
+        .expect("the `you may play the top card of their library` permission");
+
+    // THE ASSERTION THE NAMED REMOVAL TURNS RED: this link reaches
+    // `duration_is_unset_sentinel` with its EMBEDDED field unset, so the leading
+    // "Until end of turn," must be written into it.
+    match &*cast_from_zone.effect {
+        Effect::CastFromZone { duration, .. } => assert_eq!(
+            duration.as_ref(),
+            Some(&Duration::UntilEndOfTurn),
+            "CR 611.2a: an unset embedded window takes the governing leading duration; \
+             narrowing `duration_is_unset_sentinel` to exclude `None` leaves it None and \
+             the play permission is never pruned"
+        ),
+        other => panic!("expected CastFromZone, got {other:?}"),
+    }
+}
+
 /// **V-U1g — `[BASE]`, SHAPE.** CR 611.2a (`:2908`); CR 615 is the
 /// prevention-effects section `Effect::PreventDamage` implements.
 ///

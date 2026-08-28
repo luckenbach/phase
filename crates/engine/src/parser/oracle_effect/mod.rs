@@ -7742,7 +7742,7 @@ pub(crate) fn parse_effect_clause(text: &str, ctx: &mut ParseContext) -> ParsedE
     // already populated a non-default `clause.duration` (some specialized
     // parsers set it themselves and we must not clobber). A default
     // `Permanent` from a body parser yields to the explicit peeled duration.
-    if clause.duration.is_none() || matches!(clause.duration, Some(Duration::Permanent)) {
+    if duration_is_unset_sentinel(&clause.duration) {
         if let Some(duration) = peel_ctx.duration().cloned() {
             clause = with_clause_duration(clause, duration);
         }
@@ -9880,13 +9880,21 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
         // governed sequential sibling a recognizer built beneath this clause.
         //
         // DELIBERATELY UNGATED, unlike the two other leading-duration stamp sites (the
-        // trailing peel above and `ClauseDraft::push`). CR 608.2c: this duration is
-        // printed at the HEAD of the very sentence `rest` is the body of, so it
-        // syntactically governs that body — a duration the body parser set is its own
-        // injected default, not separately-printed text, and the printed prefix
-        // outranks it. A severed conjunct is the opposite case: separately-printed text
-        // whose own stated window outranks the sentence's prefix, which is why those
-        // two sites gate.
+        // trailing peel above and `ClauseDraft::push`): this call does not test
+        // `clause.duration` before stamping. CR 608.2c: this duration is printed at the
+        // HEAD of the very sentence `rest` is the body of, so it syntactically governs
+        // that body — a CARRIER the body parser set is its own injected default, not
+        // separately-printed text, and the printed prefix outranks it. A severed
+        // conjunct is the opposite case: separately-printed text whose own stated
+        // window outranks the sentence's prefix, which is why those two sites gate.
+        //
+        // SCOPE — the paragraph above is about `clause.duration` ONLY. The effect's OWN
+        // embedded `duration` field is a SECOND carrier and is NOT outranked here:
+        // `apply_duration_to_effect` decides it per arm through
+        // `duration_is_unset_sentinel`, preserving any value that is neither `None` nor
+        // `Some(Permanent)` (CR 611.2a — an explicitly written window is a stated one).
+        // Both carriers travel through this one call; only the head clause's carrier
+        // is ungated.
         return with_clause_chain_duration(parse_effect_clause(rest, ctx), duration);
     }
 

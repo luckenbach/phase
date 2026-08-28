@@ -1235,6 +1235,15 @@ impl ClauseDraft<'_> {
                 // sentence's window here would have `apply_duration_to_effect`
                 // overwrite it, the exact clobber this gate exists to prevent — so
                 // leave the clause untouched.
+                //
+                // Since #7959 the EMBEDDED-side clobber this branch guards against is refused
+                // structurally: `apply_duration_to_effect` yields to a written embedded window
+                // on every `Option<Duration>` writer, through `duration_is_unset_sentinel`
+                // (CR 611.2a, :2908). This textual gate STAYS, because it guards the OTHER
+                // carrier: `AbilityDefinition.duration` is still written unconditionally by
+                // `with_clause_duration`, and an injected `UntilEndOfTurn` is still
+                // indistinguishable from a printed one there (#7962). Do not delete it as
+                // redundant.
                 self.parsed.duration.clone()
             } else {
                 self.builder.pending_leading_duration.clone()
