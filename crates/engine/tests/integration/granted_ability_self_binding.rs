@@ -462,8 +462,9 @@ fn food_fight_named_self_filter_is_not_masked() {
         structural.to_lowercase().contains("food fight"),
         "the `named Food Fight` name-filter must preserve the card name; got {structural}"
     );
+    let json = serde_json::to_string(&granted).expect("the granted definition serializes");
     assert!(
-        !structural.contains('\u{E0002}'),
+        !json.contains(PLACEHOLDER),
         "the granting-object placeholder must never leak into the AST"
     );
     assert!(
