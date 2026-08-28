@@ -9438,8 +9438,18 @@ impl<'a> ParsedElement<'a> {
 /// with `~` so they match parsed descriptions (which use `~` normalization).
 fn normalize_for_matching(lower: &str, card_name_lower: &str) -> String {
     // Keep coverage matching byte-equivalent to the parser's self-reference
-    // authority. Coverage adds only its historical "this spell" alias.
-    normalize_card_name_refs(lower, card_name_lower).replace("this spell", "~")
+    // authority — BOTH halves of it. CR 201.5a: the granter self-reference
+    // marker must render exactly as it does in the descriptions this function's
+    // output is compared against, or the Oracle side and the description side
+    // disagree for every card whose granted body names its granter (measured:
+    // all 16 currently fail description matching outright for exactly this
+    // reason). Both sides are lowercased here, so both carry the lowercased
+    // printed name. Coverage adds only its historical "this spell" alias.
+    crate::parser::oracle_util::render_granting_self_reference(
+        &normalize_card_name_refs(lower, card_name_lower),
+        card_name_lower,
+    )
+    .replace("this spell", "~")
 }
 
 fn split_trigger_variants(norm: &str) -> Option<Vec<String>> {
@@ -15166,6 +15176,30 @@ mod tests {
                 "coverage and parser normalization must not drift for {name}"
             );
         }
+    }
+
+    /// CR 201.5a: coverage compares Oracle text against parsed descriptions, so
+    /// both sides must share ONE self-reference authority. Before this, the
+    /// description side rendered the granter marker to the granting card's
+    /// printed name while the Oracle side left the raw marker in place, so every
+    /// card whose granted body names its granter failed description matching.
+    #[test]
+    fn normalize_for_matching_renders_the_granter_name_on_the_oracle_side() {
+        const ORACLE: &str = "equipped creature gets +1/+1 and has \"{3}, {t}, sacrifice \
+                              deconstruction hammer: destroy target artifact or enchantment.\"";
+        // POSITIVE REACH-GUARD: the assertion below is an identity over ORACLE,
+        // so it would pass vacuously if the masker never fired on this lowercased
+        // input. Prove it fires BEFORE the render composes over it.
+        assert!(
+            normalize_card_name_refs(ORACLE, "deconstruction hammer")
+                .contains(crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER),
+            "reach-guard: the masker must place the granter marker on the Oracle side, \
+             or the identity assertion below proves nothing"
+        );
+        assert_eq!(
+            normalize_for_matching(ORACLE, "deconstruction hammer"),
+            ORACLE
+        );
     }
 
     #[test]
