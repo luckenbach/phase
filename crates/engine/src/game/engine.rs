@@ -1,5 +1,5 @@
 use rand::Rng;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use thiserror::Error;
 
 use crate::types::ability::{DurationEvent, EffectKind, KeywordAction, TargetRef};
@@ -17,7 +17,8 @@ use crate::types::game_state::{
     ManaAbilityResume, MayTriggerAutoChoiceKey, PayCostKind, PendingCostMoveResume,
     PendingCounterPostAction, PendingEffectResolved, ResolveAllConsentParticipant,
     ResolveAllConsentRun, ResolveAllPrioritySnapshot, RetargetScope, StackEntry, StackEntryKind,
-    WaitingFor,
+    StackResolutionAutoPassOverlay, StackResolutionBudget, StackResolutionEntryFence,
+    StackResolutionPolicy, StackResolutionSession, WaitingFor,
 };
 use crate::types::identifiers::{CardId, DelayedTriggerOrigin, ObjectId, ObjectIncarnationRef};
 use crate::types::match_config::MatchType;
@@ -77,10 +78,13 @@ use super::zone_pipeline::{self, ZoneMoveRequest, ZoneMoveResult};
 use super::zones;
 
 pub use super::engine_resolve_batch::{
-    pending_resolve_all_ready_requester, recover_orphaned_resolve_all, resolve_all_fast_forward,
-    resolve_all_ready_access, resolve_all_ready_prefix, resolve_all_ready_prefix_with,
+    classify_restored_stack_automation, pending_resolve_all_ready_requester,
+    recover_orphaned_resolve_all, resolve_all_fast_forward, resolve_all_ready_access,
+    resolve_all_ready_prefix, resolve_all_ready_prefix_with, resume_restored_stack_automation,
     ResolveAllCallbackDecision, ResolveAllContinuation, ResolveAllFastForwardResult,
-    ResolveAllReadyAccess,
+    ResolveAllReadyAccess, RestoredStackAutomation, RestoredStackAutomationOutcome,
+    RestoredStackAutomationPresentation, RestoredStackAutomationResult,
+    RestoredStackAutomationResume, MAX_RESTORED_STACK_AUTOMATION_LOG_ENTRIES,
 };
 
 #[derive(Debug, Clone, Error)]
@@ -1043,6 +1047,140 @@ pub fn apply_interaction_with_rejection(
     })
 }
 
+/// Applies an AI-selected priority pass after re-validating the exact current
+/// engine-issued decision contract. A verified pass is the only AI action that
+/// may start (or continue) a retained `RecheckNoMeaningfulPriorityAction`
+/// session; ordinary `PassPriority` remains an ordinary player pass.
+///
+/// The retained session is intentionally stack-local: it fences the stack as
+/// it exists now and may reuse only the verified representative's own pass at
+/// later priority windows. It never infers a pass for an unverified
+/// representative and never authorizes a new stack entry.
+pub fn apply_verified_ai_priority_pass(
+    state: &mut GameState,
+    authenticated_actor: PlayerId,
+    contract: &crate::ai_support::AiDecisionContract,
+    action: GameAction,
+) -> Result<ActionResult, EngineError> {
+    if action != GameAction::PassPriority
+        || authenticated_actor != contract.authorized_actor
+        || !contract.permits(state, authenticated_actor, &action)
+    {
+        return Err(EngineError::ActionNotAllowed(
+            "AI priority pass no longer matches its issued decision contract".to_string(),
+        ));
+    }
+    let WaitingFor::Priority { player } = &state.waiting_for else {
+        return Err(EngineError::ActionNotAllowed(
+            "AI stack continuation requires a live priority window".to_string(),
+        ));
+    };
+    if *player != contract.semantic_owner || state.stack.is_empty() {
+        return Err(EngineError::ActionNotAllowed(
+            "AI stack continuation requires the issued nonempty priority window".to_string(),
+        ));
+    }
+
+    let representative = super::topology::priority_pass_representative(state, *player);
+    let inserted_verified_representative = if let Some(session) =
+        state.stack_resolution_session.as_ref()
+    {
+        let current_representatives = super::topology::canonical_priority_representatives(
+            state,
+            session.representatives.iter().copied(),
+        );
+        let current_entry_matches = session.entries.get(session.cursor).is_some_and(|fence| {
+            state
+                .stack
+                .back()
+                .is_some_and(|entry| fence.matches_captured_entry(entry))
+        });
+        if session.policy != StackResolutionPolicy::RecheckNoMeaningfulPriorityAction
+            || current_representatives != session.representatives
+            || !session.representatives.contains(&representative)
+            || !current_entry_matches
+        {
+            return Err(EngineError::ActionNotAllowed(
+                "AI priority pass cannot replace the active stack-resolution session".to_string(),
+            ));
+        }
+        state
+            .stack_resolution_session
+            .as_mut()
+            .expect("the validated active session remains installed")
+            .verified_pass_representatives
+            .insert(representative)
+    } else {
+        // The shared session is installed before the ordinary action boundary
+        // so its explicit-pass seam can enforce the one-entry limit. A rejected
+        // action boundary intentionally preserves its ownerless-replacement
+        // repair, so roll back only the newly installed private overlay rather
+        // than restoring the entire pre-boundary game state.
+        let auto_pass_before_install = state.auto_pass.clone();
+        let baseline = state
+            .auto_pass
+            .iter()
+            .map(|(&player, &auto_pass)| (player, auto_pass))
+            .collect();
+        install_stack_resolution_session(
+            state,
+            super::topology::priority_pass_participants(state)
+                .into_iter()
+                .collect(),
+            StackResolutionBudget::Unlimited,
+            StackResolutionPolicy::RecheckNoMeaningfulPriorityAction,
+            baseline,
+        );
+        state
+            .stack_resolution_session
+            .as_mut()
+            .expect("the newly installed session exists")
+            .verified_pass_representatives
+            .insert(representative);
+        return match apply_interaction(state, authenticated_actor, contract.semantic_owner, action)
+        {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                state.auto_pass = auto_pass_before_install;
+                state.stack_resolution_session = None;
+                Err(error)
+            }
+        };
+    };
+
+    match apply_interaction(state, authenticated_actor, contract.semantic_owner, action) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            if inserted_verified_representative {
+                if let Some(session) = state.stack_resolution_session.as_mut() {
+                    session
+                        .verified_pass_representatives
+                        .remove(&representative);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Applies a verified AI priority pass while returning the same stable rejection
+/// metadata as other interaction-materialized actions.
+pub fn apply_verified_ai_priority_pass_with_rejection(
+    state: &mut GameState,
+    authenticated_actor: PlayerId,
+    contract: &crate::ai_support::AiDecisionContract,
+    action: GameAction,
+) -> Result<ActionResult, ActionRejection> {
+    let related_object_ids = action.related_object_ids();
+    apply_verified_ai_priority_pass(state, authenticated_actor, contract, action).map_err(|error| {
+        super::visibility::filter_action_rejection_for_viewer(
+            state,
+            authenticated_actor,
+            &action_rejection_for_engine_error(&error, related_object_ids),
+        )
+    })
+}
+
 pub(crate) fn apply_interaction_for_simulation(
     state: &mut GameState,
     authenticated_actor: PlayerId,
@@ -1164,6 +1302,7 @@ struct RawActionApplication {
     result: ActionResult,
     journal_start: usize,
     is_actor_scoped_preference: bool,
+    suppress_auto_pass_once: bool,
     boundary_snapshot: GameState,
     previous_interaction_waiting: WaitingFor,
     previous_interaction_slots: Vec<crate::types::interaction::ActiveInteractionSlot>,
@@ -1277,6 +1416,13 @@ fn apply_action_boundary_core(
     let boundary_snapshot = state.clone();
     let journal_start = state.resolved_rules_journal.entries().len();
     let is_actor_scoped_preference = action.is_actor_scoped_preference();
+    let suppress_auto_pass_once = matches!(
+        &action,
+        GameAction::RespondResolveAllConsent {
+            decision: ResolveAllConsentDecision::Decline,
+            ..
+        } | GameAction::RevokeResolveAllConsent { .. }
+    );
     interaction::ensure_interaction_authority(state);
     let previous_interaction_waiting = state.waiting_for.clone();
     let previous_interaction_slots = state.active_interaction_slots.clone();
@@ -1353,6 +1499,7 @@ fn apply_action_boundary_core(
         result,
         journal_start,
         is_actor_scoped_preference,
+        suppress_auto_pass_once,
         boundary_snapshot,
         previous_interaction_waiting,
         previous_interaction_slots,
@@ -1387,6 +1534,7 @@ fn finish_action_boundary_with_lifecycle(
         mut result,
         journal_start,
         is_actor_scoped_preference,
+        suppress_auto_pass_once,
         boundary_snapshot,
         previous_interaction_waiting,
         previous_interaction_slots,
@@ -1397,12 +1545,19 @@ fn finish_action_boundary_with_lifecycle(
     reconcile_terminal_result(state, &mut result);
     bump_state_revision(state);
     sync_waiting_for(state, &result.waiting_for);
-    let auto_pass_advanced = if is_actor_scoped_preference {
+    // Decline/Revoke are transactional consent rollbacks. They restore the
+    // frozen Priority checkpoint exactly; a standing auto-pass may resume on
+    // the next ordinary action boundary, but must not consume that checkpoint
+    // as an implicit side effect of withdrawing the authorization.
+    let auto_pass_advanced = if is_actor_scoped_preference || suppress_auto_pass_once {
         false
     } else {
         run_auto_pass_loop(state, &mut result)
     };
     reconcile_terminal_result(state, &mut result);
+    if matches!(result.waiting_for, WaitingFor::GameOver { .. }) {
+        take_and_restore_stack_resolution_session(state);
+    }
     // Debug "infinite mana" (CR 500.5 suppressed for flagged players): restore any
     // pool that a spend during this action depleted, before public state is
     // finalized and the next affordability probe runs. No-op when none flagged.
@@ -4217,7 +4372,10 @@ fn drive_one_shortcut_cycle(
         match pass_priority_once_with_pipeline(&mut work, &mut beat_events, None) {
             // Cross-lethal: COMMIT + STOP. The GameOver event + transition are already in
             // `work`/`beat_events`.
-            Ok(WaitingFor::GameOver { winner }) => {
+            Ok(PriorityPassPipelineOutcome {
+                waiting_for: WaitingFor::GameOver { winner },
+                ..
+            }) => {
                 ev.append(&mut beat_events);
                 return CycleOutcome::CrossLethal {
                     state: Box::new(work),
@@ -4232,7 +4390,10 @@ fn drive_one_shortcut_cycle(
             // it advances the same counter. Both arms key the advance on the ring's BACK
             // ALLOCATION actually changing rather than on the beat kind, which is what keeps
             // the drive's frame count equal to the mint's on either path.
-            Ok(WaitingFor::Priority { player }) if player == work.active_player => {
+            Ok(PriorityPassPipelineOutcome {
+                waiting_for: WaitingFor::Priority { player },
+                ..
+            }) if player == work.active_player => {
                 ev.append(&mut beat_events);
                 let ring_back_after = work.loop_detect_ring.back().map(std::sync::Arc::as_ptr);
                 if ring_back_after.is_some() && ring_back_after != ring_back_before {
@@ -4251,13 +4412,18 @@ fn drive_one_shortcut_cycle(
                 continue; // active beat, not yet recurred ⇒ keep driving within the cap
             }
             // Opponent's mid-cycle priority window ⇒ keep driving.
-            Ok(WaitingFor::Priority { .. }) => {
+            Ok(PriorityPassPipelineOutcome {
+                waiting_for: WaitingFor::Priority { .. },
+                ..
+            }) => {
                 ev.append(&mut beat_events);
                 continue;
             }
             // Any OTHER prompt (OrderTriggers / TriggerTargetSelection / …): answer it from the
             // pins and continue. An unpinned prompt fails closed ⇒ abort to manual.
-            Ok(other) => {
+            Ok(PriorityPassPipelineOutcome {
+                waiting_for: other, ..
+            }) => {
                 ev.append(&mut beat_events);
                 match inject_pinned_answer(&mut work, template, iteration, &other) {
                     Ok(()) => {
@@ -7135,7 +7301,9 @@ fn priority_auto_pass_decision(state: &GameState, player: PlayerId) -> AutoPassD
         return AutoPassDecision::Exit;
     };
     match mode {
-        AutoPassMode::UntilStackEmpty { initial_stack_len } => {
+        AutoPassMode::UntilStackEmpty {
+            initial_stack_len, ..
+        } => {
             if state.stack.is_empty() || state.stack.len() > *initial_stack_len {
                 AutoPassDecision::Finish
             } else {
@@ -7172,14 +7340,22 @@ fn end_of_turn_active(state: &GameState, player: PlayerId) -> bool {
     )
 }
 
+struct PriorityPassPipelineOutcome {
+    waiting_for: WaitingFor,
+    consumed_stack_entries: u32,
+}
+
 fn pass_priority_once_with_pipeline(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
     stack_resolution_limit: Option<u32>,
-) -> Result<WaitingFor, EngineError> {
+) -> Result<PriorityPassPipelineOutcome, EngineError> {
     if let WaitingFor::Priority { player } = &state.waiting_for {
         if super::precast_copy_shortcut::blocks_pass(state, *player) {
-            return Ok(state.waiting_for.clone());
+            return Ok(PriorityPassPipelineOutcome {
+                waiting_for: state.waiting_for.clone(),
+                consumed_stack_entries: 0,
+            });
         }
     }
     state.cancelled_casts.clear();
@@ -7201,13 +7377,13 @@ fn pass_priority_once_with_pipeline(
     // submitter (the controller), which would mis-count consecutive passes and
     // soft-lock the game.
     let current_seat = turn_control::priority_seat(state);
-    let wf = priority::handle_priority_pass_with_limit(
+    let priority_outcome = priority::handle_priority_pass_with_limit(
         current_seat,
         state,
         events,
         stack_resolution_limit,
     );
-    sync_waiting_for(state, &wf);
+    sync_waiting_for(state, &priority_outcome.waiting_for);
 
     // CR 608.2 + CR 117.4: Drain any pending continuation queued during the
     // priority pass (e.g. effects that chain a sub-resolution after the parent
@@ -7297,7 +7473,10 @@ fn pass_priority_once_with_pipeline(
     // No else-branch: a bare handoff or an empty-stack pass-to-advance-phase does NOT
     // touch the ring (leave-intact), so accumulation survives the inter-resolution beats.
 
-    Ok(wf)
+    Ok(PriorityPassPipelineOutcome {
+        waiting_for: wf,
+        consumed_stack_entries: priority_outcome.consumed_stack_entries,
+    })
 }
 
 fn active_until_stack_empty_requester(state: &GameState) -> Option<PlayerId> {
@@ -7348,12 +7527,21 @@ fn no_living_player_has_meaningful_priority_action(state: &GameState) -> bool {
 }
 
 fn finish_completed_or_interrupted_until_stack_empty_sessions(state: &mut GameState) -> bool {
+    let session_representatives = state
+        .stack_resolution_session
+        .as_ref()
+        .map(|session| &session.representatives);
     let finished: Vec<PlayerId> = state
         .auto_pass
         .iter()
         .filter_map(|(player, mode)| match mode {
-            AutoPassMode::UntilStackEmpty { initial_stack_len }
-                if state.stack.is_empty() || state.stack.len() > *initial_stack_len =>
+            AutoPassMode::UntilStackEmpty {
+                initial_stack_len, ..
+            } if !session_representatives.is_some_and(|representatives| {
+                representatives.contains(&super::topology::priority_pass_representative(
+                    state, *player,
+                ))
+            }) && (state.stack.is_empty() || state.stack.len() > *initial_stack_len) =>
             {
                 Some(*player)
             }
@@ -7366,6 +7554,205 @@ fn finish_completed_or_interrupted_until_stack_empty_sessions(state: &mut GameSt
     }
 
     !finished.is_empty()
+}
+
+/// Restores the exact sparse auto-pass map that existed before a stack
+/// resolution session installed its representative overlay.
+///
+/// This intentionally does not touch priority bookkeeping or `WaitingFor`:
+/// a cancelled or invalidated authorization leaves the current ordinary
+/// priority window in place (CR 117.3d / CR 117.4).
+pub(crate) fn take_and_restore_stack_resolution_session(state: &mut GameState) -> bool {
+    let Some(session) = state.stack_resolution_session.take() else {
+        return false;
+    };
+    state.auto_pass = session.auto_pass_overlay.baseline.into_iter().collect();
+    true
+}
+
+/// Drives an already-authorized restored stack-resolution session through the
+/// same ordinary auto-pass runner used at a player-action boundary.
+///
+/// Restore itself deliberately does not call this: deserialization must remain
+/// a pure state reconstruction. The explicit restore-resume entry point
+/// validates the saved authorization before selecting this lifecycle seam.
+pub(crate) fn resume_stack_resolution_session_runner(state: &mut GameState) -> ActionResult {
+    let boundary_snapshot = state.clone();
+    let journal_start = state.resolved_rules_journal.entries().len();
+    let mut result = ActionResult {
+        events: Vec::new(),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: Vec::new(),
+    };
+
+    reconcile_terminal_result(state, &mut result);
+    bump_state_revision(state);
+    sync_waiting_for(state, &result.waiting_for);
+    run_auto_pass_loop(state, &mut result);
+    reconcile_terminal_result(state, &mut result);
+    if matches!(result.waiting_for, WaitingFor::GameOver { .. }) {
+        take_and_restore_stack_resolution_session(state);
+    }
+    super::mana_payment::refill_infinite_mana(state);
+    remember_public_reveals(state, &result.events, journal_start);
+    mark_public_state_from_events(state, &result.events);
+    finalize_rules_state(state);
+    result.waiting_for = state.waiting_for.clone();
+    finalize_display_state(state);
+    result.log_entries = super::log::resolve_log_entries(&result.events, &boundary_snapshot, state);
+    interaction::ensure_interaction_authority(state);
+    #[cfg(debug_assertions)]
+    debug_assert_runtime_resolution_invariants(state);
+    result
+}
+
+#[derive(Clone, Copy)]
+enum StackResolutionSessionPassKind {
+    /// The session runner is considering an implicit pass. A rechecking AI
+    /// session may reuse only a representative who already supplied a verified
+    /// pass within this fenced stack cohort.
+    Automatic,
+    /// A player explicitly submitted `PassPriority`. That choice is itself the
+    /// fresh decision, so it may consume the session's next authorized entry.
+    Explicit,
+}
+
+enum StackResolutionSessionPriorityDecision {
+    NotActive,
+    Pause,
+    /// A rechecking AI session is waiting on an unverified representative.
+    /// Keep it intact so that representative's explicit decision can continue
+    /// its fenced cohort.
+    PauseRetained,
+    Resolve {
+        limit: u32,
+    },
+}
+
+fn stack_resolution_session_priority_decision(
+    state: &mut GameState,
+    holder: PlayerId,
+    pass_kind: StackResolutionSessionPassKind,
+) -> StackResolutionSessionPriorityDecision {
+    let canonical_holder = super::topology::priority_pass_representative(state, holder);
+    let decision = {
+        let Some(session) = state.stack_resolution_session.as_ref() else {
+            return StackResolutionSessionPriorityDecision::NotActive;
+        };
+
+        let current_representatives = super::topology::canonical_priority_representatives(
+            state,
+            session.representatives.iter().copied(),
+        );
+        let live_representatives = super::topology::priority_pass_participants(state)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if current_representatives != session.representatives
+            || !session
+                .representatives
+                .iter()
+                .all(|representative| live_representatives.contains(representative))
+            || session.cursor == session.entries.len()
+            || state.stack.is_empty()
+        {
+            None
+        } else {
+            let remaining_budget = match session.budget.max_resolutions() {
+                Some(maximum) => {
+                    maximum.saturating_sub(session.cursor.try_into().unwrap_or(u32::MAX))
+                }
+                None => u32::MAX,
+            };
+            let top_matches = session
+                .entries
+                .get(session.cursor)
+                .is_some_and(|top_fence| {
+                    state
+                        .stack
+                        .back()
+                        .is_some_and(|entry| top_fence.matches_captured_entry(entry))
+                });
+            if remaining_budget == 0 || !top_matches {
+                None
+            } else {
+                let rechecks =
+                    session.policy == StackResolutionPolicy::RecheckNoMeaningfulPriorityAction;
+                let holder_is_representative = session.representatives.contains(&canonical_holder);
+                if matches!(pass_kind, StackResolutionSessionPassKind::Automatic) {
+                    if rechecks {
+                        return if holder_is_representative
+                            && session
+                                .verified_pass_representatives
+                                .contains(&canonical_holder)
+                        {
+                            StackResolutionSessionPriorityDecision::Resolve { limit: 1 }
+                        } else {
+                            StackResolutionSessionPriorityDecision::PauseRetained
+                        };
+                    }
+                    if !holder_is_representative && priority_player_has_meaningful_action(state) {
+                        return StackResolutionSessionPriorityDecision::Pause;
+                    }
+                }
+                let matching_prefix = state
+                    .stack
+                    .iter()
+                    .rev()
+                    .zip(session.entries.iter().skip(session.cursor))
+                    .take_while(|(entry, fence)| fence.matches_captured_entry(entry))
+                    .count();
+                let limit = matching_prefix
+                    .min(remaining_budget as usize)
+                    .min(u32::MAX as usize) as u32;
+                // A verified representative may reuse its own pass only
+                // inside this exact fenced session. Each all-pass boundary
+                // still resolves one entry so a changed stack topology tears
+                // the session down before a pass can escape its cohort.
+                let limit =
+                    if session.policy == StackResolutionPolicy::RecheckNoMeaningfulPriorityAction {
+                        limit.min(1)
+                    } else {
+                        limit
+                    };
+                (limit != 0).then_some(limit)
+            }
+        }
+    };
+
+    match decision {
+        Some(limit) => StackResolutionSessionPriorityDecision::Resolve { limit },
+        None => {
+            take_and_restore_stack_resolution_session(state);
+            StackResolutionSessionPriorityDecision::Pause
+        }
+    }
+}
+
+fn advance_stack_resolution_session_after_priority_pass(
+    state: &mut GameState,
+    consumed_stack_entries: u32,
+    waiting_for: &WaitingFor,
+) -> bool {
+    let should_restore = {
+        let Some(session) = state.stack_resolution_session.as_mut() else {
+            return false;
+        };
+        let consumed_stack_entries = usize::try_from(consumed_stack_entries)
+            .expect("a stack resolver count fits the engine's native index size");
+        session.cursor = session.cursor.saturating_add(consumed_stack_entries);
+        let budget_exhausted = session
+            .budget
+            .max_resolutions()
+            .is_some_and(|maximum| session.cursor >= maximum as usize);
+        !matches!(waiting_for, WaitingFor::Priority { .. })
+            || session.cursor == session.entries.len()
+            || budget_exhausted
+            || state.stack.is_empty()
+    };
+    if should_restore {
+        take_and_restore_stack_resolution_session(state);
+    }
+    should_restore
 }
 
 // CR 732.2a SAFETY LIMIT: a shortcut is "a loop that repeats a specified number of times";
@@ -7451,38 +7838,57 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) -> bool 
                 if super::precast_copy_shortcut::blocks_pass(state, player) {
                     break;
                 }
-                let decision = priority_auto_pass_decision(state, player);
-                match decision {
-                    AutoPassDecision::Exit => {
-                        let Some(requester) = active_until_stack_empty_requester(state) else {
-                            break;
-                        };
-                        if requester == player {
-                            break;
+                let stack_resolution_limit = match stack_resolution_session_priority_decision(
+                    state,
+                    player,
+                    StackResolutionSessionPassKind::Automatic,
+                ) {
+                    StackResolutionSessionPriorityDecision::Resolve { limit } => Some(limit),
+                    StackResolutionSessionPriorityDecision::Pause => break,
+                    StackResolutionSessionPriorityDecision::PauseRetained => break,
+                    StackResolutionSessionPriorityDecision::NotActive => {
+                        let decision = priority_auto_pass_decision(state, player);
+                        match decision {
+                            AutoPassDecision::Exit => {
+                                let Some(requester) = active_until_stack_empty_requester(state)
+                                else {
+                                    break;
+                                };
+                                if requester == player {
+                                    break;
+                                }
+                                if finish_completed_or_interrupted_until_stack_empty_sessions(state)
+                                {
+                                    break;
+                                }
+                                if priority_player_has_meaningful_action(state) {
+                                    break;
+                                }
+                            }
+                            AutoPassDecision::Finish => {
+                                state.auto_pass.remove(&player);
+                                break;
+                            }
+                            AutoPassDecision::Break => break,
+                            AutoPassDecision::Pass => {}
                         }
-                        if finish_completed_or_interrupted_until_stack_empty_sessions(state) {
-                            break;
-                        }
-                        if priority_player_has_meaningful_action(state) {
-                            break;
-                        }
+                        None
                     }
-                    AutoPassDecision::Finish => {
-                        state.auto_pass.remove(&player);
-                        break;
-                    }
-                    AutoPassDecision::Break => break,
-                    AutoPassDecision::Pass => {}
-                }
+                };
 
                 let mut events = Vec::new();
-                match pass_priority_once_with_pipeline(state, &mut events, None) {
-                    Ok(wf) => {
+                match pass_priority_once_with_pipeline(state, &mut events, stack_resolution_limit) {
+                    Ok(outcome) => {
                         advanced = true;
                         let stack_empty_or_grew =
                             finish_completed_or_interrupted_until_stack_empty_sessions(state);
+                        let session_finished = advance_stack_resolution_session_after_priority_pass(
+                            state,
+                            outcome.consumed_stack_entries,
+                            &outcome.waiting_for,
+                        );
                         result.events.extend(events);
-                        result.waiting_for = wf;
+                        result.waiting_for = outcome.waiting_for;
                         // CR 732.2: a mandatory cascade growing the board or
                         // event stream past the resource ceiling cannot settle —
                         // halt gracefully rather than exhaust WASM memory.
@@ -7556,7 +7962,7 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) -> bool 
                             loop_window.push_back((fingerprint, normalized));
                         }
 
-                        if stack_empty_or_grew {
+                        if stack_empty_or_grew || session_finished {
                             break;
                         }
                     }
@@ -7783,6 +8189,11 @@ fn begin_resolve_all_consent(
     priority_player: PlayerId,
     max_resolutions: u32,
 ) -> Result<WaitingFor, EngineError> {
+    if state.stack_resolution_session.is_some() {
+        return Err(EngineError::ActionNotAllowed(
+            "Resolve All cannot replace an active stack-resolution session".to_string(),
+        ));
+    }
     super::priority::pass_priority_legality(state, priority_player)?;
     let current_representative =
         super::topology::priority_pass_representative(state, priority_player);
@@ -7807,7 +8218,7 @@ fn begin_resolve_all_consent(
     // or revoked before its authorized one-entry materialization begins.
     state.resolve_all_consent_run = Some(ResolveAllConsentRun {
         epoch,
-        max_resolutions,
+        max_resolutions: StackResolutionBudget::from_legacy_max_resolutions(max_resolutions),
         priority_snapshot: ResolveAllPrioritySnapshot {
             waiting_player: priority_player,
             priority_player: state.priority_player,
@@ -7825,7 +8236,22 @@ fn begin_resolve_all_consent(
                 granted: representative == current_representative,
             })
             .collect(),
+        auto_pass_baseline: Some(
+            state
+                .auto_pass
+                .iter()
+                .map(|(&player, &mode)| (player, mode))
+                .collect(),
+        ),
     });
+
+    if state
+        .resolve_all_consent_run
+        .as_ref()
+        .is_some_and(|run| run.participants.len() == 1)
+    {
+        return materialize_live_resolve_all_session(state, None);
+    }
 
     resolve_all_consent_waiting_for(state).ok_or_else(|| {
         EngineError::ActionNotAllowed(
@@ -7836,14 +8262,16 @@ fn begin_resolve_all_consent(
 
 fn resolve_all_consent_waiting_for(state: &GameState) -> Option<WaitingFor> {
     let run = state.resolve_all_consent_run.as_ref()?;
-    Some(
-        run.next_pending_representative()
-            .map(|representative| WaitingFor::ResolveAllConsent {
-                epoch: run.epoch,
-                representative,
-            })
-            .unwrap_or(WaitingFor::ResolveAllReady { epoch: run.epoch }),
-    )
+    run.next_pending_representative()
+        .map(|representative| WaitingFor::ResolveAllConsent {
+            epoch: run.epoch,
+            representative,
+        })
+        .or_else(|| {
+            run.auto_pass_baseline
+                .is_none()
+                .then_some(WaitingFor::ResolveAllReady { epoch: run.epoch })
+        })
 }
 
 // CR 117.3d + CR 117.4: A declined optimized batch restores the exact
@@ -7853,6 +8281,9 @@ fn restore_resolve_all_priority_snapshot(state: &mut GameState) -> Result<Waitin
     let run = state.resolve_all_consent_run.take().ok_or_else(|| {
         EngineError::InvalidAction("Resolve All consent is not active".to_string())
     })?;
+    if let Some(baseline) = run.auto_pass_baseline {
+        state.auto_pass = baseline.into_iter().collect();
+    }
     let snapshot = run.priority_snapshot;
     state.priority_player = snapshot.priority_player;
     state.priority_pass_count = snapshot.priority_pass_count;
@@ -7862,12 +8293,115 @@ fn restore_resolve_all_priority_snapshot(state: &mut GameState) -> Result<Waitin
     })
 }
 
+/// Installs the single fenced stack-resolution session used by committed human
+/// Resolve All, direct UntilStackEmpty, and a verified AI pass. The caller owns
+/// authorization and supplies the exact sparse preference map to restore when
+/// the bounded cohort ends.
+pub(crate) fn install_stack_resolution_session(
+    state: &mut GameState,
+    representatives: BTreeSet<PlayerId>,
+    budget: StackResolutionBudget,
+    policy: StackResolutionPolicy,
+    baseline: BTreeMap<PlayerId, AutoPassMode>,
+) {
+    let overlay_mode = AutoPassMode::UntilStackEmpty {
+        initial_stack_len: state.stack.len(),
+        policy,
+    };
+    for representative in &representatives {
+        state.auto_pass.insert(*representative, overlay_mode);
+    }
+    state.stack_resolution_session = Some(StackResolutionSession {
+        entries: state
+            .stack
+            .iter()
+            .rev()
+            .map(StackResolutionEntryFence::capture)
+            .collect(),
+        cursor: 0,
+        representatives,
+        verified_pass_representatives: BTreeSet::new(),
+        budget,
+        policy,
+        auto_pass_overlay: StackResolutionAutoPassOverlay { baseline },
+    });
+}
+
+/// Converts a newly-created unanimous Resolve All authorization into the
+/// ordinary shared stack-resolution session. Legacy persisted consent runs
+/// intentionally do not take this path; their `ResolveAllReady` latch remains
+/// readable until its migration phase.
+///
+/// CR 117.3d + CR 117.4: the session resumes at the exact normal Priority
+/// checkpoint and lets the ordinary priority-pass pipeline resolve each entry.
+/// CR 400.7: the captured fence compares entry-local provenance, never a live
+/// source object that may have left and returned.
+fn materialize_live_resolve_all_session(
+    state: &mut GameState,
+    expected_grant_epoch: Option<u64>,
+) -> Result<WaitingFor, EngineError> {
+    let Some(run) = state.resolve_all_consent_run.as_ref() else {
+        return Err(EngineError::InvalidAction(
+            "Resolve All consent is not active".to_string(),
+        ));
+    };
+    let origin_matches = match expected_grant_epoch {
+        Some(epoch) => {
+            matches!(
+                state.waiting_for,
+                WaitingFor::ResolveAllConsent { epoch: active, .. } if active == epoch
+            ) && run.epoch == epoch
+        }
+        None => {
+            matches!(state.waiting_for, WaitingFor::Priority { .. }) && run.participants.len() == 1
+        }
+    };
+    let coherent = origin_matches
+        && run.auto_pass_baseline.is_some()
+        && run
+            .participants
+            .iter()
+            .all(|participant| participant.granted)
+        && state.stack_resolution_session.is_none()
+        && !state.stack.is_empty()
+        && state.priority_player == run.priority_snapshot.priority_player
+        && state.priority_pass_count == run.priority_snapshot.priority_pass_count
+        && state.priority_passes == run.priority_snapshot.priority_passes
+        && turn_control::resolve_all_consent_authority_matches_live(state, run);
+    if !coherent {
+        turn_control::rebase_invalid_resolve_all_consent(state);
+        return Ok(state.waiting_for.clone());
+    }
+
+    let run = state
+        .resolve_all_consent_run
+        .take()
+        .expect("coherent Resolve All consent run remains present");
+    let baseline = run
+        .auto_pass_baseline
+        .expect("a live Resolve All session requires a captured baseline");
+    let representatives = run
+        .participants
+        .iter()
+        .map(|participant| participant.representative)
+        .collect();
+    install_stack_resolution_session(
+        state,
+        representatives,
+        run.max_resolutions,
+        StackResolutionPolicy::Committed,
+        baseline,
+    );
+    Ok(WaitingFor::Priority {
+        player: run.priority_snapshot.waiting_player,
+    })
+}
+
 /// Installs one player's requested auto-pass mode and, when that player holds
 /// the current Priority window, consumes it through the ordinary pipeline.
 ///
-/// `SetAutoPass` and a declined Resolve All consent share this exact reducer
-/// path: both preserve the current stack baseline and must obey the same
-/// shortened-precast-pass restriction.
+/// Direct `SetAutoPass` owns its own live session producer. Resolve All uses
+/// the same session type after its separate unanimous-consent handshake.
 fn install_auto_pass_and_pass_priority(
     state: &mut GameState,
     auto_pass_owner: PlayerId,
@@ -7877,14 +8411,15 @@ fn install_auto_pass_and_pass_priority(
     let WaitingFor::Priority { player } = &state.waiting_for else {
         unreachable!("auto-pass may only be installed from a Priority window");
     };
-    let pass_immediately = *player == auto_pass_owner;
-    if pass_immediately && super::precast_copy_shortcut::blocks_pass(state, *player) {
+    let player = *player;
+    let pass_immediately = player == auto_pass_owner;
+    if pass_immediately && super::precast_copy_shortcut::blocks_pass(state, player) {
         return Err(EngineError::ActionNotAllowed(
             "A shortened pre-cast shortcut requires a different meaningful action before passing"
                 .to_string(),
         ));
     }
-    store_auto_pass_request(state, auto_pass_owner, mode);
+    store_direct_auto_pass_request(state, auto_pass_owner, mode);
     if !pass_immediately {
         return Ok(ActionResult {
             events: std::mem::take(events),
@@ -7892,15 +8427,53 @@ fn install_auto_pass_and_pass_priority(
             log_entries: vec![],
         });
     }
-    let waiting_for = pass_priority_once_with_pipeline(state, events, None)?;
+    pass_installed_auto_pass_priority(state, player, events)
+}
+
+/// Consume the immediate pass implied by a successful direct auto-pass request.
+///
+/// This is deliberately the same pre-pass authorization boundary used by the
+/// auto-pass runner. In particular, the first pass can be the final CR 117.4
+/// pass, so it must not bypass a frozen cohort merely because it happens
+/// synchronously with installation.
+fn pass_installed_auto_pass_priority(
+    state: &mut GameState,
+    player: PlayerId,
+    events: &mut Vec<GameEvent>,
+) -> Result<ActionResult, EngineError> {
+    let stack_resolution_limit = match stack_resolution_session_priority_decision(
+        state,
+        player,
+        StackResolutionSessionPassKind::Explicit,
+    ) {
+        StackResolutionSessionPriorityDecision::Resolve { limit } => Some(limit),
+        // A stale session is torn down by the decision seam. The explicit
+        // pass still means what its submitter chose, so continue through the
+        // ordinary CR 117.3d path after that restoration.
+        StackResolutionSessionPriorityDecision::Pause => None,
+        StackResolutionSessionPriorityDecision::PauseRetained => {
+            return Ok(ActionResult {
+                events: std::mem::take(events),
+                waiting_for: state.waiting_for.clone(),
+                log_entries: vec![],
+            });
+        }
+        StackResolutionSessionPriorityDecision::NotActive => None,
+    };
+    let outcome = pass_priority_once_with_pipeline(state, events, stack_resolution_limit)?;
+    advance_stack_resolution_session_after_priority_pass(
+        state,
+        outcome.consumed_stack_entries,
+        &outcome.waiting_for,
+    );
     Ok(ActionResult {
         events: std::mem::take(events),
-        waiting_for,
+        waiting_for: outcome.waiting_for,
         log_entries: vec![],
     })
 }
 
-fn store_auto_pass_request(
+fn store_legacy_auto_pass_request(
     state: &mut GameState,
     auto_pass_owner: PlayerId,
     mode: AutoPassRequest,
@@ -7908,25 +8481,88 @@ fn store_auto_pass_request(
     let stored_mode = match mode {
         AutoPassRequest::UntilStackEmpty => AutoPassMode::UntilStackEmpty {
             initial_stack_len: state.stack.len(),
+            policy: StackResolutionPolicy::Committed,
         },
         AutoPassRequest::UntilTurnBoundary { until } => AutoPassMode::UntilTurnBoundary { until },
     };
     state.auto_pass.insert(auto_pass_owner, stored_mode);
 }
 
-/// Stores Resolve All's durable "do not make me pass each frame" intent in
-/// the same engine-owned `UntilStackEmpty` flow as a direct priority request.
-pub(crate) fn install_until_stack_empty_auto_pass_and_pass_priority(
+/// Applies a cancellation to both the live map and a pending fresh Resolve All
+/// baseline. The baseline is the source restored by either consent rollback,
+/// so omitting this mirror would resurrect a preference the player withdrew
+/// while another representative was considering the authorization.
+fn cancel_pending_resolve_all_auto_pass(state: &mut GameState, actor: PlayerId) -> bool {
+    let representative = super::topology::priority_pass_representative(state, actor);
+    let Some(run) = state.resolve_all_consent_run.as_mut() else {
+        return false;
+    };
+    let Some(baseline) = run.auto_pass_baseline.as_mut() else {
+        return false;
+    };
+    state.auto_pass.remove(&representative);
+    baseline.remove(&representative);
+    true
+}
+
+fn store_direct_auto_pass_request(
     state: &mut GameState,
     auto_pass_owner: PlayerId,
-    events: &mut Vec<GameEvent>,
-) -> Result<ActionResult, EngineError> {
-    install_auto_pass_and_pass_priority(
+    mode: AutoPassRequest,
+) {
+    let representative = super::topology::priority_pass_representative(state, auto_pass_owner);
+    if let Some(representatives) = state
+        .stack_resolution_session
+        .as_ref()
+        .map(|session| session.representatives.clone())
+    {
+        if representatives.contains(&representative) {
+            take_and_restore_stack_resolution_session(state);
+        } else {
+            // A different priority seat may update only its own standing
+            // preference; it cannot replace another seat's frozen cohort. The
+            // same preference becomes part of the teardown baseline so a later
+            // session stop never erases a valid intervening player choice.
+            store_legacy_auto_pass_request(state, representative, mode);
+            let updated_mode = *state
+                .auto_pass
+                .get(&representative)
+                .expect("the legacy request was just stored");
+            state
+                .stack_resolution_session
+                .as_mut()
+                .expect("the nonrepresentative path preserves the live session")
+                .auto_pass_overlay
+                .baseline
+                .insert(representative, updated_mode);
+            return;
+        }
+    }
+
+    if !matches!(mode, AutoPassRequest::UntilStackEmpty) || state.stack.is_empty() {
+        store_legacy_auto_pass_request(state, representative, mode);
+        return;
+    }
+
+    let representatives =
+        super::topology::canonical_priority_representatives(state, [auto_pass_owner]);
+    if representatives.is_empty() {
+        store_legacy_auto_pass_request(state, representative, mode);
+        return;
+    }
+
+    let baseline: BTreeMap<PlayerId, AutoPassMode> = state
+        .auto_pass
+        .iter()
+        .map(|(&player, &auto_pass)| (player, auto_pass))
+        .collect();
+    install_stack_resolution_session(
         state,
-        auto_pass_owner,
-        AutoPassRequest::UntilStackEmpty,
-        events,
-    )
+        representatives,
+        StackResolutionBudget::Unlimited,
+        StackResolutionPolicy::Committed,
+        baseline,
+    );
 }
 
 /// Retains Resolve All's durable no-manual-priority preference when a rules
@@ -7936,43 +8572,7 @@ pub(crate) fn install_until_stack_empty_auto_pass(
     state: &mut GameState,
     auto_pass_owner: PlayerId,
 ) {
-    store_auto_pass_request(state, auto_pass_owner, AutoPassRequest::UntilStackEmpty);
-}
-
-/// CR 117.3d + CR 117.4: Declining the optimized Resolve All batch preserves
-/// the requester's intent by switching to the ordinary engine auto-pass flow.
-fn decline_resolve_all_consent_with_auto_pass(
-    state: &mut GameState,
-    epoch: u64,
-    representative: PlayerId,
-    response_epoch: u64,
-    events: &mut Vec<GameEvent>,
-) -> Result<ActionResult, EngineError> {
-    let waiting_for = respond_resolve_all_consent(
-        state,
-        epoch,
-        representative,
-        response_epoch,
-        ResolveAllConsentDecision::Decline,
-    )?;
-    let WaitingFor::Priority { player } = waiting_for else {
-        unreachable!("declined Resolve All consent must restore Priority");
-    };
-    // `pass_priority_once_with_pipeline` derives the semantic priority seat
-    // from this state. Install the captured Priority window before reusing the
-    // normal SetAutoPass path, rather than passing from the consent prompt.
-    state.waiting_for = WaitingFor::Priority { player };
-    // The outer action boundary drives an existing preference immediately.
-    // Replacing it here would turn a retained time-boundary request into a
-    // stack-bound fallback before that normal progression can observe it.
-    if state.auto_pass.contains_key(&player) {
-        return Ok(ActionResult {
-            events: std::mem::take(events),
-            waiting_for: state.waiting_for.clone(),
-            log_entries: vec![],
-        });
-    }
-    install_until_stack_empty_auto_pass_and_pass_priority(state, player, events)
+    store_legacy_auto_pass_request(state, auto_pass_owner, AutoPassRequest::UntilStackEmpty);
 }
 
 fn respond_resolve_all_consent(
@@ -7987,7 +8587,7 @@ fn respond_resolve_all_consent(
             "Resolve All consent epoch is stale".to_string(),
         ));
     }
-    {
+    let legacy_grant = {
         let run = state.resolve_all_consent_run.as_mut().ok_or_else(|| {
             EngineError::InvalidAction("Resolve All consent is not active".to_string())
         })?;
@@ -8003,26 +8603,29 @@ fn respond_resolve_all_consent(
                 .find(|participant| participant.representative == representative)
                 .expect("pending Resolve All representative must be a participant");
             participant.granted = true;
+            run.auto_pass_baseline.is_none()
+        } else {
+            false
         }
+    };
+    // A missing baseline identifies the persisted pre-session protocol. Its
+    // Ready reader requires an empty live map, so retain its historical
+    // per-grant removal while fresh `Some` runs preserve their transaction
+    // baseline until the session materializes or rolls back.
+    if legacy_grant {
+        state.auto_pass.remove(&representative);
     }
     if matches!(decision, ResolveAllConsentDecision::Decline) {
         return restore_resolve_all_priority_snapshot(state);
     }
+    if state.resolve_all_consent_run.as_ref().is_some_and(|run| {
+        run.auto_pass_baseline.is_some() && run.next_pending_representative().is_none()
+    }) {
+        return materialize_live_resolve_all_session(state, Some(epoch));
+    }
     let waiting_for = resolve_all_consent_waiting_for(state).ok_or_else(|| {
         EngineError::InvalidAction("Resolve All consent is not active".to_string())
     })?;
-    // ResolveAllReady has no current actor, so the ordinary waiting-state sync
-    // deliberately leaves `priority_player` alone. Restore the saved priority
-    // cursor now; the Ready consumer validates this exact snapshot before it
-    // begins its first materialized CR 117.4 pass cycle.
-    if matches!(waiting_for, WaitingFor::ResolveAllReady { .. }) {
-        state.priority_player = state
-            .resolve_all_consent_run
-            .as_ref()
-            .expect("an active consent run produced ResolveAllReady")
-            .priority_snapshot
-            .priority_player;
-    }
     Ok(waiting_for)
 }
 
@@ -8113,7 +8716,27 @@ fn apply_action(
     // `authorized_submitter(state)`, which silently cancelled the wrong player's
     // session when fired while an opponent held the prompt.
     if matches!(action, GameAction::CancelAutoPass) {
-        state.auto_pass.remove(&actor);
+        let representative = super::topology::priority_pass_representative(state, actor);
+        if state
+            .stack_resolution_session
+            .as_ref()
+            .is_some_and(|session| session.representatives.contains(&representative))
+        {
+            take_and_restore_stack_resolution_session(state);
+        } else if cancel_pending_resolve_all_auto_pass(state, actor) {
+            // A fresh consent run owns a complete rollback baseline. The helper
+            // changes both representations atomically; legacy runs intentionally
+            // retain their pre-session cancellation behavior below.
+        } else {
+            state.auto_pass.remove(&actor);
+            if let Some(session) = state.stack_resolution_session.as_mut() {
+                // A nonrepresentative preference can be merged into the
+                // pre-overlay baseline while a session is live. Cancelling it
+                // must remove the same saved key, or later teardown would
+                // resurrect a preference the player explicitly withdrew.
+                session.auto_pass_overlay.baseline.remove(&actor);
+            }
+        }
         return Ok(ActionResult {
             events: vec![],
             waiting_for: state.waiting_for.clone(),
@@ -8414,9 +9037,25 @@ fn apply_action(
     let action_for_divergence = action.clone();
 
     // Any deliberate player action (not auto-pass-related or a simple pass) cancels their auto-pass.
-    // CR 103.5: Use the authenticated `actor` directly so the simultaneous mulligan
-    // variants (where `authorized_submitter` is None when multiple players are pending)
-    // still clear per-actor side-effect state correctly.
+    // CR 723.1: A Priority-window action belongs to the semantic priority
+    // seat, not necessarily to its authenticated submitter. In
+    // particular, a turn controller can act for P0; tearing down P2's
+    // representative instead would leave P0's frozen cohort live and let the
+    // boundary runner resolve an entry after P0 deliberately acted. Outside a
+    // Priority window retain the authenticated actor: simultaneous mulligan
+    // variants have no single semantic priority seat.
+    // CR 117.6 + CR 805.5b: Canonicalize that seat before consulting a
+    // session, because a shared team's representative owns its priority pass.
+    let session_preference_owner = match (&state.waiting_for, &action) {
+        // CR 104.3a: Concede is the one self-authorized action that may be
+        // submitted while another player holds priority, so it remains scoped
+        // to its authenticated actor rather than that other priority seat.
+        (_, GameAction::Concede { .. }) => actor,
+        (WaitingFor::Priority { player }, _) => {
+            super::topology::priority_pass_representative(state, *player)
+        }
+        _ => actor,
+    };
     match &action {
         GameAction::SetAutoPass { .. }
         | GameAction::PassPriority
@@ -8425,7 +9064,30 @@ fn apply_action(
         | GameAction::RespondResolveAllConsent { .. }
         | GameAction::RevokeResolveAllConsent { .. } => {}
         _ => {
-            state.auto_pass.remove(&actor);
+            if state
+                .stack_resolution_session
+                .as_ref()
+                .is_some_and(|session| session.representatives.contains(&session_preference_owner))
+            {
+                // A representative's deliberate action revokes the frozen
+                // authorization before this action reaches its reducer. Restore
+                // the pre-session preferences first, then remove this action's
+                // standing preference below; otherwise the boundary runner could
+                // consume the cohort after an off-stack action, or teardown could
+                // resurrect the preference the representative just cancelled.
+                take_and_restore_stack_resolution_session(state);
+            } else if let Some(session) = state.stack_resolution_session.as_mut() {
+                if !session.representatives.contains(&session_preference_owner) {
+                    // A deliberate action revokes this nonrepresentative's standing
+                    // preference. Keep the deferred restore baseline in lockstep so
+                    // a later session teardown cannot resurrect the revoked mode.
+                    session
+                        .auto_pass_overlay
+                        .baseline
+                        .remove(&session_preference_owner);
+                }
+            }
+            state.auto_pass.remove(&session_preference_owner);
         }
     }
 
@@ -8458,12 +9120,28 @@ fn apply_action(
             // AI candidate-legality hatch and the projection fast path so the
             // three cannot drift.
             super::priority::pass_priority_legality(state, *player)?;
-            let wf = pass_priority_once_with_pipeline(state, &mut events, stack_resolution_limit)?;
-            return Ok(ActionResult {
-                events,
-                waiting_for: wf,
-                log_entries: vec![],
-            });
+            // An explicit pass can be the final CR 117.4 pass. Route it
+            // through the same fenced session seam as an installed auto-pass,
+            // so its resolved-entry count advances the persisted cursor rather
+            // than silently bypassing a live stack-resolution authorization.
+            if stack_resolution_limit.is_some() {
+                let outcome = pass_priority_once_with_pipeline(
+                    state,
+                    &mut events,
+                    stack_resolution_limit,
+                )?;
+                advance_stack_resolution_session_after_priority_pass(
+                    state,
+                    outcome.consumed_stack_entries,
+                    &outcome.waiting_for,
+                );
+                return Ok(ActionResult {
+                    events,
+                    waiting_for: outcome.waiting_for,
+                    log_entries: vec![],
+                });
+            }
+            return pass_installed_auto_pass_priority(state, *player, &mut events);
         }
         (WaitingFor::Priority { player }, GameAction::BeginResolveAll { max_resolutions }) => {
             begin_resolve_all_consent(state, *player, max_resolutions)?
@@ -8478,13 +9156,13 @@ fn apply_action(
                 decision: ResolveAllConsentDecision::Decline,
             },
         ) => {
-            return decline_resolve_all_consent_with_auto_pass(
+            respond_resolve_all_consent(
                 state,
                 *epoch,
                 *representative,
                 response_epoch,
-                &mut events,
-            );
+                ResolveAllConsentDecision::Decline,
+            )?
         }
         (
             WaitingFor::ResolveAllConsent {
@@ -11043,7 +11721,7 @@ fn apply_action(
                 mode: AutoPassRequest::UntilTurnBoundary { until },
             },
         ) => {
-            store_auto_pass_request(
+            store_direct_auto_pass_request(
                 state,
                 *player,
                 AutoPassRequest::UntilTurnBoundary { until },
@@ -11068,7 +11746,7 @@ fn apply_action(
                 mode: AutoPassRequest::UntilTurnBoundary { until },
             },
         ) => {
-            store_auto_pass_request(
+            store_direct_auto_pass_request(
                 state,
                 *player,
                 AutoPassRequest::UntilTurnBoundary { until },
@@ -15656,6 +16334,102 @@ pub(super) fn check_exile_returns(state: &mut GameState, events: &mut Vec<GameEv
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod resolve_all_consent_session_tests {
+    use super::*;
+    use crate::types::format::FormatConfig;
+    use std::collections::BTreeSet;
+
+    const P0: PlayerId = PlayerId(0);
+    const P1: PlayerId = PlayerId(1);
+    const P2: PlayerId = PlayerId(2);
+    const P3: PlayerId = PlayerId(3);
+
+    fn no_op_entry(id: u64, controller: PlayerId) -> StackEntry {
+        StackEntry {
+            id: ObjectId(id),
+            source_id: ObjectId(id),
+            controller,
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: ObjectId(id),
+                ability: Box::new(crate::types::ability::ResolvedAbility::new(
+                    crate::types::ability::Effect::NoOp,
+                    vec![],
+                    ObjectId(id),
+                    controller,
+                )),
+            },
+        }
+    }
+
+    #[test]
+    fn one_representative_begin_materializes_a_session_without_a_consent_or_ready_stop() {
+        // This invokes the producer before the outer lifecycle can terminalize
+        // an intentionally one-seat fixture, so the assertion observes the
+        // actual singleton materializer rather than a post-GameOver boundary.
+        let mut state = GameState::new(FormatConfig::free_for_all(), 1, 0x51_1E);
+        state.stack.push_back(no_op_entry(1, P0));
+
+        let waiting = begin_resolve_all_consent(&mut state, P0, 1)
+            .expect("the sole representative is already unanimous");
+
+        assert!(matches!(waiting, WaitingFor::Priority { player: P0 }));
+        assert!(state.resolve_all_consent_run.is_none());
+        let session = state
+            .stack_resolution_session
+            .as_ref()
+            .expect("singleton Begin creates the ordinary session directly");
+        assert_eq!(session.representatives, BTreeSet::from([P0]));
+        assert_eq!(session.budget.max_resolutions(), Some(1));
+    }
+
+    #[test]
+    fn two_headed_giant_final_grant_overlays_only_canonical_team_representatives() {
+        let mut state = GameState::new(FormatConfig::two_headed_giant(), 4, 0x2A6);
+        state.stack.push_back(no_op_entry(1, P0));
+        let waiting = begin_resolve_all_consent(&mut state, P0, 7)
+            .expect("the active team representative begins consent");
+        let WaitingFor::ResolveAllConsent {
+            epoch,
+            representative: P2,
+        } = waiting
+        else {
+            panic!("the opposing team's canonical representative must consent")
+        };
+        state.waiting_for = WaitingFor::ResolveAllConsent {
+            epoch,
+            representative: P2,
+        };
+
+        let materialized = respond_resolve_all_consent(
+            &mut state,
+            epoch,
+            P2,
+            epoch,
+            ResolveAllConsentDecision::Grant,
+        )
+        .expect("the final team grant materializes a shared session");
+
+        assert!(matches!(materialized, WaitingFor::Priority { player: P0 }));
+        let session = state
+            .stack_resolution_session
+            .as_ref()
+            .expect("the final team grant creates a session");
+        assert_eq!(session.representatives, BTreeSet::from([P0, P2]));
+        for representative in [P0, P2] {
+            assert!(matches!(
+                state.auto_pass.get(&representative),
+                Some(AutoPassMode::UntilStackEmpty {
+                    policy: StackResolutionPolicy::Committed,
+                    ..
+                })
+            ));
+        }
+        assert!(!state.auto_pass.contains_key(&P1));
+        assert!(!state.auto_pass.contains_key(&P3));
+    }
+}
 
 #[cfg(test)]
 #[path = "engine_trigger_target_tests.rs"]

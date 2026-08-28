@@ -1705,6 +1705,10 @@ export type AdditionalCost =
 /** Mirrors Rust AbilityCost serialization (serde tag = "type"). */
 export type SerializedAbilityCost = { type: string; [key: string]: unknown };
 
+export type ResolutionOptionalPaymentChoice =
+  | { type: "Decline" }
+  | { type: "Pay"; data: { index: number } };
+
 // ── Modal Choice metadata ─────────────────────────────────────────────
 
 export interface ModalChoice {
@@ -1942,6 +1946,7 @@ export type WaitingFor =
   | { type: "CollectEvidenceChoice"; data: { player: PlayerId; minimum_mana_value: number; cards: ObjectId[]; resume: unknown } }
   | { type: "HarmonizeTapChoice"; data: { player: PlayerId; eligible_creatures: ObjectId[]; pending_cast: PendingCast } }
   | { type: "OptionalEffectChoice"; data: { player: PlayerId; source_id: ObjectId; description?: string; may_trigger_key?: MayTriggerAutoChoiceKey; same_card_may_trigger_choice_available?: boolean } }
+  | { type: "ResolutionOptionalPaymentChoice"; data: { player: PlayerId; source_id: ObjectId; costs: Array<{ index: number; cost: SerializedAbilityCost }> } }
   | { type: "PairChoice"; data: { player: PlayerId; source_id: ObjectId; choices: ObjectId[] } }
   | { type: "OpponentMayChoice"; data: { player: PlayerId; source_id: ObjectId; description?: string; remaining: PlayerId[] } }
   | { type: "LoopShortcut"; data: { proposer: PlayerId; predicted_winner: PlayerId | null; certificate: LoopCertificate; schema: ShortcutDecisionSchema } }
@@ -2453,6 +2458,7 @@ export type GameAction =
   | { type: "CastSpellAsWebSlinging"; data: { hand_object: ObjectId; card_id: CardId; creature_to_return: ObjectId; payment_mode?: CastPaymentMode } }
   | { type: "ActivateNinjutsu"; data: { ninjutsu_object_id: ObjectId; creature_to_return: ObjectId } }
   | { type: "DecideOptionalEffect"; data: { accept: boolean } }
+  | { type: "ChooseResolutionOptionalPaymentBranch"; data: { choice: ResolutionOptionalPaymentChoice } }
   | { type: "DecideOptionalEffectAndRemember"; data: { choice: AutoMayChoice; scope?: MayTriggerAutoChoiceScope } }
   | { type: "PayUnlessCost"; data: { pay: boolean } }
   // CR 118.12a: Choose a branch of a disjunctive unless-cost. The
@@ -3556,8 +3562,18 @@ export function persistedGameStateView(state: PersistedGameState): GameState {
 
 export type TurnBoundary = "EndOfCurrentTurn" | "MyNextTurnStart";
 
+/** Mirrors the engine's per-window stack-resolution policy. A missing policy
+ * on UntilStackEmpty is the legacy committed behavior. */
+export type StackResolutionPolicy =
+  | "Committed"
+  | "RecheckNoMeaningfulPriorityAction";
+
 export type AutoPassMode =
-  | { type: "UntilStackEmpty"; initial_stack_len: number }
+  | {
+      type: "UntilStackEmpty";
+      initial_stack_len: number;
+      policy?: StackResolutionPolicy;
+    }
   | { type: "UntilTurnBoundary"; until: TurnBoundary };
 
 /**
@@ -3907,25 +3923,12 @@ export function actionRejectionError(rejection: ActionRejection | string): Adapt
 }
 
 /**
- * Classify a requester-correlated Resolve All rejection.
- *
- * A batch request can reach the server after priority has advanced. The server
- * must reject that request, but this particular response is a stale UI race,
- * not an actionable error for the requester. Keep the classification scoped to
- * the Resolve All protocol frame: the same text on an ordinary action
- * rejection must remain visible.
- */
-export function resolveAllRejectionError(reason: string): AdapterError {
-  return reason === "Resolve All requires your priority"
-    ? new AdapterError(AdapterErrorCode.STALE_ACTION, reason, false)
-    : actionRejectionError(reason);
-}
-
-/**
- * Detect the legacy string representation of a `ReorderHand` rejection from
- * a pre-structured remote engine. Local WASM now emits `stale_action` with a
- * typed disposition instead; this helper remains only until every remote
- * transport has adopted the same DTO.
+ * Detect the engine's rejection of a `ReorderHand` whose order no longer names
+ * the current hand. `apply_action` formats
+ * `EngineError::InvalidAction("ReorderHand: expected {n} ids, got {m}")` as
+ * `Engine error: ReorderHand: expected ...` and returns it BEFORE mutating any
+ * player state, so — exactly like the actor-authorization rejections above —
+ * nothing changed and there is nothing to recover.
  *
  * This is the benign client/engine desync behind issue #5913: a drag computes
  * its order against the hand as displayed, but a draw or discard can land in
@@ -4035,14 +4038,16 @@ export interface ViewerSnapshot {
   viewerInteraction?: ViewerInteraction;
 }
 
-export interface BatchResolveResult {
-  events: GameEvent[];
-  waitingFor: WaitingFor;
-  logEntries?: GameLogEntry[];
-  itemsResolved: number;
-  /** Stack depth at this chunk's entry; the drive loop latches the first
-   *  chunk's value as the "resolving X of Y" denominator. */
-  total: number;
+/**
+ * Engine-authored display summary for the one explicit automation run that
+ * follows loading a persisted game. The state in `RestoredGameStateResult` is
+ * authoritative; this bounded tail only explains that one transition.
+ */
+export interface RestoredStackAutomationPresentation {
+  outcome: "noop" | "progressed" | "zeroResolutionRepair";
+  automatedResolutionCount: number;
+  omittedEventCount: number;
+  logEntries: GameLogEntry[];
 }
 
 /**
@@ -4064,6 +4069,12 @@ export interface EngineSnapshot {
    * commit authority drops pairs stamped older than the last one it committed.
    */
   seq: number;
+}
+
+/** A post-resume engine pair and its engine-authored automation presentation. */
+export interface RestoredGameStateResult {
+  snapshot: EngineSnapshot;
+  presentation: RestoredStackAutomationPresentation;
 }
 
 /**
@@ -4191,17 +4202,15 @@ export interface EngineAdapter {
    * genuinely need one half in isolation.
    */
   getSnapshot(): Promise<EngineSnapshot>;
+  /**
+   * Explicitly resume automation carried by a persisted state after a normal
+   * restore. Undo and developer restores deliberately do not call this.
+   */
+  resumeRestoredGameState?(): Promise<RestoredGameStateResult | null>;
   /** Returns an opaque, exact member of the current engine-issued decision domain. */
   getAiActionProposal?(difficulty: string, playerId: number): Promise<AiActionProposal | null> | AiActionProposal | null;
   /** Applies a proposal only if its authority token and exact action remain current. */
   submitAiActionProposal?(proposal: AiActionProposal): Promise<AiProposalSubmission> | AiProposalSubmission;
-  resolveAll?(
-    requester: number,
-    aiSeats: { playerId: number; difficulty: string }[],
-    maxResolutions?: number,
-  ): Promise<BatchResolveResult>;
-  /** True when Resolve All delegates AI decisions to the authenticated server. */
-  readonly resolveAllUsesServerAi?: true;
   restoreState(state: PersistedGameState): void | Promise<void>;
   /** Trusted local persistence snapshot, when this adapter owns the engine. */
   exportPersistenceState?(): Promise<string>;

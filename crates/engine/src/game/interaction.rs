@@ -24,7 +24,7 @@ use crate::types::ability::{
 use crate::types::action_rejection::{ActionRejection, ActionRejectionCode};
 use crate::types::actions::{
     AlternativeCastDecision, CastChoice, GameAction, MulliganChoice, OutsideGameSelection,
-    PrecastCopyShortcutResponse, UnlessCostBranch,
+    PrecastCopyShortcutResponse, ResolutionOptionalPaymentChoice, UnlessCostBranch,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::{CounterMatch, CounterType};
@@ -319,6 +319,7 @@ fn human_response_model(waiting_for: &WaitingFor, semantic_owner: PlayerId) -> H
         | WaitingFor::CastingVariantChoice { .. }
         | WaitingFor::ChoosePermanentTypeSlot { .. }
         | WaitingFor::OptionalEffectChoice { .. }
+        | WaitingFor::ResolutionOptionalPaymentChoice { .. }
         | WaitingFor::PairChoice { .. }
         | WaitingFor::TributeChoice { .. }
         | WaitingFor::MiracleReveal { .. }
@@ -556,6 +557,7 @@ fn classify_waiting_for(waiting_for: &WaitingFor) -> WaitingClassification {
         | WaitingFor::CastingVariantChoice { .. }
         | WaitingFor::ChoosePermanentTypeSlot { .. }
         | WaitingFor::OptionalEffectChoice { .. }
+        | WaitingFor::ResolutionOptionalPaymentChoice { .. }
         | WaitingFor::PairChoice { .. }
         | WaitingFor::TributeChoice { .. }
         | WaitingFor::MiracleReveal { .. }
@@ -3688,6 +3690,7 @@ fn selection_projection(
         | WaitingFor::MultiTargetSelection { .. }
         | WaitingFor::AbilityModeChoice { .. }
         | WaitingFor::OptionalEffectChoice { .. }
+        | WaitingFor::ResolutionOptionalPaymentChoice { .. }
         | WaitingFor::PairChoice { .. }
         | WaitingFor::TributeChoice { .. }
         | WaitingFor::MiracleReveal { .. }
@@ -4862,6 +4865,14 @@ fn project_action_payload(
         GameAction::DecideOptionalEffect { accept } => {
             push_value_surface(surfaces, InteractionRoleCode::Accept, accept)
         }
+        GameAction::ChooseResolutionOptionalPaymentBranch { choice } => match choice {
+            ResolutionOptionalPaymentChoice::Decline => {
+                push_value_surface(surfaces, InteractionRoleCode::CostBranch, "decline")
+            }
+            ResolutionOptionalPaymentChoice::Pay { index } => {
+                push_value_surface(surfaces, InteractionRoleCode::CostBranchIndex, index)
+            }
+        },
         GameAction::RespondToSpliceOffer { card } => {
             if let Some(card) = card {
                 push_object_surface(surfaces, state, *card, InteractionRoleCode::SpliceCard);
@@ -5399,6 +5410,9 @@ fn action_code(action: &GameAction) -> InteractionActionCode {
         GameAction::CastSpellAsMiracle { .. } => InteractionActionCode::CastSpellAsMiracle,
         GameAction::CastSpellAsMadness { .. } => InteractionActionCode::CastSpellAsMadness,
         GameAction::DecideOptionalEffect { .. } => InteractionActionCode::DecideOptionalEffect,
+        GameAction::ChooseResolutionOptionalPaymentBranch { .. } => {
+            InteractionActionCode::ChooseResolutionOptionalPaymentBranch
+        }
         GameAction::RespondToSpliceOffer { .. } => InteractionActionCode::RespondToSpliceOffer,
         GameAction::DecideOptionalEffectAndRemember { .. } => {
             InteractionActionCode::DecideOptionalEffectAndRemember

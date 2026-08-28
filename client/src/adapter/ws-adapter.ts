@@ -1,7 +1,6 @@
 import type {
   EngineAdapter,
   EngineSnapshot,
-  BatchResolveResult,
   GameAction,
   GameEvent,
   GameLogEntry,
@@ -203,6 +202,10 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 44 — Resolution-time optional PayCost(OneOf) branch choice added a
+ *      serialized WaitingFor/GameAction pair.
+ * 43 — Engine-owned stack-resolution automation retired the legacy native
+ *      Resolve All request/result wire messages.
  * 42 — FormatConfig.deck_size changed from a bare u16 to the adjacently
  *      tagged DeckSizeRule enum (Minimum(u16) / Exactly(u16)), because
  *      CR 903.13f(1) makes Commander Draft a command-zone format with a
@@ -291,8 +294,6 @@ export class NativeEngineVersionMismatchError extends Error {
  *      answers under ServerMode::LobbyOnly with an explicit rejection rather
  *      than a silent drop.
  * 30 — Serialized player-action completion provenance and modal continuations.
- * 29 — Added requester-correlated ResolveAllRejected response frames.
- * 28 — Added native ResolveAll request/result frames.
  * 27 — Added DraftKind.Sealed, serialized by draft WebSocket messages.
  * 26 — Added ActionNoOp acknowledgement for accepted transport no-ops.
  * 25 — DebugCardEntries added a serialized, private resolution frame for
@@ -324,7 +325,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      into a MulliganDecisionPhase::BottomCards sub-phase on
  *      WaitingFor::MulliganDecision.
  */
-export const PROTOCOL_VERSION = 42;
+export const PROTOCOL_VERSION = 44;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
@@ -517,7 +518,6 @@ function playerNamesFromWire(names: string[]): Record<number, string> {
 export class WebSocketAdapter implements EngineAdapter {
   readonly supportsMatchConcede = true;
   readonly supportsServerRewind = true;
-  readonly resolveAllUsesServerAi: true | undefined;
   private ws: PhaseSocketTransport | null = null;
   /**
    * The single cached engine pair, rebuilt (and re-stamped) once per inbound
@@ -532,12 +532,6 @@ export class WebSocketAdapter implements EngineAdapter {
   private fullSessionKey: FullSessionKey | null = null;
   private pendingResolve: ((result: SubmitResult) => void) | null = null;
   private pendingReject: ((error: Error) => void) | null = null;
-  private nextResolveAllRequestId = 1;
-  private pendingResolveAll: {
-    requestId: number;
-    resolve: (result: BatchResolveResult) => void;
-    reject: (error: Error) => void;
-  } | null = null;
   private nextManaPaymentPreviewRequestId = 1;
   private pendingManaPaymentPreviews = new Map<
     number,
@@ -604,7 +598,6 @@ export class WebSocketAdapter implements EngineAdapter {
     private readonly displayName = "Player",
     private readonly options: WebSocketAdapterOptions = {},
   ) {
-    this.resolveAllUsesServerAi = options.nativeAi ? true : undefined;
     // 0 is terminal, not "retry once": `attemptReconnect` compares
     // `reconnectAttempt >= maxReconnectAttempts`, so 0 >= 0 is true on the
     // very first attempt — it emits `reconnectFailed` and returns without
@@ -899,12 +892,6 @@ export class WebSocketAdapter implements EngineAdapter {
         this.pendingResolve = null;
         this.pendingReject = null;
       }
-      if (this.pendingResolveAll) {
-        this.pendingResolveAll.reject(
-          new AdapterError("WS_CLOSED", "Connection closed during Resolve All", true),
-        );
-        this.pendingResolveAll = null;
-      }
       this.rejectPendingManaPaymentPreviews(
         new AdapterError("WS_CLOSED", "Connection closed during mana-payment preview", true),
       );
@@ -989,31 +976,6 @@ export class WebSocketAdapter implements EngineAdapter {
         this.pendingReject = null;
         this.emit({ type: "actionPendingChanged", pending: false });
         reject(new AdapterError("WS_CLOSED", "Failed to send interaction", true));
-      }
-    });
-  }
-
-  async resolveAll(
-    _requester: PlayerId,
-    _aiSeats: { playerId: number; difficulty: string }[],
-    maxResolutions = 5_000,
-  ): Promise<BatchResolveResult> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new AdapterError("WS_ERROR", "WebSocket not connected", false);
-    }
-    if (this.pendingResolveAll) {
-      throw new AdapterError("WS_ERROR", "Resolve All already pending", false);
-    }
-
-    const requestId = this.nextResolveAllRequestId++;
-    return new Promise<BatchResolveResult>((resolve, reject) => {
-      this.pendingResolveAll = { requestId, resolve, reject };
-      if (!this.send({
-        type: "ResolveAll",
-        data: { request_id: requestId, max_resolutions: maxResolutions },
-      })) {
-        this.pendingResolveAll = null;
-        reject(new AdapterError("WS_CLOSED", "Failed to send Resolve All", true));
       }
     });
   }
@@ -1155,12 +1117,6 @@ export class WebSocketAdapter implements EngineAdapter {
     this.fullSessionKey = null;
     this.pendingResolve = null;
     this.pendingReject = null;
-    if (this.pendingResolveAll) {
-      this.pendingResolveAll.reject(
-        new AdapterError("WS_CLOSED", "Adapter disposed during Resolve All", true),
-      );
-      this.pendingResolveAll = null;
-    }
     this.rejectPendingManaPaymentPreviews(
       new AdapterError("WS_CLOSED", "Adapter disposed during mana-payment preview", true),
     );
@@ -1725,55 +1681,6 @@ export class WebSocketAdapter implements EngineAdapter {
           this.pendingReject = null;
         } else {
           this.emit({ type: "error", message: data.message });
-        }
-        break;
-      }
-
-      case "ResolveAllResult": {
-        const data = msg.data as {
-          request_id: number;
-          items_resolved: number;
-          total: number;
-        };
-        if (this.pendingResolveAll?.requestId === data.request_id) {
-          const waitingFor = this.snapshot?.state.waiting_for;
-          if (!waitingFor) {
-            this.pendingResolveAll.reject(
-              new AdapterError("WS_ERROR", "Resolve All result arrived without a state snapshot", false),
-            );
-            this.pendingResolveAll = null;
-            break;
-          }
-          this.pendingResolveAll.resolve({
-            events: [],
-            waitingFor,
-            logEntries: [],
-            itemsResolved: data.items_resolved,
-            total: data.total,
-          });
-          this.pendingResolveAll = null;
-        }
-        break;
-      }
-
-      case "ResolveAllRejected": {
-        const data = msg.data as { request_id: number; rejection?: unknown };
-        if (this.pendingResolveAll?.requestId === data.request_id) {
-          this.pendingResolveAll.reject(
-            isActionRejection(data.rejection)
-              ? actionRejectionError(data.rejection)
-              : new AdapterError(AdapterErrorCode.WASM_ERROR, "Server sent an invalid Resolve All rejection.", false),
-          );
-          this.pendingResolveAll = null;
-        }
-        break;
-      }
-
-      case "ResolveAllFailed": {
-        const data = msg.data as { request_id: number; message: string };
-        if (this.pendingResolveAll?.requestId === data.request_id) {
-          this.pendingResolveAll.reject(new AdapterError("WS_ERROR", data.message, false));
-          this.pendingResolveAll = null;
         }
         break;
       }

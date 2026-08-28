@@ -13,7 +13,7 @@ use crate::types::ability::{
 };
 use crate::types::actions::{
     CastChoice, GameAction, LearnOption, MulliganChoice, OutsideGameSelection,
-    ResolveAllConsentDecision,
+    ResolutionOptionalPaymentChoice, ResolveAllConsentDecision,
 };
 use crate::types::card::LayoutKind;
 use crate::types::card_type::CoreType;
@@ -2489,6 +2489,27 @@ pub fn candidate_actions_broad_with_probe(
                 )
             })
             .collect(),
+        WaitingFor::ResolutionOptionalPaymentChoice { player, costs, .. } => {
+            std::iter::once(candidate(
+                GameAction::ChooseResolutionOptionalPaymentBranch {
+                    choice: ResolutionOptionalPaymentChoice::Decline,
+                },
+                TacticalClass::Utility,
+                Some(*player),
+            ))
+            .chain(costs.iter().map(|option| {
+                candidate(
+                    GameAction::ChooseResolutionOptionalPaymentBranch {
+                        choice: ResolutionOptionalPaymentChoice::Pay {
+                            index: option.index,
+                        },
+                    },
+                    TacticalClass::Utility,
+                    Some(*player),
+                )
+            }))
+            .collect()
+        }
         WaitingFor::OptionalEffectChoice { .. }
         | WaitingFor::OpponentMayChoice { .. }
         | WaitingFor::TributeChoice { .. } => {

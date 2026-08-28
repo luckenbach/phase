@@ -423,23 +423,6 @@ export function replay_length_js(): number;
 export function replay_seek_js(target: number): any;
 
 /**
- * Batch-resolve the stack by auto-passing priority for the requesting player
- * and delegating to the AI for opponent decisions. Runs entirely inside WASM
- * with no JS round-trips between resolutions — collapses the O(N) priority
- * pass cycle into a single call.
- *
- * `requester` is the human player seat (whose "Resolve All" click initiated
- * this). `ai_seats_json` is a JSON array of `{ playerId, difficulty }` for
- * each AI opponent.
- *
- * Returns a compact `BatchResolveResult` with the final `WaitingFor` and a
- * count of items resolved. The Resolve All UI does not animate individual
- * events, so the WASM boundary intentionally returns empty event/log arrays
- * instead of serializing thousands of records for pathological stacks.
- */
-export function resolve_all(requester: number, ai_seats_json: string, max_resolutions: number): any;
-
-/**
  * Restore the game state from a JSON string.
  * Uses serde_json which handles string-keyed maps (from localStorage round-trip)
  * correctly deserializing into HashMap<ObjectId, V>.
@@ -449,6 +432,17 @@ export function resolve_all(requester: number, ai_seats_json: string, max_resolu
  * game on the wire. Undo is a single-player affordance only.
  */
 export function restore_game_state(json_str: string): void;
+
+/**
+ * Explicitly resume a persisted stack-automation session after
+ * `restore_game_state` has installed the snapshot.
+ *
+ * Generic restore is intentionally decode-only, so it never manufactures a
+ * priority pass. This returns the engine-authored bounded presentation for the
+ * resumed session (or an explicit no-op/repair); read the post-transition game
+ * state through `get_game_state` or a filtered state export.
+ */
+export function resume_restored_game_state(): any;
 
 /**
  * Resume a multiplayer host session from a persisted `GameState`.
@@ -481,9 +475,11 @@ export function restore_game_state(json_str: string): void;
  *    session.
  *
  * Refuses when the engine is already in use — this is a fresh-instance
- * entry point. Callers must clear any existing state first.
+ * entry point. Callers must clear any existing state first. Returns the same
+ * bounded engine-authored restored-automation presentation as
+ * `resume_restored_game_state` before the host exposes its first snapshot.
  */
-export function resume_multiplayer_host_state(json_str: string): void;
+export function resume_multiplayer_host_state(json_str: string): any;
 
 /**
  * Search the loaded card database. The engine is the single authority for the
@@ -607,9 +603,9 @@ export interface InitOutput {
     readonly preview_mana_payment_js: (a: number, b: any) => any;
     readonly project_seat_view: (a: number, b: number) => [number, number, number];
     readonly replay_seek_js: (a: number) => [number, number, number];
-    readonly resolve_all: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly restore_game_state: (a: number, b: number) => [number, number];
-    readonly resume_multiplayer_host_state: (a: number, b: number) => [number, number];
+    readonly resume_restored_game_state: () => [number, number, number];
+    readonly resume_multiplayer_host_state: (a: number, b: number) => [number, number, number];
     readonly search_cards_js: (a: any) => [number, number, number];
     readonly set_multiplayer_mode: (a: number) => void;
     readonly sideboardPolicyForFormat: (a: any) => [number, number, number];

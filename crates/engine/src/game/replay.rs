@@ -16,12 +16,14 @@ use thiserror::Error;
 use crate::database::CardDatabase;
 use crate::types::game_state::{GameState, WaitingFor};
 use crate::types::player::PlayerId;
-use crate::types::replay::{RecordedAction, ReplayHeader, ReplayLog, REPLAY_FORMAT_VERSION};
+use crate::types::replay::{
+    RecordedAction, RecordedActionKind, ReplayHeader, ReplayLog, REPLAY_FORMAT_VERSION,
+};
 
 use super::deck_loading::{load_and_hydrate_decks, resolve_deck_list};
 use super::engine::{
-    apply, resolve_all_ready_access, resolve_all_ready_prefix, start_game,
-    start_game_with_starting_player, ResolveAllReadyAccess,
+    apply, apply_verified_ai_priority_pass, resolve_all_ready_access, resolve_all_ready_prefix,
+    start_game, start_game_with_starting_player, ResolveAllReadyAccess,
 };
 
 /// Checkpoints are cached every `CHECKPOINT_INTERVAL` actions, bounding cache
@@ -199,11 +201,24 @@ impl ReplayPlayer {
             .iter()
             .enumerate()
         {
-            apply(&mut state, recorded.actor, recorded.action.clone()).map_err(|e| {
-                ReplayError::Desync {
-                    index: recorded.seq,
-                    message: e.to_string(),
+            let applied = match recorded.kind {
+                RecordedActionKind::Submitted => {
+                    apply(&mut state, recorded.actor, recorded.action.clone())
                 }
+                RecordedActionKind::VerifiedAiPriorityPass { semantic_owner } => {
+                    let contract =
+                        crate::ai_support::AiDecisionContract::issue(&state, semantic_owner);
+                    apply_verified_ai_priority_pass(
+                        &mut state,
+                        recorded.actor,
+                        &contract,
+                        recorded.action.clone(),
+                    )
+                }
+            };
+            applied.map_err(|e| ReplayError::Desync {
+                index: recorded.seq,
+                message: e.to_string(),
             })?;
             let after_action_count = start_idx + offset as u32 + 1;
             for boundary in self
@@ -271,20 +286,28 @@ fn validate_resolve_all_boundaries(log: &ReplayLog) -> Result<(), ReplayError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::game::zones::create_object;
     use crate::types::ability::{
-        Effect, ResolvedAbility, TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef,
+        AbilityDefinition, AbilityKind, Effect, QuantityExpr, ResolvedAbility, TargetFilter,
+        TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef,
     };
     use crate::types::actions::{GameAction, ResolveAllConsentDecision};
+    use crate::types::card_type::CoreType;
     use crate::types::format::FormatConfig;
     use crate::types::game_state::{
-        AutoPassMode, ProductionOverride, StackEntry, StackEntryKind, TurnBoundary,
+        AutoPassMode, ProductionOverride, StackEntry, StackEntryKind, StackResolutionPolicy,
+        TurnBoundary, WaitingFor,
     };
-    use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
+    use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef};
     use crate::types::mana::{
         ManaSourceOutput, ManaSourcePenalty, ManaSourceSelection, ManaType, TapsForManaSelection,
     };
     use crate::types::match_config::MatchConfig;
+    use crate::types::phase::Phase;
     use crate::types::replay::RecordedResolveAll;
+    use crate::types::zones::Zone;
 
     fn two_player_header(seed: u64) -> ReplayHeader {
         ReplayHeader {
@@ -324,6 +347,87 @@ mod tests {
                 )),
             },
         }
+    }
+
+    fn recheck_fixture_state() -> GameState {
+        let mut state = GameState::new_two_player(42);
+        state.phase = Phase::PreCombatMain;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        state.stack.push_back(StackEntry {
+            id: ObjectId(70_200),
+            source_id: ObjectId(70_200),
+            controller: PlayerId(1),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: ObjectId(70_200),
+                ability: Box::new(crate::types::ability::ResolvedAbility::new(
+                    Effect::NoOp,
+                    Vec::new(),
+                    ObjectId(70_200),
+                    PlayerId(1),
+                )),
+            },
+        });
+        let object_id = create_object(
+            &mut state,
+            CardId(70_201),
+            PlayerId(1),
+            "Replay Recheck Action".to_string(),
+            Zone::Battlefield,
+        );
+        let object = state
+            .objects
+            .get_mut(&object_id)
+            .expect("created battlefield object");
+        object.card_types.core_types.push(CoreType::Artifact);
+        Arc::make_mut(&mut object.abilities).push(AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        ));
+        state
+    }
+
+    #[test]
+    fn verified_ai_stack_pass_replays_with_live_private_session_state() {
+        let initial = recheck_fixture_state();
+        let contract = crate::ai_support::AiDecisionContract::issue(&initial, PlayerId(0));
+        let mut live = initial.clone();
+        apply_verified_ai_priority_pass(
+            &mut live,
+            PlayerId(0),
+            &contract,
+            GameAction::PassPriority,
+        )
+        .expect("the live verified pass applies");
+
+        let header = two_player_header(42);
+        let mut log = ReplayLog::new(header);
+        log.push_verified_ai_priority_pass(PlayerId(0), PlayerId(0));
+        let mut checkpoints = BTreeMap::new();
+        checkpoints.insert(0, initial);
+        let mut player = ReplayPlayer {
+            log,
+            checkpoints,
+            scratch: None,
+        };
+        let replayed = player.seek(1).expect("the marker must replay");
+
+        assert_eq!(replayed, &live, "replay must use the same engine seam");
+        assert_eq!(replayed.state_revision, live.state_revision);
+        assert_eq!(
+            replayed
+                .stack_resolution_session
+                .as_ref()
+                .map(|session| (session.cursor, session.policy)),
+            Some((0, StackResolutionPolicy::RecheckNoMeaningfulPriorityAction)),
+            "the retained private cursor and policy must match live application"
+        );
     }
 
     #[test]
@@ -430,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn due_resolve_all_boundary_rejects_an_unentitled_requester() {
+    fn due_resolve_all_boundary_rejects_a_legacy_boundary_after_engine_owned_resolution() {
         let header = two_player_header(5);
         let mut initial = GameState::new_two_player(header.seed);
         initial.stack.push_back(no_op_entry(1, PlayerId(0)));
@@ -458,16 +562,16 @@ mod tests {
         replay.checkpoints.insert(0, initial);
         let error = replay
             .seek(2)
-            .expect_err("a non-participant cannot consume Resolve All Ready");
+            .expect_err("new Resolve All actions resolve through the engine without a Ready latch");
         assert!(matches!(
             error,
             ReplayError::Desync { message, .. }
-                if message == "Resolve All boundary requester is not entitled to the Ready latch"
+                if message == "Resolve All boundary was due without a Ready latch"
         ));
     }
 
     #[test]
-    fn version_three_roundtrips_semantic_mana_source_selections() {
+    fn current_version_roundtrips_semantic_mana_source_selections() {
         let source = ObjectIncarnationRef::of(ObjectId(7), 3);
         let aura = ObjectIncarnationRef::of(ObjectId(9), 2);
         let action = GameAction::TapLandForMana {
@@ -581,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_player_reconstructs_atomic_resolve_all_with_two_retained_auto_passes() {
+    fn replay_player_reconstructs_a_legacy_atomic_resolve_all_boundary() {
         let header = two_player_header(101);
         let mut initial = GameState::new_two_player(header.seed);
         initial.stack.push_back(no_op_entry(1, PlayerId(0)));
@@ -594,14 +698,23 @@ mod tests {
             );
         }
 
+        let begin = GameAction::BeginResolveAll { max_resolutions: 0 };
+        apply(&mut initial, PlayerId(0), begin).expect("P0 begins Resolve All consent");
+        let WaitingFor::ResolveAllConsent { epoch, .. } = initial.waiting_for else {
+            panic!(
+                "P1 should be asked for consent, got {:?}",
+                initial.waiting_for
+            );
+        };
+        let run = initial
+            .resolve_all_consent_run
+            .as_mut()
+            .expect("the consent prompt retains its private run");
+        run.auto_pass_baseline = None;
+        initial.auto_pass.remove(&PlayerId(0));
+
         let mut live = initial.clone();
         let mut log = ReplayLog::new(header);
-        let begin = GameAction::BeginResolveAll { max_resolutions: 0 };
-        apply(&mut live, PlayerId(0), begin.clone()).expect("P0 begins Resolve All consent");
-        log.push_action(PlayerId(0), begin);
-        let WaitingFor::ResolveAllConsent { epoch, .. } = live.waiting_for else {
-            panic!("P1 should be asked for consent, got {:?}", live.waiting_for);
-        };
         let grant = GameAction::RespondResolveAllConsent {
             epoch,
             decision: ResolveAllConsentDecision::Grant,

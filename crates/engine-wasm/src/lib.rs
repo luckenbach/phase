@@ -17,7 +17,8 @@ use engine::database::{CardDatabase, CardSearchQuery};
 use engine::game::engine::apply;
 use engine::game::engine::{
     apply_interaction_with_rejection, apply_with_rejection, preflight_debug_action_with_rejection,
-    recover_orphaned_resolve_all, resolve_all_ready_prefix_with_rejection,
+    resume_restored_stack_automation, RestoredStackAutomationOutcome,
+    RestoredStackAutomationPresentation,
 };
 use engine::game::interaction::{bind_interaction_authority, submit_interaction_with_rejection};
 use engine::game::preview::{
@@ -1707,6 +1708,19 @@ fn record_replay_action(is_debug_action: bool, actor: PlayerId, action_for_repla
     });
 }
 
+/// Record the AI-only verified-pass seam. This has a distinct typed replay
+/// marker because replaying its visible `PassPriority` payload through the
+/// ordinary reducer would omit the retained stack recheck session.
+fn record_verified_ai_priority_pass(actor: PlayerId, semantic_owner: PlayerId) {
+    REPLAY_LOG.with(|cell| {
+        let mut log = cell.take();
+        if let Some(log) = log.as_mut() {
+            log.push_verified_ai_priority_pass(actor, semantic_owner);
+        }
+        cell.set(log);
+    });
+}
+
 struct DebugCreateCardRequest<'a> {
     actor: PlayerId,
     card_name: &'a str,
@@ -2304,10 +2318,6 @@ fn restore_game_state_inner(json_str: &str) -> Result<(), String> {
     backfill_legacy_debug_permissions(&mut state, restored.debug_permitted_was_serialized, false);
     finalize_public_state(&mut state);
     bind_interaction_session(&mut state);
-    // A snapshot written while a Resolve All latch was outstanding restores
-    // with no acting seat; the consumer that would have advanced it lived in
-    // the worker that produced the snapshot.
-    recover_orphaned_resolve_all(&mut state);
     GAME_STATE.with(|cell| cell.set(Some(state)));
     // Restoring (undo, or resuming a save from a fresh worker that never saw
     // `initialize_game`) invalidates any in-progress recording — the restored
@@ -2315,6 +2325,50 @@ fn restore_game_state_inner(json_str: &str) -> Result<(), String> {
     REPLAY_LOG.with(|cell| cell.set(None));
     invalidate_ai_proposals();
     Ok(())
+}
+
+/// Explicitly drive any persisted stack automation after a successful restore.
+///
+/// [`restore_game_state`] deliberately remains an undo/decode boundary: it
+/// installs a playable snapshot but never manufactures a priority pass. This
+/// separately-invoked transition is the only WASM owner allowed to ask the
+/// engine to resume a saved `StackResolutionSession` or legacy Ready latch.
+/// Its bounded engine-authored presentation describes the automated burst;
+/// callers read the final game snapshot through the normal state exports.
+#[wasm_bindgen]
+pub fn resume_restored_game_state() -> Result<JsValue, JsValue> {
+    resume_loaded_stack_automation(false)
+        .map(|presentation| to_js(&presentation))
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+/// Resume persisted stack automation from the state currently installed in
+/// this WASM instance.
+///
+/// A normal local restore has already invalidated undo's abandoned replay and
+/// proposal authority, so its no-op resume leaves those stores alone. A real
+/// engine transition (including an authorization repair) invalidates them once
+/// at the same boundary. Multiplayer host resume installs a new game identity,
+/// so it requests that reset even for an ordinary-priority no-op.
+fn resume_loaded_stack_automation(
+    reset_on_noop: bool,
+) -> Result<RestoredStackAutomationPresentation, String> {
+    let resumed = GAME_STATE.with(|cell| {
+        let mut state = cell.take().ok_or_else(|| NOT_INITIALIZED_ERR.to_string())?;
+        let resumed = resume_restored_stack_automation(&mut state);
+        cell.set(Some(state));
+        Ok::<_, String>(resumed)
+    })?;
+    let changed = !matches!(
+        resumed.presentation.outcome,
+        RestoredStackAutomationOutcome::Noop
+    );
+    if changed || reset_on_noop {
+        clear_ai_session_cache();
+        REPLAY_LOG.with(|cell| cell.set(None));
+        invalidate_ai_proposals();
+    }
+    Ok(resumed.presentation)
 }
 
 /// Resume a multiplayer host session from a persisted `GameState`.
@@ -2349,7 +2403,7 @@ fn restore_game_state_inner(json_str: &str) -> Result<(), String> {
 /// Refuses when the engine is already in use — this is a fresh-instance
 /// entry point. Callers must clear any existing state first.
 #[wasm_bindgen]
-pub fn resume_multiplayer_host_state(json_str: &str) -> Result<(), JsValue> {
+pub fn resume_multiplayer_host_state(json_str: &str) -> Result<JsValue, JsValue> {
     if MULTIPLAYER_MODE.with(|cell| cell.get()) {
         return Err(JsValue::from_str(
             "resume_multiplayer_host_state refused: multiplayer mode already set",
@@ -2379,20 +2433,15 @@ pub fn resume_multiplayer_host_state(json_str: &str) -> Result<(), JsValue> {
 
     finalize_public_state(&mut state);
     bind_interaction_session(&mut state);
-    // Mirrors `server-core::GameSession::from_persisted`: a host that reloaded
-    // while a Resolve All latch was outstanding would otherwise resume into a
-    // state no seat can advance, with returning guests bound to a dead prompt.
-    recover_orphaned_resolve_all(&mut state);
 
     GAME_STATE.with(|cell| cell.set(Some(state)));
     MULTIPLAYER_MODE.with(|cell| cell.set(true));
-    clear_ai_session_cache();
-    // Multiplayer games are out of scope for v1 recording (see
-    // `crates/engine/src/types/replay.rs`); ensure no stale local-game
-    // recording from this worker's previous session lingers.
-    REPLAY_LOG.with(|cell| cell.set(None));
-    invalidate_ai_proposals();
-    Ok(())
+    // The fresh RNG state is installed before the engine evaluates the saved
+    // session, and no caller can observe the hosted snapshot until this
+    // returns its bounded engine presentation.
+    resume_loaded_stack_automation(true)
+        .map(|presentation| to_js(&presentation))
+        .map_err(|error| JsValue::from_str(&error))
 }
 
 #[cfg(test)]
@@ -3097,19 +3146,35 @@ pub fn submit_ai_action_proposal(token: &str, actor: u8, action: JsValue) -> JsV
     };
 
     match with_state_mut(|state| {
-        if !proposal.contract.permits(state, actor, &action) {
+        let is_stack_recheck_pass =
+            matches!(&action, GameAction::PassPriority) && !state.stack.is_empty();
+        if !is_stack_recheck_pass && !proposal.contract.permits(state, actor, &action) {
             return AiProposalSubmission::Stale {
                 reason: "decision_changed_or_action_outside_issued_bounds",
             };
         }
-        match apply_interaction_with_rejection(
-            state,
-            actor,
-            proposal.contract.semantic_owner,
-            action.clone(),
-        ) {
+        let applied = if is_stack_recheck_pass {
+            engine::game::engine::apply_verified_ai_priority_pass_with_rejection(
+                state,
+                actor,
+                &proposal.contract,
+                action.clone(),
+            )
+        } else {
+            apply_interaction_with_rejection(
+                state,
+                actor,
+                proposal.contract.semantic_owner,
+                action.clone(),
+            )
+        };
+        match applied {
             Ok(result) => {
-                record_replay_action(false, actor, action);
+                if is_stack_recheck_pass {
+                    record_verified_ai_priority_pass(actor, proposal.contract.semantic_owner);
+                } else {
+                    record_replay_action(false, actor, action);
+                }
                 invalidate_ai_proposals();
                 AiProposalSubmission::Applied {
                     result: Box::new(result),
@@ -3123,67 +3188,6 @@ pub fn submit_ai_action_proposal(token: &str, actor: u8, action: JsValue) -> JsV
             reason: "state_unavailable",
         }),
     }
-}
-
-/// Batch-resolve the stack by auto-passing priority for the requesting player
-/// and delegating to the AI for opponent decisions. Runs entirely inside WASM
-/// with no JS round-trips between resolutions — collapses the O(N) priority
-/// pass cycle into a single call.
-///
-/// `requester` is the human player seat (whose "Resolve All" click initiated
-/// this). `ai_seats_json` is a JSON array of `{ playerId, difficulty }` for
-/// each AI opponent.
-///
-/// Returns a compact `BatchResolveResult` with the final `WaitingFor` and a
-/// count of items resolved. The Resolve All UI does not animate individual
-/// events, so the WASM boundary intentionally returns empty event/log arrays
-/// instead of serializing thousands of records for pathological stacks.
-///
-#[wasm_bindgen]
-pub fn resolve_all(
-    requester: u8,
-    ai_seats_json: &str,
-    max_resolutions: u32,
-) -> Result<JsValue, JsValue> {
-    if serde_json::from_str::<Vec<serde_json::Value>>(ai_seats_json).is_err() {
-        return Ok(rejected_action_outcome(ActionRejection::new(
-            ActionRejectionCode::InvalidAction,
-        )));
-    }
-
-    let requester = PlayerId(requester);
-
-    with_state_mut(|state| {
-        // Phase 2 consumes only the already-issued, unanimous consent run.
-        // AI consent is answered through ordinary engine candidates before this
-        // call; Resolve All must never ask an AI about a speculative future
-        // priority window. Keep the legacy payload parse as a wire-compatible
-        // boundary while the consent action owns the authoritative cap.
-        let _ = max_resolutions;
-        let mut result = match resolve_all_ready_prefix_with_rejection(state, requester) {
-            Ok(result) => result,
-            Err(rejection) => return Ok(rejected_action_outcome(rejection)),
-        };
-        // Resolve All consumes a transport-owned Ready latch, rather than one
-        // `GameAction` per internal priority pass. Record the entire consumer
-        // atomically after the last submitted consent action; playback invokes
-        // the same engine consumer at that exact boundary, so auto-pass cannot
-        // re-run between synthetic recorded passes.
-        REPLAY_LOG.with(|cell| {
-            let mut log = cell.take();
-            if let Some(log) = log.as_mut() {
-                log.push_resolve_all_boundary(requester);
-            }
-            cell.set(log);
-        });
-        // Resolve All advances the live state without travelling through
-        // `submit_action`, so it must invalidate proposal capabilities at the
-        // same authority boundary.
-        invalidate_ai_proposals();
-        result.events.clear();
-        result.log_entries.clear();
-        Ok(action_outcome(Ok(result)))
-    })?
 }
 
 /// Apply a seat mutation to a seat state, using the TLS card database for deck
@@ -3324,7 +3328,6 @@ mod tests {
     use std::sync::Arc;
 
     use engine::game::deck_loading::create_object_from_card_face;
-    use engine::game::engine::ResolveAllFastForwardResult as BatchResolveResult;
     use engine::game::scenario::{GameScenario, P0, P1};
     use engine::game::zones::create_object;
     use engine::types::ability::{
@@ -3338,8 +3341,9 @@ mod tests {
     use engine::types::counter::{CounterMatch, CounterType};
     use engine::types::game_state::{
         MulliganDecisionEntry, MulliganDecisionPhase, NamedChoiceSource, NamedChoiceSourceBinding,
-        OpponentGuessOwner, OpponentGuessSource, PromptSourceBinding, StackEntry, StackEntryKind,
-        WaitingFor,
+        OpponentGuessOwner, OpponentGuessSource, PromptSourceBinding, ResolveAllConsentParticipant,
+        ResolveAllConsentRun, ResolveAllPrioritySnapshot, StackEntry, StackEntryKind,
+        StackResolutionBudget, WaitingFor,
     };
     use engine::types::identifiers::{CardId, ObjectId};
     use engine::types::keywords::Keyword;
@@ -4086,6 +4090,35 @@ mod tests {
     }
 
     #[test]
+    fn stack_pass_proposal_uses_the_verified_recheck_seam() {
+        let player = PlayerId(0);
+        let mut state = priority_state(player);
+        state
+            .stack
+            .push_back(no_op_stack_entry(70_101, PlayerId(1)));
+        add_non_mana_recheck_action(&mut state, PlayerId(1));
+        let action = GameAction::PassPriority;
+        let token = install_issued_candidate(state, player, &action);
+
+        assert_eq!(
+            proposal_outcome(&token, player, &action)["status"],
+            "applied"
+        );
+        with_state(|state| {
+            assert_eq!(
+                state
+                    .stack_resolution_session
+                    .as_ref()
+                    .map(|session| session.policy),
+                Some(engine::types::game_state::StackResolutionPolicy::RecheckNoMeaningfulPriorityAction),
+                "the WASM proposal boundary must not downgrade a verified stack pass"
+            );
+        })
+        .expect("test state must remain installed");
+        clear_game_state();
+    }
+
+    #[test]
     fn public_proposal_issuer_mints_a_submitable_priority_capability() {
         let player = PlayerId(0);
         clear_game_state();
@@ -4580,135 +4613,234 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_all_exported_path_routes_controlled_priority_to_requester() {
+    fn legacy_ready_state_json() -> String {
         let mut state = GameState::new_two_player(7);
-        state.waiting_for = WaitingFor::Priority {
-            player: PlayerId(1),
-        };
-        state.active_player = PlayerId(1);
-        state.turn_decision_controller = Some(PlayerId(0));
+        const EPOCH: u64 = 70_200;
+        state.waiting_for = WaitingFor::ResolveAllReady { epoch: EPOCH };
         state.priority_player = PlayerId(0);
-        state.stack.push_back(no_op_stack_entry(1, PlayerId(1)));
-        apply(
-            &mut state,
-            PlayerId(0),
-            GameAction::BeginResolveAll { max_resolutions: 0 },
-        )
-        .expect("the controlled priority holder begins Resolve All consent");
-        let epoch = match state.waiting_for {
-            WaitingFor::ResolveAllConsent { epoch, .. } => epoch,
-            ref other => {
-                panic!("Resolve All must prompt the remaining representative, got {other:?}")
-            }
-        };
-        apply(
-            &mut state,
-            PlayerId(0),
-            GameAction::RespondResolveAllConsent {
-                epoch,
-                decision: engine::types::actions::ResolveAllConsentDecision::Grant,
+        state
+            .stack
+            .push_back(no_op_stack_entry(70_200, PlayerId(1)));
+        state.resolve_all_consent_run = Some(ResolveAllConsentRun {
+            epoch: EPOCH,
+            max_resolutions: StackResolutionBudget::default(),
+            priority_snapshot: ResolveAllPrioritySnapshot {
+                waiting_player: PlayerId(0),
+                priority_player: PlayerId(0),
+                priority_pass_count: 0,
+                priority_passes: Default::default(),
             },
-        )
-        .expect("the controlled representative grants Resolve All consent");
+            participants: vec![
+                ResolveAllConsentParticipant {
+                    representative: PlayerId(0),
+                    authorized_submitter: PlayerId(0),
+                    granted: true,
+                },
+                ResolveAllConsentParticipant {
+                    representative: PlayerId(1),
+                    authorized_submitter: PlayerId(1),
+                    granted: true,
+                },
+            ],
+            // `None` and the empty live preference map identify the real
+            // persisted Ready representation, not a contemporary consent run.
+            auto_pass_baseline: None,
+        });
         assert!(matches!(
             state.waiting_for,
-            WaitingFor::ResolveAllReady { epoch: ready_epoch } if ready_epoch == epoch
+            WaitingFor::ResolveAllReady { epoch } if epoch == EPOCH
         ));
-        GAME_STATE.with(|cell| cell.set(Some(state)));
+        assert!(state.auto_pass.is_empty());
+        assert!(state
+            .resolve_all_consent_run
+            .as_ref()
+            .is_some_and(|run| run.auto_pass_baseline.is_none()));
+        serde_json::to_string(&state).expect("legacy Ready state serializes")
+    }
 
-        with_state_mut(|state| {
-            apply(
-                state,
-                PlayerId(0),
-                GameAction::BeginResolveAll { max_resolutions: 0 },
-            )
-            .expect("turn controller may begin the consent run");
-            let WaitingFor::ResolveAllConsent { epoch, .. } = &state.waiting_for else {
-                panic!("controlled priority should queue Resolve All consent");
-            };
-            apply(
-                state,
-                PlayerId(0),
-                GameAction::RespondResolveAllConsent {
-                    epoch: *epoch,
-                    decision: ResolveAllConsentDecision::Grant,
-                },
-            )
-            .expect("frozen turn controller may grant for the queued representative");
+    fn seed_replay_recording() {
+        REPLAY_LOG.with(|cell| {
+            cell.set(Some(ReplayLog::new(ReplayHeader {
+                format_config: FormatConfig::standard(),
+                match_config: MatchConfig::default(),
+                player_count: 2,
+                first_player: Some(0),
+                seed: 7,
+                deck_data: None,
+            })));
+        });
+        assert!(has_replay_recording());
+    }
+
+    fn add_non_mana_recheck_action(state: &mut GameState, controller: PlayerId) {
+        let object_id = create_object(
+            state,
+            CardId(70_100),
+            controller,
+            "Wasm Recheck Action".to_string(),
+            Zone::Battlefield,
+        );
+        let object = state
+            .objects
+            .get_mut(&object_id)
+            .expect("created battlefield object");
+        object.card_types.core_types.push(CoreType::Artifact);
+        Arc::make_mut(&mut object.abilities).push(AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        ));
+    }
+
+    #[test]
+    fn restore_is_decode_only_until_explicit_stack_automation_resume() {
+        clear_game_state();
+        set_multiplayer_mode(false);
+        load_minimal_test_card_database();
+        let json = legacy_ready_state_json();
+
+        restore_game_state(&json).expect("generic restore installs the snapshot");
+        with_state(|state| {
+            assert!(matches!(
+                state.waiting_for,
+                WaitingFor::ResolveAllReady { .. }
+            ));
+            assert_eq!(state.stack.len(), 1, "restore must not resolve an entry");
         })
-        .expect("test state remains installed");
+        .expect("restored state remains installed");
 
-        let value = resolve_all(0, "[]", 0).unwrap();
-        let outcome: serde_json::Value = serde_wasm_bindgen::from_value(value).unwrap();
-        let result: BatchResolveResult = serde_json::from_value(
-            outcome
-                .get("result")
-                .cloned()
-                .expect("ready Resolve All returns an applied outcome"),
+        let presentation: RestoredStackAutomationPresentation = serde_wasm_bindgen::from_value(
+            resume_restored_game_state().expect("explicit resume enters the engine seam"),
         )
-        .unwrap();
-
-        assert_eq!(result.items_resolved, 1);
-        let restored: GameState = serde_wasm_bindgen::from_value(get_game_state()).unwrap();
-        assert!(restored.stack.is_empty());
+        .expect("explicit resume presentation deserializes");
+        assert_eq!(
+            presentation.outcome,
+            RestoredStackAutomationOutcome::Progressed
+        );
+        with_state(|state| assert!(state.stack.is_empty()))
+            .expect("resumed state remains installed");
         clear_game_state();
     }
 
     #[test]
-    fn resolve_all_exported_path_records_one_atomic_replay_boundary() {
+    fn explicit_resume_is_one_shot_and_revokes_proposals_on_progress() {
         clear_game_state();
+        set_multiplayer_mode(false);
+        load_minimal_test_card_database();
+        let json = legacy_ready_state_json();
+        restore_game_state(&json).expect("generic restore installs the snapshot");
 
-        let mut state = GameState::new_two_player(8);
-        state.waiting_for = WaitingFor::Priority {
-            player: PlayerId(0),
-        };
-        state.priority_player = PlayerId(0);
-        state.stack.push_back(no_op_stack_entry(1, PlayerId(0)));
-        let header = ReplayHeader {
-            format_config: state.format_config.clone(),
-            match_config: state.match_config,
-            player_count: state.players.len() as u8,
-            first_player: Some(0),
-            seed: state.rng_seed,
-            deck_data: None,
-        };
-        REPLAY_LOG.with(|cell| cell.set(Some(ReplayLog::new(header))));
+        let cached_before = with_state(ai_session_for).expect("restored state seeds the AI cache");
+        seed_replay_recording();
 
-        let begin = GameAction::BeginResolveAll { max_resolutions: 0 };
-        apply(&mut state, PlayerId(0), begin.clone())
-            .expect("P0 begins the Resolve All consent run");
-        record_replay_action(false, PlayerId(0), begin);
-        let WaitingFor::ResolveAllConsent { epoch, .. } = state.waiting_for else {
-            panic!(
-                "P1 should be asked for consent, got {:?}",
-                state.waiting_for
-            );
-        };
-        let grant = GameAction::RespondResolveAllConsent {
-            epoch,
-            decision: ResolveAllConsentDecision::Grant,
-        };
-        apply(&mut state, PlayerId(1), grant.clone()).expect("P1 grants Resolve All consent");
-        record_replay_action(false, PlayerId(1), grant);
-        assert!(matches!(
-            state.waiting_for,
-            WaitingFor::ResolveAllReady { .. }
-        ));
-        GAME_STATE.with(|cell| cell.set(Some(state)));
-
-        resolve_all(0, "[]", 0).expect("the Ready consumer resolves through the WASM bridge");
-
-        REPLAY_LOG.with(|cell| {
-            let log = cell.take().expect("the replay log remains installed");
-            assert_eq!(log.actions.len(), 2);
-            assert_eq!(log.resolve_all_boundaries.len(), 1);
-            let boundary = &log.resolve_all_boundaries[0];
-            assert_eq!(boundary.after_action_count, 2);
-            assert_eq!(boundary.requester, PlayerId(0));
-            cell.set(Some(log));
+        let token = AI_PROPOSALS.with(|registry| {
+            registry.borrow_mut().insert(AiDecisionContract {
+                semantic_owner: PlayerId(0),
+                authorized_actor: PlayerId(0),
+                state_revision: 0,
+                candidates: Vec::new(),
+            })
         });
+        assert!(AI_PROPOSALS.with(|registry| registry.borrow().proposal(&token).is_some()));
+        let generation_before = AI_PROPOSALS.with(|registry| registry.borrow().generation);
+
+        let first = resume_loaded_stack_automation(false).expect("resume progresses once");
+        assert_eq!(first.outcome, RestoredStackAutomationOutcome::Progressed);
+        assert!(AI_PROPOSALS.with(|registry| registry.borrow().proposal(&token).is_none()));
+        assert_eq!(
+            AI_PROPOSALS.with(|registry| registry.borrow().generation),
+            generation_before.wrapping_add(1),
+            "a progressed resume revokes proposal authority exactly once"
+        );
+        assert!(
+            !has_replay_recording(),
+            "a progressed resume drops the abandoned replay recording"
+        );
+        let cached_after = with_state(ai_session_for).expect("resumed state rebuilds the AI cache");
+        assert!(
+            !Arc::ptr_eq(&cached_before, &cached_after),
+            "the resumed state must not retain its pre-resume AI session"
+        );
+
+        let second = resume_loaded_stack_automation(false).expect("second resume is harmless");
+        assert_eq!(second.outcome, RestoredStackAutomationOutcome::Noop);
+        assert_eq!(
+            AI_PROPOSALS.with(|registry| registry.borrow().generation),
+            generation_before.wrapping_add(1),
+            "a no-op local resume must not reset authority again"
+        );
         clear_game_state();
+    }
+
+    #[test]
+    fn multiplayer_host_resume_returns_post_automation_presentation() {
+        clear_game_state();
+        set_multiplayer_mode(false);
+        load_minimal_test_card_database();
+        let json = legacy_ready_state_json();
+
+        let presentation: RestoredStackAutomationPresentation = serde_wasm_bindgen::from_value(
+            resume_multiplayer_host_state(&json).expect("host resume succeeds"),
+        )
+        .expect("host resume presentation deserializes");
+        assert_eq!(
+            presentation.outcome,
+            RestoredStackAutomationOutcome::Progressed
+        );
+        assert!(is_multiplayer_mode());
+        with_state(|state| assert!(state.stack.is_empty()))
+            .expect("post-resume host state remains installed");
+        clear_game_state();
+        set_multiplayer_mode(false);
+    }
+
+    #[test]
+    fn multiplayer_host_noop_resume_resets_each_live_authority_store_once() {
+        clear_game_state();
+        set_multiplayer_mode(false);
+        load_minimal_test_card_database();
+        let stale_state = GameState::new_two_player(17);
+        let cached_before = AI_SESSION_CACHE.with(|cell| {
+            let mut cache = cell.take();
+            let session = cache.get_or_build(&stale_state);
+            cell.set(cache);
+            session
+        });
+        seed_replay_recording();
+        let token = AI_PROPOSALS.with(|registry| {
+            registry.borrow_mut().insert(AiDecisionContract {
+                semantic_owner: PlayerId(0),
+                authorized_actor: PlayerId(0),
+                state_revision: 0,
+                candidates: Vec::new(),
+            })
+        });
+        let generation_before = AI_PROPOSALS.with(|registry| registry.borrow().generation);
+
+        let ordinary = serde_json::to_string(&GameState::new_two_player(23))
+            .expect("ordinary host state serializes");
+        let presentation: RestoredStackAutomationPresentation = serde_wasm_bindgen::from_value(
+            resume_multiplayer_host_state(&ordinary).expect("ordinary host resume succeeds"),
+        )
+        .expect("host no-op presentation deserializes");
+
+        assert_eq!(presentation.outcome, RestoredStackAutomationOutcome::Noop);
+        assert!(AI_PROPOSALS.with(|registry| registry.borrow().proposal(&token).is_none()));
+        assert_eq!(
+            AI_PROPOSALS.with(|registry| registry.borrow().generation),
+            generation_before.wrapping_add(1),
+            "a host identity change revokes proposals exactly once even without automation"
+        );
+        assert!(!has_replay_recording());
+        let cached_after = with_state(ai_session_for).expect("host state rebuilds the AI cache");
+        assert!(
+            !Arc::ptr_eq(&cached_before, &cached_after),
+            "a no-op host resume must not inherit a previous session cache"
+        );
+        clear_game_state();
+        set_multiplayer_mode(false);
     }
 
     #[test]

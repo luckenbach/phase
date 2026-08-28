@@ -25,6 +25,7 @@ import init, {
   get_legal_actions_for_viewer_js,
   get_viewer_snapshot_js,
   restore_game_state,
+  resume_restored_game_state,
   resume_multiplayer_host_state,
   load_card_database,
   build_ai_card_subset,
@@ -34,7 +35,6 @@ import init, {
   export_game_state_json,
   clear_game_state,
   set_multiplayer_mode,
-  resolve_all,
   estimate_bracket_for_deck,
   has_replay_recording,
   export_replay_log,
@@ -97,6 +97,7 @@ type EngineRequest =
   | { type: "getAiActionProposalFromScoresWithDiagnostics"; id: number; scoresJson: string; difficulty: string; playerId: number; seed: number }
   | { type: "submitAiActionProposal"; id: number; proposal: AiActionProposal }
   | { type: "restoreState"; id: number; stateJson: string }
+  | { type: "resumeRestoredGameState"; id: number }
   | { type: "resumeMultiplayerHostState"; id: number; stateJson: string }
   | { type: "exportState"; id: number }
   | { type: "loadCardDbFromUrl"; id: number }
@@ -111,7 +112,6 @@ type EngineRequest =
   | { type: "takeLastPanic"; id: number }
   | { type: "applySeatMutation"; id: number; stateJson: string; mutationJson: string }
   | { type: "projectSeatView"; id: number; stateJson: string }
-  | { type: "resolveAll"; id: number; requester: number; aiSeatsJson: string; maxResolutions: number }
   | { type: "estimateBracketForDeck"; id: number; deck: BracketDeckRequest }
   | { type: "hasReplayRecording"; id: number }
   | { type: "exportReplayLog"; id: number }
@@ -512,9 +512,27 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
         break;
       }
 
+      case "resumeRestoredGameState": {
+        const presentation = resume_restored_game_state();
+        result(msg.id, {
+          presentation,
+          snapshot: {
+            state: get_game_state(),
+            legalResult: get_legal_actions_js(),
+          },
+        });
+        break;
+      }
+
       case "resumeMultiplayerHostState": {
-        resume_multiplayer_host_state(msg.stateJson);
-        result(msg.id, null);
+        const presentation = resume_multiplayer_host_state(msg.stateJson);
+        result(msg.id, {
+          presentation,
+          snapshot: {
+            state: get_game_state(),
+            legalResult: get_legal_actions_js(),
+          },
+        });
         break;
       }
 
@@ -560,24 +578,6 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
       case "projectSeatView": {
         const view = project_seat_view(msg.stateJson);
         result(msg.id, view ?? null);
-        break;
-      }
-
-      case "resolveAll": {
-        const outcome = resolve_all(msg.requester, msg.aiSeatsJson, msg.maxResolutions);
-        if (typeof outcome === "string") {
-          error(msg.id, outcome);
-          break;
-        }
-        if (!isActionOutcome(outcome)) {
-          malformedOutcomeError(msg.id);
-          break;
-        }
-        if (outcome.status === "rejected") {
-          rejectionError(msg.id, outcome.rejection);
-          break;
-        }
-        result(msg.id, outcome.result);
         break;
       }
 

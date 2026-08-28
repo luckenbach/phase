@@ -8,7 +8,8 @@ use crate::types::events::{GameEvent, PlayerActionKind};
 use crate::types::game_state::{
     ActionResult, AutoMayChoice, GameState, MayTriggerAutoChoiceScope,
     MayTriggerAutoChoiceSelector, PendingContinuation, PendingCostMoveResume,
-    PendingPlayerScopeUnlessPayment, WaitingFor, WardSacrificePaymentResume,
+    PendingPlayerScopeUnlessPayment, ResolutionOptionalPaymentOption, WaitingFor,
+    WardSacrificePaymentResume,
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::keywords::Keyword;
@@ -18,6 +19,7 @@ use crate::types::player::PlayerId;
 use crate::types::proposed_event::ProposedEvent;
 use crate::types::resolution::OptionalEffectFrame;
 use crate::types::zones::Zone;
+use crate::types::ResolutionOptionalPaymentChoice;
 
 use super::costs::{self, PaymentOutcome};
 use super::effects;
@@ -56,6 +58,54 @@ pub(super) fn handle_optional_effect_choice(
         return Ok(wait);
     }
     Ok(produced)
+}
+
+/// CR 118.12: consume a root optional disjunctive-payment choice. The client
+/// supplies only the original branch index; the concrete cost remains
+/// server-authored and is revalidated against live state before substitution.
+pub(super) fn handle_resolution_optional_payment_choice(
+    state: &mut GameState,
+    advertised_player: PlayerId,
+    advertised_source: ObjectId,
+    advertised: Vec<ResolutionOptionalPaymentOption>,
+    choice: ResolutionOptionalPaymentChoice,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    let mut frame = state
+        .active_optional_effect_frame()
+        .cloned()
+        .ok_or_else(|| EngineError::InvalidAction("optional payment frame is missing".into()))?;
+    let (live_player, live) = effects::resolution_optional_payment_options(state, &frame.ability)
+        .ok_or_else(|| {
+        EngineError::InvalidAction("optional payment root is no longer valid".into())
+    })?;
+    if live_player != advertised_player || frame.ability.source_id != advertised_source {
+        return Err(EngineError::InvalidAction(
+            "optional payment authority is stale".into(),
+        ));
+    }
+    let ResolutionOptionalPaymentChoice::Pay { index } = choice else {
+        return handle_optional_effect_choice(state, false, events);
+    };
+    let advertised_cost = advertised
+        .iter()
+        .find(|option| option.index == index)
+        .ok_or_else(|| EngineError::InvalidAction("payment branch was not advertised".into()))?;
+    let live_cost = live
+        .iter()
+        .find(|option| option.index == index && option.cost == advertised_cost.cost)
+        .ok_or_else(|| EngineError::InvalidAction("payment branch is no longer payable".into()))?;
+
+    let Effect::PayCost { cost, .. } = &mut frame.ability.effect else {
+        return Err(EngineError::InvalidAction(
+            "optional payment root is not PayCost".into(),
+        ));
+    };
+    *cost = live_cost.cost.clone();
+    state
+        .replace_active_optional_effect_frame(frame)
+        .map_err(|error| EngineError::InvalidAction(error.to_string()))?;
+    handle_optional_effect_choice(state, true, events)
 }
 
 fn handle_optional_effect_choice_inner(

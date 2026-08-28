@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use super::*;
@@ -14,12 +15,14 @@ use crate::types::ability::{
 use crate::types::card_type::CardType;
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::CounterType;
-use crate::types::events::PlayerActionKind;
+use crate::types::events::{GameEvent, PlayerActionKind};
 use crate::types::format::FormatConfig;
 use crate::types::game_state::{
-    CastPaymentMode, CastingVariant, PendingCast, ProductionOverride, TargetSelectionProgress,
+    ActionResult, CastPaymentMode, CastingVariant, PendingCast, ProductionOverride,
+    TargetSelectionProgress, WaitingFor,
 };
 use crate::types::identifiers::{CardId, ObjectId, TriggerFiring};
+use crate::types::log::{GameLogEntry, LogCategory, LogSegment};
 use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use crate::types::statics::{CastFrequency, StaticMode};
 use crate::types::TriggerMode;
@@ -75,6 +78,153 @@ fn no_op_stack_entry(id: u64, controller: PlayerId) -> StackEntry {
             )),
         },
     }
+}
+
+fn restored_automation_log_entry(seq: u32) -> GameLogEntry {
+    GameLogEntry {
+        seq,
+        turn: 1,
+        phase: Phase::PreCombatMain,
+        category: LogCategory::Stack,
+        segments: vec![LogSegment::Text("automated stack resolution".to_string())],
+        presentation: Default::default(),
+    }
+}
+
+fn restored_automation_action_result(
+    events: Vec<GameEvent>,
+    log_entries: Vec<GameLogEntry>,
+) -> ActionResult {
+    ActionResult {
+        events,
+        waiting_for: WaitingFor::Priority { player: P0 },
+        log_entries,
+    }
+}
+
+#[test]
+fn restored_stack_automation_presentation_bounds_transport_but_retains_full_engine_events() {
+    let event_count = 2_001_u64;
+    let mut events: Vec<_> = (0..event_count - 1)
+        .map(|id| GameEvent::StackResolved {
+            object_id: ObjectId(id),
+        })
+        .collect();
+    events.push(GameEvent::GameOver { winner: Some(P0) });
+    let log_count = MAX_RESTORED_STACK_AUTOMATION_LOG_ENTRIES as u32 + 7;
+    let logs: Vec<_> = (0..log_count).map(restored_automation_log_entry).collect();
+    let mut full_result = restored_automation_action_result(events, logs);
+    full_result.waiting_for = WaitingFor::GameOver { winner: Some(P0) };
+    let resumed = RestoredStackAutomationResume::from_completed(
+        RestoredStackAutomationResult::Progressed(full_result),
+    );
+
+    assert_eq!(
+        resumed.action_result().events.len(),
+        event_count as usize,
+        "the engine keeps every event needed for lifecycle bookkeeping"
+    );
+    assert!(matches!(
+        resumed.action_result().events.last(),
+        Some(GameEvent::GameOver { winner: Some(P0) })
+    ));
+    assert!(matches!(
+        resumed.action_result().waiting_for,
+        WaitingFor::GameOver { winner: Some(P0) }
+    ));
+    assert_eq!(
+        resumed.presentation.outcome,
+        RestoredStackAutomationOutcome::Progressed
+    );
+    assert_eq!(
+        resumed.presentation.automated_resolution_count,
+        event_count as u32 - 1
+    );
+    assert_eq!(resumed.presentation.omitted_event_count, event_count as u32);
+    assert_eq!(
+        resumed.presentation.log_entries.len(),
+        MAX_RESTORED_STACK_AUTOMATION_LOG_ENTRIES
+    );
+    assert_eq!(
+        resumed
+            .presentation
+            .log_entries
+            .first()
+            .expect("bounded tail is non-empty")
+            .seq,
+        log_count - MAX_RESTORED_STACK_AUTOMATION_LOG_ENTRIES as u32
+    );
+    assert_eq!(
+        resumed
+            .presentation
+            .log_entries
+            .last()
+            .expect("bounded tail is non-empty")
+            .seq,
+        log_count - 1
+    );
+
+    let wire = serde_json::to_value(&resumed).expect("presentation serializes");
+    assert!(
+        wire.get("result").is_none(),
+        "the unbounded internal result must never serialize"
+    );
+    assert_eq!(
+        wire["presentation"]["omittedEventCount"],
+        serde_json::json!(event_count),
+        "the transport gets an explicit lossless count instead of the event burst"
+    );
+}
+
+#[test]
+fn restored_stack_automation_presentation_distinguishes_noop_progress_and_repair() {
+    let noop = RestoredStackAutomationResume::from_completed(RestoredStackAutomationResult::Noop(
+        restored_automation_action_result(Vec::new(), Vec::new()),
+    ));
+    let progressed = RestoredStackAutomationResume::from_completed(
+        RestoredStackAutomationResult::Progressed(restored_automation_action_result(
+            vec![
+                GameEvent::PriorityPassed { player_id: P0 },
+                GameEvent::StackResolved {
+                    object_id: ObjectId(1),
+                },
+            ],
+            vec![restored_automation_log_entry(1)],
+        )),
+    );
+    let repair = RestoredStackAutomationResume::from_completed(
+        RestoredStackAutomationResult::ZeroResolutionRepair(restored_automation_action_result(
+            vec![GameEvent::PriorityPassed { player_id: P0 }],
+            Vec::new(),
+        )),
+    );
+
+    assert_eq!(
+        noop.presentation.outcome,
+        RestoredStackAutomationOutcome::Noop
+    );
+    assert_eq!(noop.presentation.automated_resolution_count, 0);
+    assert_eq!(noop.presentation.omitted_event_count, 0);
+
+    assert_eq!(
+        progressed.presentation.outcome,
+        RestoredStackAutomationOutcome::Progressed
+    );
+    assert_eq!(progressed.presentation.automated_resolution_count, 1);
+    assert_eq!(progressed.presentation.omitted_event_count, 2);
+    assert_eq!(progressed.presentation.log_entries.len(), 1);
+    assert_eq!(
+        progressed.action_result().events.len(),
+        2,
+        "small results still retain their normal engine event slice"
+    );
+
+    assert_eq!(
+        repair.presentation.outcome,
+        RestoredStackAutomationOutcome::ZeroResolutionRepair
+    );
+    assert_eq!(repair.presentation.automated_resolution_count, 0);
+    assert_eq!(repair.presentation.omitted_event_count, 1);
 }
 
 #[test]
@@ -3520,6 +3670,191 @@ fn cancel_auto_pass_routes_by_actor() {
     assert!(
         !state.auto_pass.contains_key(&PlayerId(0)),
         "P0's auto-pass should have been cancelled"
+    );
+}
+
+#[test]
+fn cancelling_a_session_representative_restores_the_pre_overlay_preferences() {
+    use crate::types::game_state::{
+        AutoPassMode, StackResolutionAutoPassOverlay, StackResolutionBudget,
+        StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, TurnBoundary,
+    };
+
+    let mut state = setup_game_at_main_phase();
+    let entry = no_op_stack_entry(7_777, PlayerId(0));
+    state.stack.push_back(entry.clone());
+    state.auto_pass.insert(
+        PlayerId(0),
+        AutoPassMode::UntilStackEmpty {
+            initial_stack_len: 1,
+            policy: StackResolutionPolicy::Committed,
+        },
+    );
+    let baseline = BTreeMap::from([(
+        PlayerId(1),
+        AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::MyNextTurnStart,
+        },
+    )]);
+    state.stack_resolution_session = Some(StackResolutionSession {
+        entries: vec![StackResolutionEntryFence::capture(&entry)],
+        cursor: 0,
+        representatives: [PlayerId(0)].into_iter().collect(),
+        verified_pass_representatives: BTreeSet::new(),
+        budget: StackResolutionBudget::Unlimited,
+        policy: StackResolutionPolicy::Committed,
+        auto_pass_overlay: StackResolutionAutoPassOverlay {
+            baseline: baseline.clone(),
+        },
+    });
+
+    apply(&mut state, PlayerId(0), GameAction::CancelAutoPass)
+        .expect("the representative may cancel its own session");
+
+    assert!(state.stack_resolution_session.is_none());
+    assert_eq!(
+        state.auto_pass,
+        baseline.into_iter().collect::<HashMap<_, _>>()
+    );
+}
+
+#[test]
+fn representative_replacement_recaptures_the_restored_baseline() {
+    use crate::types::game_state::{
+        AutoPassMode, AutoPassRequest, StackResolutionAutoPassOverlay, StackResolutionBudget,
+        StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, TurnBoundary,
+    };
+
+    let mut state = setup_game_at_main_phase();
+    let entry = no_op_stack_entry(7_779, PlayerId(0));
+    state.stack.push_back(entry.clone());
+    let baseline = BTreeMap::from([(
+        PlayerId(1),
+        AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::MyNextTurnStart,
+        },
+    )]);
+    state.auto_pass.insert(
+        PlayerId(0),
+        AutoPassMode::UntilStackEmpty {
+            initial_stack_len: 1,
+            policy: StackResolutionPolicy::Committed,
+        },
+    );
+    state.stack_resolution_session = Some(StackResolutionSession {
+        entries: vec![StackResolutionEntryFence::capture(&entry)],
+        cursor: 0,
+        representatives: [PlayerId(0)].into_iter().collect(),
+        verified_pass_representatives: BTreeSet::new(),
+        budget: StackResolutionBudget::Unlimited,
+        policy: StackResolutionPolicy::Committed,
+        auto_pass_overlay: StackResolutionAutoPassOverlay {
+            baseline: baseline.clone(),
+        },
+    });
+
+    let response_id = create_object(
+        &mut state,
+        CardId(7_780),
+        PlayerId(1),
+        "Priority Response".to_string(),
+        Zone::Battlefield,
+    );
+    let response = state
+        .objects
+        .get_mut(&response_id)
+        .expect("the response permanent was just created");
+    response.card_types.core_types.push(CoreType::Artifact);
+    Arc::make_mut(&mut response.abilities).push(AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        },
+    ));
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .expect("the representative may replace its live session");
+
+    assert_eq!(
+        state
+            .stack_resolution_session
+            .as_ref()
+            .expect("replacement installs a fresh session")
+            .auto_pass_overlay
+            .baseline,
+        baseline,
+        "replacement must not capture the previous overlay as its new baseline"
+    );
+    apply(&mut state, PlayerId(0), GameAction::CancelAutoPass)
+        .expect("the representative may cancel the replacement");
+    assert_eq!(
+        state.auto_pass,
+        baseline.into_iter().collect::<HashMap<_, _>>()
+    );
+}
+
+#[test]
+fn elimination_restores_session_baseline_before_departing_preferences_are_cleaned() {
+    use crate::types::game_state::{
+        AutoPassMode, StackResolutionAutoPassOverlay, StackResolutionBudget,
+        StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, TurnBoundary,
+    };
+
+    let mut state = setup_game_at_main_phase();
+    let entry = no_op_stack_entry(7_778, PlayerId(0));
+    state.stack.push_back(entry.clone());
+    state.auto_pass.insert(
+        PlayerId(0),
+        AutoPassMode::UntilStackEmpty {
+            initial_stack_len: 1,
+            policy: StackResolutionPolicy::Committed,
+        },
+    );
+    let baseline = BTreeMap::from([
+        (
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+            },
+        ),
+        (
+            PlayerId(1),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::MyNextTurnStart,
+            },
+        ),
+    ]);
+    state.stack_resolution_session = Some(StackResolutionSession {
+        entries: vec![StackResolutionEntryFence::capture(&entry)],
+        cursor: 0,
+        representatives: [PlayerId(0)].into_iter().collect(),
+        verified_pass_representatives: BTreeSet::new(),
+        budget: StackResolutionBudget::Unlimited,
+        policy: StackResolutionPolicy::Committed,
+        auto_pass_overlay: StackResolutionAutoPassOverlay {
+            baseline: baseline.clone(),
+        },
+    });
+
+    let mut events = Vec::new();
+    crate::game::elimination::eliminate_player(&mut state, PlayerId(0), &mut events);
+
+    assert!(state.stack_resolution_session.is_none());
+    assert!(
+        !state.auto_pass.contains_key(&PlayerId(0)),
+        "the departing seat is cleaned only after the baseline is restored"
+    );
+    assert_eq!(
+        state.auto_pass.get(&PlayerId(1)),
+        baseline.get(&PlayerId(1)),
+        "the survivor's pre-overlay preference is retained"
     );
 }
 

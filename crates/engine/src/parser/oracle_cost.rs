@@ -3,7 +3,7 @@ use nom::bytes::complete::{tag, take_till, take_until};
 use nom::combinator::{all_consuming, map, opt, rest, value};
 use nom::error::ParseError;
 use nom::multi::separated_list1;
-use nom::sequence::{pair, preceded, terminated};
+use nom::sequence::{pair, preceded, separated_pair, terminated};
 use nom::Parser;
 
 use super::oracle_effect::imperative::parse_discard_card_filter;
@@ -37,34 +37,65 @@ pub fn parse_oracle_cost(text: &str) -> AbilityCost {
     let text = text.trim();
     let lower = text.to_lowercase();
 
-    // CR 118.3: Top-level " or " splits the entire cost into alternatives.
-    // E.g., "{3}, {T} or {R}, {T}" → OneOf([Composite([Mana(3), Tap]), Composite([Mana(R), Tap])]).
-    // Must check before comma-splitting so the `or` isn't consumed as part of a segment.
-    // Guard: both sides must contain `{` (mana/tap symbols) to distinguish from
-    // filter phrases like "creature or artifact" inside a Sacrifice cost.
-    if let Ok((_, (before, _after))) = split_once_on(&lower, " or ") {
-        let consumed = before.len();
-        let left_text = &text[..consumed];
-        let right_text = &text[consumed + " or ".len()..];
-        if left_text.contains('{') && right_text.contains('{') {
-            let left = parse_oracle_cost_no_or(left_text);
-            let right = parse_oracle_cost_no_or(right_text);
-            return AbilityCost::OneOf {
-                costs: vec![left, right],
-            };
-        }
-        // CR 118.12a: "Pay {3} or discard a card" — disjunctive verb costs where
-        // only the mana branch carries `{` symbols (Bloodthorn Flail equip).
-        let left = parse_oracle_cost_no_or(left_text);
-        let right = parse_oracle_cost_no_or(right_text);
-        if is_disjunctive_alt_cost(&left) && is_disjunctive_alt_cost(&right) {
-            return AbilityCost::OneOf {
-                costs: vec![left, right],
-            };
-        }
+    if let Some(cost) = parse_oxford_mana_alternatives_nom(&lower)
+        .or_else(|| parse_binary_cost_alternatives_nom(&lower))
+    {
+        return cost;
     }
 
     parse_oracle_cost_no_or(text)
+}
+
+/// CR 118.12: parse exactly two top-level cost alternatives with full input
+/// consumption. Typed-leaf validation prevents noun filters containing "or"
+/// from becoming payment branches.
+fn parse_binary_cost_alternatives_nom(text: &str) -> Option<AbilityCost> {
+    type E<'a> = super::oracle_nom::error::OracleError<'a>;
+    let (_, (left, right)) = all_consuming(separated_pair(
+        take_until::<_, _, E<'_>>(" or "),
+        tag(" or "),
+        rest,
+    ))
+    .parse(text)
+    .ok()?;
+    if left.is_empty()
+        || right.is_empty()
+        || left.trim_end().ends_with(',')
+        || right.trim_end().ends_with(',')
+    {
+        return None;
+    }
+    let costs = vec![
+        parse_oracle_cost_no_or(left),
+        parse_oracle_cost_no_or(right),
+    ];
+    costs
+        .iter()
+        .all(is_disjunctive_alt_cost)
+        .then_some(AbilityCost::OneOf { costs })
+}
+
+/// CR 118.12: parse the exact three-mana Oxford/non-Oxford alternative grammar
+/// used by resolution-time optional payments.
+fn parse_oxford_mana_alternatives_nom(text: &str) -> Option<AbilityCost> {
+    type E<'a> = super::oracle_nom::error::OracleError<'a>;
+    let (_, (mut first, last)) = all_consuming(preceded(
+        opt(tag::<_, _, E<'_>>("pay ")),
+        separated_pair(
+            separated_list1(tag(", "), parse_mana_cost_nom),
+            alt((tag(", or "), tag(" or "))),
+            parse_mana_cost_nom,
+        ),
+    ))
+    .parse(text)
+    .ok()?;
+    first.push(last);
+    (first.len() == 3).then_some(AbilityCost::OneOf {
+        costs: first
+            .into_iter()
+            .map(|cost| AbilityCost::Mana { cost })
+            .collect(),
+    })
 }
 
 /// CR 601.2f: Parse a GERUND-form cost phrase ("discarding a card", "paying 1
@@ -2790,6 +2821,39 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn direct_binary_and_three_way_mana_alternatives_are_full_consuming() {
+        let AbilityCost::OneOf { costs } = parse_oracle_cost("Discard a card or pay {2}") else {
+            panic!("binary alternatives must produce OneOf");
+        };
+        assert_eq!(costs.len(), 2);
+        assert!(matches!(costs[0], AbilityCost::Discard { .. }));
+        assert!(matches!(costs[1], AbilityCost::Mana { .. }));
+
+        for text in ["Pay {G}, {U}, or {R}", "Pay {G}, {U} or {R}"] {
+            let AbilityCost::OneOf { costs } = parse_oracle_cost(text) else {
+                panic!("three-way mana alternatives must produce OneOf: {text}");
+            };
+            assert_eq!(costs.len(), 3);
+            assert!(costs
+                .iter()
+                .all(|cost| matches!(cost, AbilityCost::Mana { .. })));
+        }
+
+        for malformed in [
+            "Pay {G},{U}, or {R}",
+            "Pay {G}, {U},or {R}",
+            "Pay {G}, {U}, or {R},",
+            "Pay {G}, {U}, {R}, or {W}",
+            "Pay {G}, discard a card, or {R}",
+        ] {
+            assert!(
+                !matches!(parse_oracle_cost(malformed), AbilityCost::OneOf { .. }),
+                "malformed alternative list must fail closed: {malformed}"
+            );
+        }
     }
     #[test]
     fn cost_pay_life_equal_to_commanders_color_identity() {

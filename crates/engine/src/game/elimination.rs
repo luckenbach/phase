@@ -153,6 +153,19 @@ pub fn eliminate_players_simultaneously(
         }
     }
 
+    // CR 800.4a: elimination can remove frozen stack entries and a session's
+    // canonical representative. Restore the pre-overlay preferences before
+    // `do_eliminate` removes the departing player's own state, so teardown
+    // cannot later resurrect an eliminated seat's auto-pass preference.
+    if !leaving_set.is_empty() {
+        // CR 117.4 + CR 800.4a: an unmaterialized Resolve All run captures an
+        // exact auto-pass baseline. Restore it while every departing seat's
+        // preference is still present; the established elimination cleanup then
+        // removes only the entries that belong to players leaving the game.
+        super::turn_control::invalidate_resolve_all_consent_for_topology_change(state);
+        super::engine::take_and_restore_stack_resolution_session(state);
+    }
+
     let interrupted_ordinary_search = state
         .pending_scoped_library_search
         .is_none()
@@ -898,11 +911,6 @@ fn do_eliminate(
         state.active_combat_phase_control = None;
         super::turn_control::recompute_active_player_control(state);
     }
-
-    // A consent run freezes canonical representatives and submitters. Player
-    // elimination changes that topology, so discard the run rather than
-    // allowing a stale prompt or Ready state to authorize anyone.
-    super::turn_control::invalidate_resolve_all_consent(state);
 
     // CR 800.4a + CR 800.4b: a departing searcher/zone owner invalidates its
     // live session, while a departing latched controller ends only that

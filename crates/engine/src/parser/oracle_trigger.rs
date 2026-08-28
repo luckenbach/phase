@@ -3469,13 +3469,52 @@ fn reflexive_optional_cost_payable_by_resolution_prompt(cost: &AbilityCost) -> b
                 .all(reflexive_optional_cost_payable_by_resolution_prompt)
                 && costs.iter().any(cost_contains_tap_creatures)
         }
-        // `OneOf` needs an interactive branch-choice prompt before a concrete
-        // branch can be paid. Do not let the generic reflexive splitter mark
-        // those cards supported until that flow exists.
-        AbilityCost::OneOf { .. } => false,
+        AbilityCost::OneOf { costs } => {
+            // CR 608.2d: every offered branch must be a legal choice; CR 118.12:
+            // admission is limited to the exact immediate payment allowlist.
+            costs.len() >= 2 && costs.iter().all(reflexive_optional_direct_cost)
+        }
         AbilityCost::TapCreatures { .. } => true,
-        _ => false,
+        AbilityCost::Mana { .. }
+        | AbilityCost::ManaDynamic { .. }
+        | AbilityCost::Tap
+        | AbilityCost::Untap
+        | AbilityCost::Loyalty { .. }
+        | AbilityCost::Sacrifice(_)
+        | AbilityCost::PayLife { .. }
+        | AbilityCost::Discard { .. }
+        | AbilityCost::Exile { .. }
+        | AbilityCost::ExileMaterials { .. }
+        | AbilityCost::CollectEvidence { .. }
+        | AbilityCost::ExileWithAggregate { .. }
+        | AbilityCost::RemoveCounter { .. }
+        | AbilityCost::PayEnergy { .. }
+        | AbilityCost::PaySpeed { .. }
+        | AbilityCost::ReturnToHand { .. }
+        | AbilityCost::Unattach
+        | AbilityCost::UnattachFrom { .. }
+        | AbilityCost::Mill { .. }
+        | AbilityCost::Exert
+        | AbilityCost::Blight { .. }
+        | AbilityCost::Reveal { .. }
+        | AbilityCost::Behold { .. }
+        | AbilityCost::Waterbend { .. }
+        | AbilityCost::NinjutsuFamily { .. }
+        | AbilityCost::EffectCost { .. }
+        | AbilityCost::PerCounter { .. }
+        | AbilityCost::KeywordCostOfCastSpell { .. }
+        | AbilityCost::GetPlayerCounters { .. }
+        | AbilityCost::Unimplemented { .. } => false,
     }
+}
+
+/// CR 608.2d: every offered branch must be legal; CR 118.12: only exact
+/// resolution-time payment shapes enter this parser family.
+///
+/// Phase-1 structural allowlist for immediate direct payment leaves. Sacrifice
+/// remains an honest strict gap until its replacement-safe resume exists.
+fn reflexive_optional_direct_cost(cost: &AbilityCost) -> bool {
+    crate::game::costs::is_direct_resolution_optional_payment_branch(cost)
 }
 
 fn cost_contains_tap_creatures(cost: &AbilityCost) -> bool {
@@ -5451,6 +5490,10 @@ fn extract_if_condition_with_card_name(
 ) -> (String, Option<TriggerCondition>) {
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
+    // Only a proven self-trigger may use the source-bound "it's on the
+    // battlefield" shorthand. On a non-self zone-change trigger, "it" is
+    // the event object, so the simple source-condition table must not steal it.
+    let source_is_self = matches!(dying_subject, Some(TargetFilter::SelfRef));
 
     // CR 603.4: Only a true intervening-if is hoisted to the trigger-level condition.
     // A trigger-level `if` is one that IMMEDIATELY follows the trigger condition
@@ -5854,6 +5897,7 @@ fn extract_if_condition_with_card_name(
     if let Some(result) = try_extract_simple_condition(
         &tp,
         text,
+        source_is_self,
         &[
             // CR 508.1 / CR 603.4: attacking state.
             ("if it's attacking", TriggerCondition::SourceIsAttacking),
@@ -6262,6 +6306,7 @@ fn extract_if_condition_with_card_name(
         text,
         "if ",
         PostEffectPolicy::DeferIfRehomeable,
+        source_is_self,
         |c| c,
     ) {
         return result;
@@ -6272,6 +6317,7 @@ fn extract_if_condition_with_card_name(
         text,
         " unless ",
         PostEffectPolicy::AlwaysHoist,
+        source_is_self,
         |c| TriggerCondition::Not {
             condition: Box::new(c),
         },
@@ -7340,6 +7386,7 @@ fn try_extract_intervening(
     text: &str,
     keyword: &str,
     policy: PostEffectPolicy,
+    source_is_self: bool,
     wrap: impl FnOnce(TriggerCondition) -> TriggerCondition,
 ) -> Option<(String, Option<TriggerCondition>)> {
     let pos = tp.find(keyword)?;
@@ -7357,7 +7404,21 @@ fn try_extract_intervening(
         // AlwaysHoist, or non-re-homeable: fall through and hoist as before.
     }
     let cond_fragment = &lower[pos + keyword.len()..];
-    let (rest, sc) = parse_inner_condition(cond_fragment).ok()?;
+    // CR 113.6b: the source-bound contraction in a leading intervening-if
+    // ("if it's on the battlefield ...") is not the same generic `it`
+    // anaphor used for an event object elsewhere in a trigger. Normalize only
+    // the source-zone production, then delegate the complete conjunction to
+    // the shared condition grammar. In particular, do not teach the global
+    // self-token parser that bare `it` is a source reference.
+    let normalized_fragment;
+    let condition_input =
+        if let Some(tail) = source_zone_contraction_tail(cond_fragment, source_is_self) {
+            normalized_fragment = format!("this creature is{tail}");
+            normalized_fragment.as_str()
+        } else {
+            cond_fragment
+        };
+    let (rest, sc) = parse_inner_condition(condition_input).ok()?;
     let rest_trimmed = rest.trim();
     let after_dots = rest_trimmed.trim_start_matches('.').trim_start();
     let has_otherwise = tag::<_, _, OracleError<'_>>("otherwise")
@@ -7369,11 +7430,41 @@ fn try_extract_intervening(
         return None;
     }
     let inner = static_condition_to_trigger_condition(&sc)?;
+    // `source_zone_contraction_tail` changes only the consumed subject/copula;
+    // the unconsumed suffix is byte-for-byte the original suffix, so its length
+    // gives the correct span in `cond_fragment` for `strip_condition_clause`.
     let consumed = cond_fragment.len() - rest.len();
     Some((
         strip_condition_clause(text, pos, keyword.len() + consumed),
         Some(wrap(inner)),
     ))
+}
+
+/// Returns the unmodified suffix after a source-bound `it's` / `it’s` only
+/// when it immediately opens a zone predicate. This is deliberately narrower
+/// than a global pronoun rule: an event-object condition such as `if it's a
+/// Goblin` must retain its existing event-subject meaning, and bare `it on ...`
+/// must decline rather than being guessed as the trigger source.
+fn source_zone_contraction_tail(input: &str, source_is_self: bool) -> Option<&str> {
+    if !source_is_self {
+        return None;
+    }
+    let (tail, _) = alt((
+        tag::<_, _, OracleError<'_>>("it's"),
+        tag::<_, _, OracleError<'_>>("it’s"),
+    ))
+    .parse(input)
+    .ok()?;
+    let _ = alt((
+        tag::<_, _, OracleError<'_>>(" on the battlefield"),
+        tag(" in your "),
+        tag(" in the command zone"),
+        tag(" in exile"),
+        tag(" exiled"),
+    ))
+    .parse(tail)
+    .ok()?;
+    Some(tail)
 }
 
 /// CR 702.49a + CR 702.142b: Parse "whenever you activate a [keyword] ability" triggers.
@@ -7874,10 +7965,19 @@ fn try_extract_cast_variant_paid_condition(
 fn try_extract_simple_condition(
     tp: &TextPair<'_>,
     text: &str,
+    source_is_self: bool,
     patterns: &[(&str, TriggerCondition)],
 ) -> Option<(String, Option<TriggerCondition>)> {
     let first_if = tp.find("if "); // allow-noncombinator: structural first-if anchor for trigger-level intervening-if extraction
     for (pattern, condition) in patterns {
+        if !source_is_self
+            && matches!(
+                *pattern,
+                "if it's on the battlefield" | "if it is on the battlefield"
+            )
+        {
+            continue;
+        }
         if let Some(pos) = tp.find(pattern) {
             if Some(pos) != first_if {
                 continue;

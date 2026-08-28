@@ -112,6 +112,14 @@ pub enum UnlessCostBranch {
     Pay { index: usize },
 }
 
+/// CR 118.12: decision for an optional cost paid while an effect resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum ResolutionOptionalPaymentChoice {
+    Decline,
+    Pay { index: usize },
+}
+
 /// CR 400.11 + CR 406.3: One discriminated selection committed for an
 /// outside-game choice. The two source pools (sideboard and face-up exile) are
 /// expressed as parallel variants so the action wire format is uniform.
@@ -551,6 +559,11 @@ pub enum GameAction {
     /// CR 608.2d: Accept or decline an optional effect ("You may X").
     DecideOptionalEffect {
         accept: bool,
+    },
+    /// CR 118.12: decline or choose one server-advertised branch of an optional
+    /// disjunctive cost while an effect resolves.
+    ChooseResolutionOptionalPaymentBranch {
+        choice: ResolutionOptionalPaymentChoice,
     },
     /// CR 702.47a–e: Respond to a `WaitingFor::SpliceOffer`. `Some(card)` splices
     /// that card from hand onto the spell being cast (re-presenting the offer for
@@ -1846,6 +1859,7 @@ impl GameAction {
             | Self::KeepAllCopyTargets
             | Self::ChoosePermanentTypeSlot { .. }
             | Self::DecideOptionalEffect { .. }
+            | Self::ChooseResolutionOptionalPaymentBranch { .. }
             | Self::DecideOptionalEffectAndRemember { .. }
             | Self::PayUnlessCost { .. }
             | Self::ChooseUnlessCostBranch { .. }
@@ -2186,6 +2200,7 @@ impl GameAction {
             | GameAction::KeepAllCopyTargets
             | GameAction::ChoosePermanentTypeSlot { .. }
             | GameAction::DecideOptionalEffect { .. }
+            | GameAction::ChooseResolutionOptionalPaymentBranch { .. }
             | GameAction::DecideOptionalEffectAndRemember { .. }
             | GameAction::PayUnlessCost { .. }
             | GameAction::ChooseUnlessCostBranch { .. }
