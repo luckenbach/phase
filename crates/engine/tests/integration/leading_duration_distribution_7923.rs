@@ -56,8 +56,8 @@ use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
     AbilityDefinition, CastingPermission, ContinuousModification, Duration, Effect,
-    GameRestriction, ManaSpendPermission, PlayerScope, ProhibitedActivity, SubAbilityLink,
-    TargetFilter,
+    GameRestriction, ManaSpendPermission, PlayerScope, ProhibitedActivity, StaticCondition,
+    SubAbilityLink, TargetFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::game_state::{TransientContinuousEffect, WaitingFor};
@@ -81,6 +81,7 @@ const GIANT_OYSTER: &str = "You may choose not to untap this creature during you
 const BELLIGERENT: &str = "Whenever The Belligerent attacks, create a Treasure token. Until end of turn, you may look at the top card of your library any time, and you may play lands and cast spells from the top of your library.\nCrew 3";
 const OPPORTUNISTIC_DRAGON: &str = "Flying\nWhen this creature enters, choose target Human or artifact an opponent controls. For as long as this creature remains on the battlefield, gain control of that permanent, it loses all abilities, and it can't attack or block.";
 const MURDER: &str = "Destroy target creature.";
+const TEMPORAL_APERTURE: &str = "{5}, {T}: Shuffle your library, then reveal the top card. Until end of turn, for as long as that card remains on top of your library, play with the top card of your library revealed and you may play that card without paying its mana cost.";
 const ONE_RING: &str = "Indestructible\nWhen The One Ring enters, if you cast it, you gain protection from everything until your next turn.\nAt the beginning of your upkeep, you lose 1 life for each burden counter on The One Ring.\n{T}: Put a burden counter on The One Ring, then draw a card for each burden counter on The One Ring.";
 const ABEYANCE: &str = "Until end of turn, target player can't cast instant or sorcery spells, and that player can't activate abilities that aren't mana abilities.\nDraw a card.";
 const REVENGE: &str = "Until end of turn, target creature gets +6/+6 and gains trample, and all creatures able to block it this turn do so.\nMiracle {G} (You may cast this card for its miracle cost when you draw it if it's the first card you drew this turn.)";
@@ -545,6 +546,87 @@ fn one_ring_hoisted_keyword_window_reaches_the_embedded_field() {
         ),
         other => panic!("expected GenericEffect, got {other:?}"),
     }
+}
+
+/// **V7 — `[BASE]`, SHAPE.** CR 611.2a (`docs/MagicCompRules.txt:2908`).
+///
+/// Temporal Aperture prints TWO bounds on one permission: an outer "Until end of
+/// turn," and an inner "for as long as that card remains on top of your library".
+/// The engine has no `Duration` that expresses their conjunction — `ForAsLongAs`
+/// carries a condition, never a condition AND a window — and the inner condition
+/// parses to `StaticCondition::Unrecognized`, which nothing can evaluate.
+///
+/// `cast_from_zone::resolve` reads the EMBEDDED duration and never
+/// `ability.duration`, so accepting the unevaluable inner window would MASK the
+/// printed outer bound: nothing would end the permission at end of turn and it
+/// could stay live past it. That is strictly worse than the pre-#7959 behaviour,
+/// which at least expired on time while dropping the condition.
+///
+/// So the shape is STRICT-FAILED. Coverage honesty (CLAUDE.md) requires the gap be
+/// preserved as `Effect::unimplemented` rather than shipping a permission whose
+/// lifetime is wrong; modelling the conjunction needs a new `Duration` variant and
+/// is a serialized-shape change, deliberately out of scope here.
+///
+/// FAILS AT BASE_SHA: there the node is a live `CastFromZone` carrying the
+/// unevaluable window.
+#[test]
+fn temporal_aperture_unevaluable_inner_window_strict_fails() {
+    let parsed = parse_oracle_text(
+        TEMPORAL_APERTURE,
+        "Temporal Aperture",
+        &[],
+        &["Artifact".to_string()],
+        &[],
+    );
+
+    assert_eq!(parsed.abilities.len(), 1, "one activated ability");
+    let links = chain(&parsed.abilities[0]);
+
+    // POSITIVE REACH GUARD: the ability really parsed and the chain really reached
+    // the permission clause. Without this, "no CastFromZone carries an unevaluable
+    // window" would pass vacuously on a card that failed to parse at all — the
+    // canonical vacuous-negative in this file.
+    assert!(
+        links.len() > 1,
+        "the shuffle/reveal chain parsed into multiple links, got {}",
+        links.len()
+    );
+    assert!(
+        links
+            .iter()
+            .any(|d| matches!(&*d.effect, Effect::Shuffle { .. })),
+        "the `Shuffle your library` head still parses — only the permission is gapped"
+    );
+
+    // THE ASSERTION: no surviving `CastFromZone` may carry a lifetime the engine
+    // cannot evaluate. At BASE_SHA the permission node holds
+    // `ForAsLongAs(Unrecognized("that card remains on top of your library"))`.
+    for def in &links {
+        if let Effect::CastFromZone { duration, .. } = &*def.effect {
+            assert!(
+                !matches!(
+                    duration,
+                    Some(Duration::ForAsLongAs {
+                        condition: StaticCondition::Unrecognized { .. }
+                    })
+                ),
+                "CR 611.2a: a CastFromZone whose embedded window is an unevaluable \
+                 condition MASKS the printed outer bound — `cast_from_zone::resolve` \
+                 reads only this field, so the permission never expires. It must be \
+                 strict-failed, not accepted: {duration:?}"
+            );
+        }
+    }
+
+    // And the gap is PRESERVED rather than silently dropped: the clause is still
+    // present as an honest `Effect::Unimplemented` marker, so coverage does not
+    // count this card as supported.
+    assert!(
+        links
+            .iter()
+            .any(|d| matches!(&*d.effect, Effect::Unimplemented { .. })),
+        "the unsupported permission is preserved as a strict-failure marker"
+    );
 }
 
 /// **V-U1g — `[BASE]`, SHAPE.** CR 611.2a (`:2908`); CR 615 is the

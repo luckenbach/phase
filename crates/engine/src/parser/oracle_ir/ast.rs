@@ -2119,6 +2119,32 @@ pub(crate) fn with_clause_duration(
 /// duration-bearing variant whose field DOES have a distinguishable sentinel must
 /// be guarded the same way. (`duration_arms_match_governed_set` pins the 9/5 split.)
 fn apply_duration_to_effect(effect: &mut Effect, duration: &Duration) {
+    // CR 611.2a (`docs/MagicCompRules.txt:2908`) — STRICT-FAIL an unknown lifetime
+    // rather than ship a wrong one. `cast_from_zone::resolve` reads the EMBEDDED
+    // duration and never `ability.duration`, so an inner `ForAsLongAs` whose
+    // condition the engine cannot evaluate MASKS the printed outer bound this
+    // function was called to apply: nothing ends the permission at that bound and it
+    // can stay live past it. Coverage honesty requires preserving the gap as
+    // `Effect::unimplemented` instead (CLAUDE.md, "Coverage honesty").
+    //
+    // SCOPE, measured — this fires ONLY where an outer window is actually being
+    // applied over an unevaluable inner one. The 18 `for as long as ~ remains
+    // exiled` permissions carry no governing prefix, so this function never runs on
+    // them, and they are understood anyway (`is_play_from_exile_lifetime_duration`).
+    // `BecomeCopy` is structurally identical — its embedded field also wins at
+    // `become_copy::resolve` — but has no such node in the corpus today; add it here
+    // if one appears rather than duplicating the rule.
+    let masked = match effect {
+        Effect::CastFromZone {
+            duration: inner, ..
+        } => masked_outer_bound_fragment(inner),
+        _ => None,
+    };
+    if let Some(fragment) = masked {
+        *effect = Effect::unimplemented("cast_from_zone_unevaluable_lifetime", fragment);
+        return;
+    }
+
     match effect {
         // CR 611.2a (`docs/MagicCompRules.txt:2908`): yield to an explicitly written
         // inner duration. The two parser-default sentinels (`None`,
@@ -2358,6 +2384,48 @@ pub(crate) fn is_play_from_exile_lifetime_duration(duration: &Duration) -> bool 
                 | "they remain exiled"
         )
     )
+}
+
+/// The first `Unrecognized` condition text inside a lifetime condition, or `None`
+/// when every leaf is understood.
+///
+/// A `StaticCondition::Unrecognized` is a PARSE-FAILURE MARKER, not a stated
+/// window: nothing downstream can evaluate it. Recurses through `And`/`Or`/`Not`
+/// because the marker nests — `dead man's chest` carries one inside an `And`.
+fn unrecognized_condition_text(condition: &StaticCondition) -> Option<&str> {
+    match condition {
+        StaticCondition::Unrecognized { text } => Some(text.as_str()),
+        StaticCondition::And { conditions } | StaticCondition::Or { conditions } => {
+            conditions.iter().find_map(unrecognized_condition_text)
+        }
+        StaticCondition::Not { condition } => unrecognized_condition_text(condition),
+        _ => None,
+    }
+}
+
+/// CR 611.2a (`docs/MagicCompRules.txt:2908`): the fragment naming an inner lifetime
+/// that MASKS a printed outer window, or `None` when the inner lifetime is either
+/// understood or absent.
+///
+/// "Masks" is literal for an effect whose EMBEDDED duration is the sole runtime
+/// authority: if the inner condition cannot be evaluated, nothing ever ends the
+/// effect at the outer bound the Oracle text printed, so the permission can outlive
+/// it. That is strictly worse than having no inner condition at all, which is why
+/// the shape is strict-failed rather than accepted.
+///
+/// A RECOGNIZED play-from-exile lifetime is NOT masking: it is understood, and
+/// `normalize_play_from_exile_duration` maps it to a real window (CR 400.7i).
+fn masked_outer_bound_fragment(duration: &Option<Duration>) -> Option<String> {
+    let inner = duration.as_ref()?;
+    if is_play_from_exile_lifetime_duration(inner) {
+        return None;
+    }
+    match inner {
+        Duration::ForAsLongAs { condition } => {
+            unrecognized_condition_text(condition).map(str::to_owned)
+        }
+        _ => None,
+    }
 }
 
 fn normalize_play_from_exile_duration(duration: Duration) -> Duration {
