@@ -81,6 +81,7 @@ const GIANT_OYSTER: &str = "You may choose not to untap this creature during you
 const BELLIGERENT: &str = "Whenever The Belligerent attacks, create a Treasure token. Until end of turn, you may look at the top card of your library any time, and you may play lands and cast spells from the top of your library.\nCrew 3";
 const OPPORTUNISTIC_DRAGON: &str = "Flying\nWhen this creature enters, choose target Human or artifact an opponent controls. For as long as this creature remains on the battlefield, gain control of that permanent, it loses all abilities, and it can't attack or block.";
 const MURDER: &str = "Destroy target creature.";
+const ONE_RING: &str = "Indestructible\nWhen The One Ring enters, if you cast it, you gain protection from everything until your next turn.\nAt the beginning of your upkeep, you lose 1 life for each burden counter on The One Ring.\n{T}: Put a burden counter on The One Ring, then draw a card for each burden counter on The One Ring.";
 const ABEYANCE: &str = "Until end of turn, target player can't cast instant or sorcery spells, and that player can't activate abilities that aren't mana abilities.\nDraw a card.";
 const REVENGE: &str = "Until end of turn, target creature gets +6/+6 and gains trample, and all creatures able to block it this turn do so.\nMiracle {G} (You may cast this card for its miracle cost when you draw it if it's the first card you drew this turn.)";
 
@@ -466,6 +467,83 @@ fn xanathar_unset_cast_window_still_takes_the_leading_duration() {
              the play permission is never pruned"
         ),
         other => panic!("expected CastFromZone, got {other:?}"),
+    }
+}
+
+/// **V6 — `[GUARD:no-injected-default]`, SHAPE.** CR 611.2a
+/// (`docs/MagicCompRules.txt:2908`).
+///
+/// **ANCHORED AGAINST REINTRODUCING AN INJECTED DEFAULT, NOT AGAINST BASE_SHA — it
+/// passes at BASE_SHA and is a POSITIVE REACH GUARD, not a discriminator.** The
+/// named removal that turns it red: restoring
+/// `let duration = duration.or(Some(Duration::UntilEndOfTurn));` in
+/// `oracle_effect::imperative::try_parse_gain_keyword`.
+///
+/// `try_parse_gain_keyword` calls `strip_trailing_duration` FIRST, so for this card
+/// the printed "until your next turn" is hoisted onto the CARRIER and the
+/// recognizer's own `duration` is left `None`. Injecting `UntilEndOfTurn` there
+/// mints a value BYTE-IDENTICAL to a printed one, so
+/// `oracle_ir::ast::duration_is_unset_sentinel` can no longer classify the embedded
+/// field as unset, the distribution declines, and the embedded window permanently
+/// disagrees with the printed text.
+///
+/// Measured against the corpus: that injection moved 6 nodes across 5 cards — The
+/// One Ring, A-The One Ring, The Stasis Coffin, Noble Heritage (x2) and Blossoming
+/// Calm — from the printed `UntilNextTurnOf { Controller }` to `UntilEndOfTurn`.
+///
+/// **SCOPE — THIS TEST MAKES NO RUNTIME CLAIM, DELIBERATELY.**
+/// `game/effects/effect.rs` resolves `ability.duration.or(embedded)`, so the
+/// CARRIER wins and the INSTALLED window is correct either way. What this row
+/// guards is EXPORTED PROVENANCE — card-data, the coverage report, the semantic
+/// audit and the client's parse overlay all read the embedded field.
+#[test]
+fn one_ring_hoisted_keyword_window_reaches_the_embedded_field() {
+    let parsed = parse_oracle_text(
+        ONE_RING,
+        "The One Ring",
+        &[],
+        &["Legendary".to_string(), "Artifact".to_string()],
+        &[],
+    );
+
+    let printed = Duration::UntilNextTurnOf {
+        player: PlayerScope::Controller,
+    };
+
+    // Positive reach guard: the protection trigger parsed at all, and is found by
+    // SHAPE rather than by index so an added/reordered trigger cannot silently make
+    // the assertion below vacuous.
+    let grant = parsed
+        .triggers
+        .iter()
+        .map(trigger_body)
+        .flat_map(|body| chain(body).into_iter())
+        .find(|d| matches!(&*d.effect, Effect::GenericEffect { .. }))
+        .expect("the `you gain protection from everything until your next turn` grant");
+    assert_no_unimplemented(&[grant], "The One Ring");
+
+    // Positive reach guard: the hoist actually happened — the printed window is on
+    // the carrier. Without this, the embedded assertion could pass on a clause that
+    // never routed through `strip_trailing_duration` at all.
+    assert_eq!(
+        grant.duration.as_ref(),
+        Some(&printed),
+        "the printed `until your next turn` is hoisted onto the carrier"
+    );
+
+    // THE ASSERTION THE NAMED REMOVAL TURNS RED: the embedded field is unset when
+    // the distribution runs, so the printed window must be written into it. With
+    // the injected default restored it reads `UntilEndOfTurn` and contradicts the
+    // card's printed text.
+    match &*grant.effect {
+        Effect::GenericEffect { duration, .. } => assert_eq!(
+            duration.as_ref(),
+            Some(&printed),
+            "CR 611.2a: the embedded window must be the PRINTED `until your next turn`; \
+             an injected `UntilEndOfTurn` default in `try_parse_gain_keyword` is \
+             indistinguishable from a printed one and strands the real window"
+        ),
+        other => panic!("expected GenericEffect, got {other:?}"),
     }
 }
 

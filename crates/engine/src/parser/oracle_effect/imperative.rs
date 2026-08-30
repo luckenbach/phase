@@ -6885,8 +6885,14 @@ fn try_parse_gain_keyword(text: &str) -> Option<Effect> {
         return None;
     }
 
-    // Default duration: UntilEndOfTurn for keyword granting sub-abilities
-    let duration = duration.or(Some(Duration::UntilEndOfTurn));
+    // CR 611.2a (`docs/MagicCompRules.txt:2908`): do NOT inject a default window
+    // here. `None` must stay a true unset sentinel so a window this clause's own
+    // recognizer already hoisted onto the carrier can distribute into the embedded
+    // field (`oracle_ir::ast::duration_is_unset_sentinel`). An injected
+    // `UntilEndOfTurn` is byte-identical to a PRINTED one, so the distribution rule
+    // cannot tell them apart and declines, stranding the printed window. The single
+    // authority for the fallback is the resolver (`game/effects/effect.rs`), which
+    // already applies `.unwrap_or(Duration::UntilEndOfTurn)`.
 
     Some(Effect::GenericEffect {
         static_abilities: vec![StaticDefinition::continuous()
