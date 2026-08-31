@@ -2027,6 +2027,123 @@ pub(crate) fn duration_is_unset_sentinel(duration: &Option<Duration>) -> bool {
     duration.is_none() || matches!(duration, Some(Duration::Permanent))
 }
 
+/// CR 608.2c + CR 611.2a: The honest gap a duration reconciliation emits when it
+/// would otherwise drop a printed batch bound.
+///
+/// Every reconciliation seam (`with_clause_duration`, `reconcile_coordinated_cast`,
+/// and the trailing-duration fixup in `oracle_effect/mod.rs`) builds its refusal
+/// here, so all three name the same gap and carry the same diagnostic. The
+/// description records the bound that was about to be lost rather than an Oracle
+/// fragment, because these seams run after lowering and no longer hold the source
+/// text — and the bound is the load-bearing fact for anyone auditing the gap.
+pub(crate) fn cast_bound_lost_to_duration_gap(
+    bounds: crate::types::ability::ResolutionCastWindow,
+) -> Effect {
+    Effect::unimplemented(
+        crate::types::ability::CAST_BOUND_LOST_TO_DURATION_GAP,
+        format!(
+            "cast bound the duration-scoped lingering permission cannot carry: {}",
+            bounds.describe_bound()
+        ),
+    )
+}
+
+/// CR 611.2a + CR 608.2g + CR 608.2c: Carry a sentence's LEADING duration onto a
+/// later coordinated clause of that same sentence.
+///
+/// A leading duration scopes the whole coordinated predicate it introduces, not
+/// just its first conjunct. Magus of the Mind prints "Until end of turn, you may
+/// play lands **and** cast spells from among cards exiled this way without paying
+/// their mana costs": one duration, two coordinated instructions.
+/// `split_clause_sequence` cuts that sentence into the chunks
+/// `"Until end of turn, you may play lands"` (boundary `Comma`) and
+/// `"cast spells from among cards exiled this way without paying their mana
+/// costs"`, so `with_clause_duration` — which only ever sees the chunk the
+/// duration was printed on — reconciles the FIRST of the two and nothing else.
+/// The cast half was then lowered from a fragment in which no duration token is
+/// visible at any position, so `from_among_batch_cast_driver`'s in-clause scan
+/// could not see one either, and the card became a resolution-scoped window
+/// although its own rulings state the opposite ("You must follow the normal
+/// timing permissions and restrictions for cards you cast this way" / "Any of the
+/// cards you don't play will remain in exile") — the lingering signature.
+///
+/// The sentence-scoped grouping is the same one CR 107.3i's `where X is` binding
+/// uses (`compute_sentence_leading_duration` / `compute_sentence_where_x`), so
+/// the two cannot drift apart on what "the same sentence" means.
+///
+/// Scoped narrowly to `Effect::CastFromZone`, because that is the only effect
+/// whose *mechanism* (`CastFromZoneDriver`) is decided from the local clause
+/// fragment and therefore cannot see the sentence head. Every other effect either
+/// carries its own duration slot (stamped by `with_clause_duration` on the chunk
+/// that printed the duration) or is instantaneous, and blanket-stamping a
+/// duration onto arbitrary later chunks would change effects the coordination
+/// does not scope.
+pub(crate) fn apply_sentence_duration_to_coordinated_casts(
+    clause: &mut ParsedEffectClause,
+    duration: &Duration,
+) {
+    reconcile_coordinated_cast(&mut clause.effect, &mut clause.duration, duration);
+    if let Some(sub) = clause.sub_ability.as_deref_mut() {
+        apply_sentence_duration_to_coordinated_cast_defs(sub, duration);
+    }
+}
+
+/// The `AbilityDefinition` half of the walk: a clause's compound-"and" remainder
+/// belongs to the same printed sentence, so the same duration scopes it.
+fn apply_sentence_duration_to_coordinated_cast_defs(
+    def: &mut AbilityDefinition,
+    duration: &Duration,
+) {
+    let (effect, def_duration) = (def.effect.as_mut(), &mut def.duration);
+    reconcile_coordinated_cast(effect, def_duration, duration);
+    if let Some(next) = def.sub_ability.as_deref_mut() {
+        apply_sentence_duration_to_coordinated_cast_defs(next, duration);
+    }
+    if let Some(alt) = def.else_ability.as_deref_mut() {
+        apply_sentence_duration_to_coordinated_cast_defs(alt, duration);
+    }
+}
+
+/// CR 611.2a: stamp the sentence's duration on one cast grant and reconcile its
+/// mechanism with it. A duration the clause stated for ITSELF always wins.
+fn reconcile_coordinated_cast(
+    effect: &mut Effect,
+    node_duration: &mut Option<Duration>,
+    duration: &Duration,
+) {
+    let Effect::CastFromZone {
+        duration: effect_duration,
+        driver,
+        ..
+    } = effect
+    else {
+        return;
+    };
+    // CR 611.2a: the permission expires with the stated duration rather than
+    // standing indefinitely (`duration: None` on this grant means "castable until
+    // the cards leave exile").
+    if effect_duration.is_none() {
+        *effect_duration = Some(duration.clone());
+    }
+    if node_duration.is_none() {
+        *node_duration = Some(duration.clone());
+    }
+    // CR 611.2a + CR 608.2g: a stated duration means the controller casts at a
+    // LATER priority window, which is the defining property of a lingering
+    // permission — so a resolution-scoped window degrades back to one. Same
+    // authority `with_clause_duration` uses for the single-chunk case, including
+    // its refusal: a sentence-leading duration that reaches a coordinated cast
+    // conjunct whose window printed a cast cap or a CR 202.3 running-total
+    // budget cannot silently drop it into a countless per-object permission.
+    match driver.with_lingering_duration() {
+        Some(reconciled) => *driver = reconciled,
+        None => {
+            let bounds = driver.window_bounds().unwrap_or_default();
+            *effect = cast_bound_lost_to_duration_gap(bounds);
+        }
+    }
+}
+
 pub(crate) fn with_clause_duration(
     mut clause: ParsedEffectClause,
     duration: Duration,
@@ -2119,32 +2236,12 @@ pub(crate) fn with_clause_duration(
 /// duration-bearing variant whose field DOES have a distinguishable sentinel must
 /// be guarded the same way. (`duration_arms_match_governed_set` pins the 9/5 split.)
 fn apply_duration_to_effect(effect: &mut Effect, duration: &Duration) {
-    // CR 611.2a (`docs/MagicCompRules.txt:2908`) — STRICT-FAIL an unknown lifetime
-    // rather than ship a wrong one. `cast_from_zone::resolve` reads the EMBEDDED
-    // duration and never `ability.duration`, so an inner `ForAsLongAs` whose
-    // condition the engine cannot evaluate MASKS the printed outer bound this
-    // function was called to apply: nothing ends the permission at that bound and it
-    // can stay live past it. Coverage honesty requires preserving the gap as
-    // `Effect::unimplemented` instead (CLAUDE.md, "Coverage honesty").
-    //
-    // SCOPE, measured — this fires ONLY where an outer window is actually being
-    // applied over an unevaluable inner one. The 18 `for as long as ~ remains
-    // exiled` permissions carry no governing prefix, so this function never runs on
-    // them, and they are understood anyway (`is_play_from_exile_lifetime_duration`).
-    // `BecomeCopy` is structurally identical — its embedded field also wins at
-    // `become_copy::resolve` — but has no such node in the corpus today; add it here
-    // if one appears rather than duplicating the rule.
-    let masked = match effect {
-        Effect::CastFromZone {
-            duration: inner, ..
-        } => masked_outer_bound_fragment(inner),
-        _ => None,
-    };
-    if let Some(fragment) = masked {
-        *effect = Effect::unimplemented("cast_from_zone_unevaluable_lifetime", fragment);
-        return;
-    }
-
+    // Both gap outcomes are recorded here and applied AFTER the match, so the
+    // borrow of `*effect` taken by the arms has ended before it is replaced.
+    // CR 608.2c (#8174): the printed cast bound the selected driver cannot carry.
+    let mut refused_bound: Option<crate::types::ability::ResolutionCastWindow> = None;
+    // CR 611.2a (#7959): the inner lifetime condition the engine cannot evaluate.
+    let mut unevaluable_lifetime: Option<String> = None;
     match effect {
         // CR 611.2a (`docs/MagicCompRules.txt:2908`): yield to an explicitly written
         // inner duration. The two parser-default sentinels (`None`,
@@ -2200,11 +2297,40 @@ fn apply_duration_to_effect(effect: &mut Effect, duration: &Duration) {
         } => {
             *perm_dur = normalize_play_from_exile_duration(duration.clone());
         }
+        // RECONCILED SEAM (#7959 x #8174). Both rules live here and neither is
+        // allowed to shadow the other; the ORDER below is the reconciliation:
+        //
+        //  1. CR 608.2g driver reconciliation (current main, #8174) runs
+        //     UNCONDITIONALLY and FIRST. A leading duration states that the
+        //     permission is exercised at a later priority window, which is the
+        //     defining property of a lingering permission — that judgement is about
+        //     the DRIVER and is independent of whatever this PR's guard later
+        //     decides about the embedded window. Running it first preserves #8174's
+        //     behaviour exactly, including its CR 608.2c refusal.
+        //  2. CR 611.2a strict-fail (#7959) for an inner lifetime the engine cannot
+        //     evaluate — see `masked_outer_bound_fragment`.
+        //  3. CR 611.2a guarded write (#7959): an explicitly printed embedded window
+        //     survives; only the unset sentinels take the governing prefix.
+        //
+        // PRECEDENCE when both 1 and 2 would gap the node: main's bound-refusal
+        // wins. It names the specific bound that was lost, which strictly dominates
+        // this PR's "lifetime not understood" as a diagnostic.
         Effect::CastFromZone {
             duration: ref mut effect_duration,
+            ref mut driver,
             ..
-        } if duration_is_unset_sentinel(effect_duration) => {
-            *effect_duration = Some(duration.clone());
+        } => {
+            match driver.with_lingering_duration() {
+                Some(reconciled) => *driver = reconciled,
+                None => refused_bound = Some(driver.window_bounds().unwrap_or_default()),
+            }
+            if refused_bound.is_none() {
+                if let Some(fragment) = masked_outer_bound_fragment(effect_duration) {
+                    unevaluable_lifetime = Some(fragment);
+                } else if duration_is_unset_sentinel(effect_duration) {
+                    *effect_duration = Some(duration.clone());
+                }
+            }
         }
         // Same rule as the siblings above, asked through the shared authority: see
         // `duration_is_unset_sentinel`.
@@ -2265,6 +2391,13 @@ fn apply_duration_to_effect(effect: &mut Effect, duration: &Duration) {
             }
         }
         _ => {}
+    }
+    // Applied in precedence order: main's specific bound-refusal dominates this
+    // PR's generic "lifetime not understood" gap when both fire.
+    if let Some(bounds) = refused_bound {
+        *effect = cast_bound_lost_to_duration_gap(bounds);
+    } else if let Some(fragment) = unevaluable_lifetime {
+        *effect = Effect::unimplemented("cast_from_zone_unevaluable_lifetime", fragment);
     }
 }
 
@@ -2639,6 +2772,47 @@ mod duration_distribution_tests_7923 {
         }
     }
 
+    /// `cast_from_zone` with an explicit driver, for the reconciled-seam rows.
+    fn cast_from_zone_driven(
+        duration: Option<Duration>,
+        driver: crate::types::ability::CastFromZoneDriver,
+    ) -> Effect {
+        match cast_from_zone(duration) {
+            Effect::CastFromZone {
+                target,
+                without_paying_mana_cost,
+                mode,
+                cast_transformed,
+                alt_ability_cost,
+                constraint,
+                duration,
+                mana_spend_permission,
+                ..
+            } => Effect::CastFromZone {
+                target,
+                without_paying_mana_cost,
+                mode,
+                cast_transformed,
+                alt_ability_cost,
+                constraint,
+                duration,
+                driver,
+                mana_spend_permission,
+            },
+            other => other,
+        }
+    }
+
+    /// The gap name a clause was replaced by, or `None` if it is not a gap.
+    /// Destructuring is permitted by `check-parser-combinators.sh`; only
+    /// hand-CONSTRUCTED `Effect::Unimplemented` literals are forbidden.
+    fn gap_name(effect: &Effect) -> Option<&str> {
+        match effect {
+            Effect::Unimplemented { name, .. } => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
     fn become_copy(duration: Option<Duration>) -> Effect {
         Effect::BecomeCopy {
             target: TargetFilter::Any,
@@ -2707,6 +2881,115 @@ mod duration_distribution_tests_7923 {
     /// Apply the stamp to a clone and report whether the EMBEDDED field moved.
     fn stamped(effect: &Effect) -> Effect {
         stamped_with(effect, &outer())
+    }
+
+    /// **RECONCILED SEAM (#7959 x #8174) — `[NEW-UNIT]`, COMPOSITION.**
+    /// CR 608.2c (`docs/MagicCompRules.txt:2797`) + CR 611.2a (`:2908`).
+    ///
+    /// The `CastFromZone` arm now carries TWO independent gap rules that can fire on
+    /// the same node, and the ORDER between them is a decision, not an accident. This
+    /// row is the only thing that pins it: every other test in this file and in
+    /// `invoke_calamity_free_cast` passes under EITHER order, because each exercises
+    /// just one of the two.
+    ///
+    /// REVERT-FAILING IN THREE DIRECTIONS. Measured, not asserted — each mutation was
+    /// applied to `apply_duration_to_effect` and the row that actually went red
+    /// recorded, because a "revert-failing" annotation that does not match measured
+    /// behaviour is the defect this file's header says was found three times already:
+    ///
+    /// * SWAP the two steps  -> ROW 1 red. The node is still gapped, and the whole
+    ///   rest of the suite stays green; it is gapped under the WRONG NAME, losing the
+    ///   specific bound that was dropped. Nothing else in the tree catches this.
+    /// * DELETE step 2 (this PR's strict-fail) -> ROW 2 red. Row 1 stays green,
+    ///   because the refusal still wins there and still names the bound.
+    /// * DELETE step 1 (current main's refusal) -> ROW 1 red, NOT row 3. The
+    ///   both-fire node gaps as `cast_from_zone_unevaluable_lifetime`, and row 1
+    ///   asserts before row 3 is ever reached — so row 3's status under that mutation
+    ///   was NOT observed, and this comment does not claim it.
+    ///
+    /// PRECEDENCE, and why: current-main's bound-refusal wins. It names the bound the
+    /// selected mechanism could not carry, which strictly dominates this PR's generic
+    /// "inner lifetime not understood" as a diagnostic for the same node.
+    ///
+    /// Rows are constructed directly because NO CARD supplies both shapes at once — a
+    /// refusable batch bound AND an unevaluable inner lifetime. That is exactly why
+    /// the composition needs a unit row: the corpus cannot discriminate it.
+    #[test]
+    fn reconciled_cast_seam_refuses_the_bound_before_gapping_the_lifetime() {
+        use crate::types::ability::{
+            CastFromZoneDriver, ResolutionCastWindow, CAST_BOUND_LOST_TO_DURATION_GAP,
+        };
+
+        let refusable = CastFromZoneDriver::ResolutionWindow {
+            bounds: ResolutionCastWindow {
+                max_casts: Some(1),
+                max_total_mv: None,
+            },
+        };
+        let unevaluable = Some(Duration::ForAsLongAs {
+            condition: StaticCondition::Unrecognized {
+                text: "that card remains on top of your library".to_string(),
+            },
+        });
+
+        // ROW 1 — BOTH rules fire. The ordering assertion.
+        let both = stamped_with(
+            &cast_from_zone_driven(unevaluable.clone(), refusable),
+            &outer(),
+        );
+        assert_eq!(
+            gap_name(&both),
+            Some(CAST_BOUND_LOST_TO_DURATION_GAP),
+            "CR 608.2c: the bound-refusal runs FIRST and names the lost bound; \
+             reordering gaps this node as an unevaluable lifetime and loses that fact"
+        );
+
+        // ROW 2 — only this PR's rule applies: the driver reconciles cleanly, so the
+        // unevaluable inner lifetime is what gaps the node.
+        let lifetime_only = stamped_with(
+            &cast_from_zone_driven(unevaluable, CastFromZoneDriver::LingeringPermission),
+            &outer(),
+        );
+        assert_eq!(
+            gap_name(&lifetime_only),
+            Some("cast_from_zone_unevaluable_lifetime"),
+            "CR 611.2a: an inner lifetime the engine cannot evaluate still gaps the node \
+             when the driver had no bound to refuse"
+        );
+
+        // ROW 3 — only current-main's rule applies: unset inner window, refusable bound.
+        let bound_only = stamped_with(&cast_from_zone_driven(None, refusable), &outer());
+        assert_eq!(
+            gap_name(&bound_only),
+            Some(CAST_BOUND_LOST_TO_DURATION_GAP),
+            "CR 608.2c: the refusal does not depend on this PR's guard declining"
+        );
+
+        // ROW 4 — PAIRED POSITIVE REACH GUARD: neither rule fires, so the node is NOT
+        // gapped, the driver is reconciled, and the governing window is written.
+        // Without this the three rows above would pass on a seam that gaps everything.
+        let ok = stamped_with(
+            &cast_from_zone_driven(None, CastFromZoneDriver::LingeringPermission),
+            &outer(),
+        );
+        assert_eq!(
+            gap_name(&ok),
+            None,
+            "reach guard: a clean node is not gapped"
+        );
+        match &ok {
+            Effect::CastFromZone {
+                duration, driver, ..
+            } => {
+                assert_eq!(duration.as_ref(), Some(&outer()), "the window is written");
+                assert_eq!(
+                    driver,
+                    &CastFromZoneDriver::LingeringPermission,
+                    "CR 608.2g: the driver is reconciled, not refused"
+                );
+            }
+            other => panic!("expected CastFromZone, got {other:?}"),
+        }
     }
 
     /// **V-U1e — `[NEW-UNIT]`.** CR 611.2a (`docs/MagicCompRules.txt:2908`).
