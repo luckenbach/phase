@@ -23002,7 +23002,18 @@ fn cant_be_activated_effect_standalone_targets_creature() {
             duration,
             end_cost: _,
         } => {
-            assert_eq!(*duration, Some(Duration::UntilEndOfTurn));
+            // CR 611.2a (`docs/MagicCompRules.txt:2908`): this sentence states NO
+            // window of its own, so the AST must say so. The recognizer used to
+            // inject `Some(UntilEndOfTurn)` here, indistinguishable from a printed
+            // window, which blocked an enclosing sentence's duration from reaching
+            // the clause — Dovin Baan, Edifice of Authority and Mythos of Vadrok each
+            // print "until your next turn" and had this prohibition end a turn early.
+            //
+            // RUNTIME IS UNCHANGED for this standalone form: both carriers are now
+            // `None`, and `game/effects/effect.rs` resolves
+            // `ability.duration.or(embedded).unwrap_or(UntilEndOfTurn)` to the same
+            // window the injection hard-coded.
+            assert_eq!(*duration, None);
             assert_eq!(static_abilities.len(), 1);
             let sd = &static_abilities[0];
             assert!(
