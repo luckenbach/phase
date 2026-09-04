@@ -2739,6 +2739,11 @@ mod duration_distribution_tests_7923 {
     fn play_from_exile_permission(duration: Duration) -> CastingPermission {
         CastingPermission::PlayFromExile {
             duration,
+            // #8180 widened this variant. A duration fixture models a plain cast
+            // permission with no alternative cost, matching the parser's own
+            // play-from-exile construction in `oracle_effect/mod.rs`.
+            mode: CardPlayMode::Cast,
+            alt_ability_cost: None,
             granted_to: crate::types::player::PlayerId(0),
             frequency: crate::types::statics::CastFrequency::Unlimited,
             source_id: None,

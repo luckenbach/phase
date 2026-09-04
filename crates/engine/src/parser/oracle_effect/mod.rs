@@ -32363,8 +32363,13 @@ pub(crate) fn parse_effect_chain_ir(
     // not by itself cover the two durations #8180 added. The deletion still stands
     // because `expand_leading_duration_chunks` keys on ANY leading duration rather than
     // an enumerated set, so the widening is already inside its domain — but that is an
-    // argument from the pre-pass's shape, and the corpus check for the two added
-    // durations is recorded in the PR body for #7959, not asserted here.
+    // argument from the pre-pass's shape. OBSERVED at this merge: Opportunistic
+    // Dragon's "For as long as this creature remains on the battlefield" now parses
+    // to `WhileHostOnBattlefield` — one of the two durations #8180 added — and the
+    // pre-pass still produces it, on the head clause and on both recovered riders
+    // (`leading_host_lifetime_gate_is_subsumed`). So the widened predicate has a live
+    // corpus member and the deletion holds for it. The full per-duration count is in
+    // the PR body for #7959.
     let full_text = text; // bind AFTER the strip so diagnostics track the parsed chunks
     ctx.effect_chain_full_lower = Some(full_text.to_ascii_lowercase());
     // CR 608.2c: A tracked-set source-zone binding is scoped to the chain that

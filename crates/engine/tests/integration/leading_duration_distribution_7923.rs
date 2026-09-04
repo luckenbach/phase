@@ -1042,7 +1042,12 @@ fn leading_host_lifetime_gate_is_subsumed() {
         .expect("the GainControl head");
     assert_eq!(
         gain.duration,
-        Some(Duration::UntilHostLeavesPlay),
+        // #8180 retyped "remains on the battlefield" from `UntilHostLeavesPlay` to
+        // `WhileHostOnBattlefield`; both answer `ends_when_host_leaves_play`, so the
+        // lifetime is unchanged and only the typed value moved. This row still pins
+        // that the PRE-PASS produced a duration here at all -- which is the claim the
+        // deleted `leading_host_lifetime_split` gate used to carry.
+        Some(Duration::WhileHostOnBattlefield),
         "the printed `For as long as this creature remains on the battlefield`"
     );
 
@@ -1059,7 +1064,7 @@ fn leading_host_lifetime_gate_is_subsumed() {
     for r in &riders {
         assert_eq!(
             r.duration,
-            Some(Duration::UntilHostLeavesPlay),
+            Some(Duration::WhileHostOnBattlefield),
             "every recovered rider carries the printed host-lifetime duration"
         );
         for s in statics_of(&r.effect) {
@@ -1462,7 +1467,9 @@ fn opportunistic_dragon_riders_bind_stolen_permanent() {
     );
 }
 
-/// **V-U2a (b) — `[BASE]`, RUNTIME.** CR 611.2a: `UntilHostLeavesPlay`.
+/// **V-U2a (b) — `[BASE]`, RUNTIME.** CR 611.2a: `WhileHostOnBattlefield`
+/// (retyped from `UntilHostLeavesPlay` by #8180; same `ends_when_host_leaves_play`
+/// boundary).
 ///
 /// All three effects share ONE printed duration, so they must expire TOGETHER
 /// when the Dragon leaves the battlefield. At BASE_SHA only `GainControl` exists,
