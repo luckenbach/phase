@@ -1,4 +1,4 @@
-import { Suspense, useState } from "react";
+import { Suspense, useRef, useState } from "react";
 import { Link, Outlet, useLocation } from "react-router";
 import { useTranslation } from "react-i18next";
 
@@ -29,12 +29,14 @@ export function AppShell() {
   // The shell owns settings-modal state so the rail's Settings button and the
   // (controlled) ChromeControls cog share one PreferencesModal instance.
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsReturnFocusRef = useRef<HTMLButtonElement>(null);
 
   // "What's New": the unread dot lives on the rail, the modal is shell-owned.
   const [whatsNewOpen, setWhatsNewOpen] = useState(false);
   const [draftChromeConfig, setDraftChromeConfig] = useState<DraftShellChromeConfig>({ mode: "default" });
-  const { mode: draftChromeMode, phoneAction, showProgress = true } = draftChromeConfig;
+  const { mode: draftChromeMode, phoneAction, showProgress = true, topActions = [] } = draftChromeConfig;
   const phoneDraftChrome = draftChromeMode === "phone-drafting" || draftChromeMode === "phone-deckbuilding";
+  const draftTopRowChrome = phoneDraftChrome || draftChromeMode === "tablet-drafting";
   const responsiveDraftChrome = draftChromeMode !== "default";
   const shellDraftPhase = draftChromeMode === "phone-deckbuilding" || draftChromeMode === "tablet-deckbuilding"
     ? "deckbuilding"
@@ -82,7 +84,10 @@ export function AppShell() {
         <div className={`relative z-10 flex ${responsiveDraftChrome ? "h-full min-h-0" : "min-h-screen"}`}>
           {!phoneDraftChrome && (
             <Rail
-              onSettings={() => setSettingsOpen(true)}
+              onSettings={(launcher) => {
+                settingsReturnFocusRef.current = launcher;
+                setSettingsOpen(true);
+              }}
               onWhatsNew={openWhatsNew}
               hasUnread={changelog.hasUnread}
             />
@@ -95,7 +100,7 @@ export function AppShell() {
               ? "sticky top-0 z-30 flex min-h-[calc(env(safe-area-inset-top)+52px)] items-center gap-2 px-2 pb-1 pt-[calc(env(safe-area-inset-top)+1rem)]"
               : "sticky top-0 z-30 flex min-h-[calc(env(safe-area-inset-top)+44px)] items-center px-2 pb-1 pt-[calc(env(safe-area-inset-top)+0.5rem)] min-[820px]:min-h-[calc(env(safe-area-inset-top)+56px)] min-[820px]:px-4 min-[820px]:pt-[calc(env(safe-area-inset-top)+0.75rem)]"}
             >
-              {phoneDraftChrome && (
+              {draftTopRowChrome && (
                 <>
                   <Link
                     to="/"
@@ -117,6 +122,24 @@ export function AppShell() {
                       {phoneAction.icon}
                     </button>
                   )}
+                  {topActions.map((action) => (
+                    <button
+                      key={action.id}
+                      type="button"
+                      data-draft-top-action={action.id}
+                      onClick={action.onClick}
+                      disabled={action.disabled}
+                      aria-label={action.label}
+                      title={action.label}
+                      className={`relative z-10 flex min-h-11 shrink-0 items-center justify-center rounded-[8px] border px-2 text-[10px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${action.tone === "danger"
+                        ? "border-rose-400/35 bg-rose-950/45 text-rose-200 hover:border-rose-300/55"
+                        : action.tone === "emerald"
+                          ? "border-emerald-400/35 bg-emerald-950/45 text-emerald-200 hover:border-emerald-300/55"
+                          : "border-hairline bg-black/45 text-fg-muted hover:border-white/15 hover:bg-slate-950"}`}
+                    >
+                      {action.label}
+                    </button>
+                  ))}
                 </>
               )}
               {responsiveDraftChrome && showProgress ? (
@@ -159,6 +182,7 @@ export function AppShell() {
         <ChromeControls
           settingsOpen={settingsOpen}
           onSettingsOpenChange={setSettingsOpen}
+          settingsReturnFocusRef={settingsReturnFocusRef}
           hideVolume={phoneDraftChrome}
           hideLanguage={phoneDraftChrome}
         />

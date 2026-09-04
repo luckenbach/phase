@@ -44,11 +44,13 @@ function viewFor(
   return {
     status,
     kind: "Premier",
+    launch_capability: "None",
     current_pack_number: 3,
     pick_number: 14,
     pass_direction: "Left",
     current_pack: null,
     required_pick_count: 0,
+    pick_selection_mode: "Direct",
     pool: [],
     draft_effects: [],
     pool_groups: EMPTY_DRAFT_POOL_GROUPS,

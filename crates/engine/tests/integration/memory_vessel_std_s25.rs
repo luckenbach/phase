@@ -24,14 +24,15 @@
 use engine::game::ability_utils::build_resolved_from_def;
 use engine::game::casting::spell_objects_available_to_cast;
 use engine::game::effects::resolve_ability_chain;
-use engine::game::layers::prune_until_next_turn_casting_permissions;
+use engine::game::layers::prune_untap_step_casting_permissions;
 use engine::game::scenario::GameScenario;
 use engine::game::zones::create_object;
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
-    AbilityDefinition, AbilityKind, ActivationRestriction, CastingPermission, Duration, Effect,
-    GameRestriction, PermissionGrantee, PlayerFilter, PlayerScope, ProhibitedActivity,
-    QuantityExpr, RestrictionExpiry, RestrictionPlayerScope, SubAbilityLink, TargetFilter,
+    AbilityDefinition, AbilityKind, ActivationRestriction, CardPlayMode, CastingPermission,
+    Duration, Effect, GameRestriction, PermissionGrantee, PlayerFilter, PlayerScope,
+    ProhibitedActivity, QuantityExpr, RestrictionExpiry, RestrictionPlayerScope, SubAbilityLink,
+    TargetFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::identifiers::{CardId, ObjectId, TrackedSetId};
@@ -55,6 +56,7 @@ fn play_from_exile_grant() -> CastingPermission {
             player: PlayerScope::Controller,
         },
         granted_to: PlayerId(0), // placeholder; grant_permission::resolve rebinds to owner
+        mode: CardPlayMode::Play,
         frequency: CastFrequency::Unlimited,
         source_id: None,
         invalidation: None,
@@ -64,6 +66,7 @@ fn play_from_exile_grant() -> CastingPermission {
         single_use_group: None,
         single_use: false,
         cast_cost_raise: None,
+        alt_ability_cost: None,
         land_enter_tapped: EtbTapState::Unspecified,
     }
 }
@@ -208,7 +211,7 @@ fn grant_expires_at_activator_next_turn_not_grantee_turn() {
 
     // P1's own next untap step: Memory Vessel's grant must SURVIVE (it lasts
     // until the ACTIVATOR P0's next turn, not P1's).
-    prune_until_next_turn_casting_permissions(state, P1);
+    prune_untap_step_casting_permissions(state, P1);
     assert!(
         state
             .objects
@@ -227,7 +230,7 @@ fn grant_expires_at_activator_next_turn_not_grantee_turn() {
     );
 
     // The activator P0's next untap step: every player's grant now expires.
-    prune_until_next_turn_casting_permissions(state, P0);
+    prune_untap_step_casting_permissions(state, P0);
     assert!(
         state
             .objects

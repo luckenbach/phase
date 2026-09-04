@@ -5,6 +5,10 @@
     "close": "Fermer",
     "closeNamed": "Fermer {{name}}"
   },
+  "debug": {
+    "exportAuthoritative": "Exporter l’état de jeu faisant autorité",
+    "exportAuthoritativeTitle": "Télécharge l’état détenu par le moteur, utilisé pour diagnostiquer et restaurer cette partie"
+  },
   "quantityRef": {
     "highestNumber": "le nombre le plus élevé",
     "lowestNumber": "le nombre le plus bas",
@@ -61,7 +65,6 @@
   "comboDetector": {
     "label": "Détecteur de combos (expérimental)",
     "title": "Détecter les boucles infinies : terminer automatiquement les boucles obligatoires et afficher les ressources ∞ (désactivé par défaut)",
-    "on": "Activé",
     "off": "Désactivé",
     "interactive": "Interactif"
   },
@@ -79,7 +82,8 @@
     "clickModeButton": "Bouton mode clic",
     "shown": "Affiché",
     "hidden": "Masqué",
-    "resume": "Reprendre",
+    "openGameLog": "Ouvrir le journal de partie",
+    "closeGameLog": "Fermer le journal de partie",
     "settings": "Paramètres",
     "boardLayoutSplit": "Divisé",
     "boardLayoutLegacy": "Legacy",

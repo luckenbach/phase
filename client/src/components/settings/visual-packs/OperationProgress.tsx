@@ -7,13 +7,15 @@ interface OperationProgressProps {
   operation: OperationStatus;
   progressPhase: ProgressEvent["phase"] | null;
   pendingActions: ReadonlySet<string>;
+  networkActionsDisabled: boolean;
   onCancel(): void;
   onResume(): void;
 }
 
-export function OperationProgress({ operation, progressPhase, pendingActions, onCancel, onResume }: OperationProgressProps) {
+export function OperationProgress({ operation, progressPhase, pendingActions, networkActionsDisabled, onCancel, onResume }: OperationProgressProps) {
   const { t } = useTranslation("settings");
-  const imageTotal = operation.objectEstimate ?? operation.objectTotal;
+  const imageTotal = operation.objectEstimate
+    ?? (operation.state === "finalizing" || operation.state === "completed" ? operation.objectTotal : null);
   const startPending = pendingActions.has("install") || pendingActions.has("repair") || pendingActions.has("resume");
   const canCancel = operation.state === "downloading" && progressPhase !== "failed";
   /**
@@ -71,10 +73,14 @@ export function OperationProgress({ operation, progressPhase, pendingActions, on
       </label>
       <label className="mt-3 block text-xs text-sky-50">
         <span className="flex items-center justify-between gap-3">
-          <span>{t("visualPacks.operation.objects", { current: operation.objectsPromoted, total: imageTotal })}</span>
-          <span className="font-medium tabular-nums">{operation.objectsPromoted}/{imageTotal}</span>
+          <span>{imageTotal === null
+            ? t("visualPacks.operation.objectsUnknown", { current: operation.objectsPromoted })
+            : t("visualPacks.operation.objects", { current: operation.objectsPromoted, total: imageTotal })}</span>
+          <span className="font-medium tabular-nums">{imageTotal === null ? operation.objectsPromoted : `${operation.objectsPromoted}/${imageTotal}`}</span>
         </span>
-        <progress className="mt-1.5 block h-2 w-full accent-sky-400" value={operation.objectsPromoted} max={Math.max(imageTotal, 1)} />
+        {imageTotal === null
+          ? <progress className="mt-1.5 block h-2 w-full accent-sky-400" />
+          : <progress className="mt-1.5 block h-2 w-full accent-sky-400" value={operation.objectsPromoted} max={Math.max(imageTotal, 1)} />}
       </label>
       <p className="mt-3 text-xs leading-relaxed text-sky-100/80">
         {t(operation.objectEstimate === null ? "visualPacks.operation.scanNote" : "visualPacks.operation.estimateNote")}
@@ -87,7 +93,7 @@ export function OperationProgress({ operation, progressPhase, pendingActions, on
           </button>
         )}
         {canResume && (
-          <button type="button" disabled={startPending} onClick={onResume} className="min-h-11 rounded-[12px] border border-sky-400/50 px-4 text-sm text-sky-100 disabled:opacity-40">
+          <button type="button" disabled={networkActionsDisabled || startPending} onClick={onResume} className="min-h-11 rounded-[12px] border border-sky-400/50 px-4 text-sm text-sky-100 disabled:opacity-40">
             {t("visualPacks.actions.resume")}
           </button>
         )}

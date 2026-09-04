@@ -62,11 +62,13 @@ function createMockDraftView(overrides: Partial<DraftPlayerView> = {}): DraftPla
   return {
     status: "Drafting",
     kind: "Premier",
+    launch_capability: "None",
     current_pack_number: 0,
     pick_number: 0,
     pass_direction: "Left",
     current_pack: null,
     required_pick_count: 0,
+    pick_selection_mode: "Direct",
     pool: [],
     draft_effects: [],
     pool_groups: EMPTY_DRAFT_POOL_GROUPS,
@@ -156,6 +158,112 @@ describe("ServerDraftAdapter", () => {
       }),
     );
     await createPromise;
+  });
+
+  it("sends a tagged Uniform source instead of legacy set codes", () => {
+    const create = ws.send.mock.calls
+      .map(([frame]) => JSON.parse(frame as string))
+      .find((frame) => frame.type === "CreateDraftWithSettings");
+
+    expect(create).toMatchObject({
+      data: {
+        source: { type: "Uniform", data: { set_codes: ["MKM"] } },
+      },
+    });
+    expect(create.data).not.toHaveProperty("set_codes");
+  });
+
+  it("sends Chaos candidates without a client assignment schedule", async () => {
+    MockWebSocket.last = null;
+    const chaos = new ServerDraftAdapter("ws://localhost:9374/ws");
+    const createPromise = chaos.createDraft({
+      displayName: "Alice",
+      source: { type: "Chaos", data: { candidate_codes: ["AAA", "BBB"] } },
+      kind: "Premier",
+      public: true,
+      tournamentFormat: "Swiss",
+      podPolicy: "Competitive",
+      podSize: 8,
+    });
+    const chaosWs = await completeHandshake();
+    const create = chaosWs.send.mock.calls
+      .map(([frame]) => JSON.parse(frame as string))
+      .find((frame) => frame.type === "CreateDraftWithSettings");
+
+    expect(create).toMatchObject({
+      data: {
+        source: { type: "Chaos", data: { candidate_codes: ["AAA", "BBB"] } },
+      },
+    });
+    expect(JSON.stringify(create)).not.toContain("assignments");
+    chaosWs.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftCreated",
+        data: { draft_code: "CHAOS1", player_token: "tok", seat_index: 0 },
+      }),
+    );
+    await createPromise;
+  });
+
+  it("rejects a stale Full server before setup or draft updates can mutate state", async () => {
+    MockWebSocket.last = null;
+    const staleAdapter = new ServerDraftAdapter("ws://localhost:9374/ws");
+    const listener = vi.fn();
+    staleAdapter.onEvent(listener);
+    const createPromise = staleAdapter.createDraft({
+      displayName: "Alice",
+      setCodes: ["MKM"],
+      kind: "CommanderDraft",
+      public: true,
+      tournamentFormat: "Swiss",
+      podPolicy: "Competitive",
+      podSize: 8,
+    });
+
+    await Promise.resolve();
+    const staleWs = MockWebSocket.last!;
+    staleWs.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "ServerHello",
+        data: {
+          server_version: "0.0.0-stale",
+          build_commit: "stalehash",
+          protocol_version: PROTOCOL_VERSION - 1,
+          mode: "Full",
+        },
+      }),
+    );
+
+    await expect(createPromise).rejects.toThrow("older than supported");
+    expect(staleWs.close).toHaveBeenCalledOnce();
+    expect(staleWs.send).not.toHaveBeenCalled();
+    expect(listener).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "serverHello",
+        compatible: false,
+        info: expect.objectContaining({ protocolVersion: PROTOCOL_VERSION - 1, mode: "Full" }),
+      }),
+    );
+
+    staleWs.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftStateUpdate",
+        data: {
+          view: {
+            ...createMockDraftView({ kind: "CommanderDraft", pick_selection_mode: "Ordered" }),
+            pick_selection_mode: undefined,
+          },
+        },
+      }),
+    );
+
+    expect(staleAdapter.currentDraftView).toBeNull();
+    expect(listener).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "draftViewUpdated" }),
+    );
   });
 
   it("transitions phase to match on DraftMatchStart", () => {

@@ -47,6 +47,7 @@ function card(instanceId: string): DraftPlayerView["pool"][number] {
 function view(): DraftPlayerView {
   return {
     status: "Deckbuilding", kind: "Traditional", pool: [card("twin-a"), card("twin-b")],
+    launch_capability: "None",
     current_pack: null, draft_effects: [],
     pool_groups: {
       color_groups: [], type_groups: [], cmc_groups: [], rarity_groups: [],
@@ -56,7 +57,7 @@ function view(): DraftPlayerView {
       workspace_row_classification: { creature_instance_ids: [], noncreature_instance_ids: [] },
     },
     seats: [], current_pack_number: 3, pick_number: 15, pass_direction: "Left",
-    cards_per_pack: 14, required_pick_count: 0, pick_steps_per_pack: 14, pack_count: 3, min_deck_size: 1, addable_cards: ["Island", "Forest"],
+    cards_per_pack: 14, required_pick_count: 0, pick_selection_mode: "Direct", pick_steps_per_pack: 14, pack_count: 3, min_deck_size: 1, addable_cards: ["Island", "Forest"],
     timer_remaining_ms: null, standings: [], current_round: 1, next_pairing_round: 2, tournament_format: "Swiss",
     pod_policy: "Competitive", pairings: [], match_config: { match_type: "Bo3" },
   };

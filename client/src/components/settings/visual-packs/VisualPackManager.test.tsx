@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -14,13 +14,16 @@ import {
   packId,
   type CatalogSummary,
   type CuratedDrift,
+  type CuratedInstallSelector,
   type InstallEstimate,
   type ProgressEvent,
   type RevisionEvent,
 } from "../../../services/visualPacks/types.ts";
 import { shortDigest } from "./packLabels.ts";
 import { VisualPackManager } from "./VisualPackManager.tsx";
+import { useVisualPackManager } from "./useVisualPackManager.ts";
 import i18n from "../../../i18n/index.ts";
+import { useConnectivityStore } from "../../../stores/connectivityStore.ts";
 import { usePreferencesStore } from "../../../stores/preferencesStore.ts";
 
 const platform = vi.hoisted(() => ({ load: vi.fn() }));
@@ -30,10 +33,12 @@ vi.mock("../../../hooks/useSetSymbols.ts", () => ({ useSetCatalog: () => ({ cata
 const ROOT_A = catalogRoot("a".repeat(64));
 const ROOT_B = catalogRoot("b".repeat(64));
 const OPERATION = operationId("c".repeat(32));
+const OTHER_OPERATION = operationId("f".repeat(32));
 /** A curated pack's root IS its membership digest, so it is deliberately
  *  neither of the catalog roots above — an estimate that matched one of those
  *  would hide a selector-identity bug rather than expose it. */
 const CURATED_DIGEST = catalogRoot("d".repeat(64));
+const DECK_LIBRARY_DIGEST = catalogRoot("e".repeat(64));
 
 /** The storage half of an `InstallEstimate`, as a browser that answers reports
  *  it. These tests are about the panel, not about storage, so every fixture
@@ -47,8 +52,12 @@ const STORAGE = {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
 }
 
 /**
@@ -71,6 +80,27 @@ function curatedSummary(digest = CURATED_DIGEST, revision = "90071992547409930")
   };
 }
 
+/** A deck-library-only fixture keeps its membership digest distinct from the
+ * catalog root, so a bulk-root comparison cannot accidentally satisfy a local
+ * membership assertion. */
+function deckLibrarySummary(digest = DECK_LIBRARY_DIGEST, revision = "90071992547409930"): CatalogSummary {
+  return {
+    ...summary(ROOT_A, revision),
+    installedPacks: [{ packId: packId("core"), catalogRoot: ROOT_A }, { packId: packId("deck_library"), catalogRoot: digest }],
+  };
+}
+
+function localPackSummary(revision = "90071992547409930"): CatalogSummary {
+  return {
+    ...summary(ROOT_A, revision),
+    installedPacks: [
+      { packId: packId("core"), catalogRoot: ROOT_A },
+      { packId: packId("curated"), catalogRoot: CURATED_DIGEST },
+      { packId: packId("deck_library"), catalogRoot: DECK_LIBRARY_DIGEST },
+    ],
+  };
+}
+
 function summary(root = ROOT_A, revision = "90071992547409930"): CatalogSummary {
   return {
     catalogRoot: root,
@@ -90,13 +120,16 @@ function backend(status: VisualPackBackend["catalogStatus"] = vi.fn(async () => 
     catalogStatus: status,
     curatedSelector: vi.fn(async () => ({ kind: "curated" as const, membershipDigest: CURATED_DIGEST })),
     curatedDrift: vi.fn(async () => noDrift()),
+    deckLibrarySelector: vi.fn(async () => ({ kind: "deck_library" as const, membershipDigest: DECK_LIBRARY_DIGEST })),
+    deckLibraryDrift: vi.fn(async () => null),
+    reconcileDeckLibrary: vi.fn(async () => {}),
     refreshCatalog: vi.fn(async () => summary()),
     catalogSummary: vi.fn(async () => summary()),
     estimateInstall: vi.fn(async (selector) => ({
       catalogRoot: ROOT_A,
       installedRevision: installedRevision("90071992547409930"),
       selector: selector.kind,
-      packIds: [packId(selector.kind === "curated" ? "curated" : "core")],
+      packIds: [packId(selector.kind === "curated" || selector.kind === "deck_library" ? selector.kind : "core")],
       assetRecords: "1",
       uniqueObjects: "1",
       logicalImageBytes: "2",
@@ -128,9 +161,13 @@ function backend(status: VisualPackBackend["catalogStatus"] = vi.fn(async () => 
 }
 
 describe("VisualPackManager initialization", () => {
-  beforeEach(() => platform.load.mockReset());
+  beforeEach(() => {
+    platform.load.mockReset();
+    useConnectivityStore.setState({ forcedOffline: false, browserOnline: true });
+  });
   afterEach(async () => {
     cleanup();
+    useConnectivityStore.setState({ forcedOffline: false, browserOnline: true });
     usePreferencesStore.getState().setLanguage("en");
     await waitFor(() => expect(i18n.resolvedLanguage).toBe("en"));
   });
@@ -158,6 +195,164 @@ describe("VisualPackManager initialization", () => {
     view.unmount();
     expect(progressUnlisten).toHaveBeenCalledTimes(1);
     expect(revisionUnlisten).toHaveBeenCalledTimes(1);
+  });
+
+  it("adopts a background operation and accepts a live lower-progress update", async () => {
+    const fixture = backend();
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+    await waitFor(() => expect(fixture.value.subscribeProgress).toHaveBeenCalled());
+    const running = {
+      operationId: OPERATION, catalogRoot: ROOT_A, kind: "install" as const, state: "downloading" as const,
+      packTotal: 1, packsPromoted: 0, objectTotal: 2, objectEstimate: 2, objectsPromoted: 1, completedRevision: null,
+    };
+    fixture.emitProgress({ phase: "running", error: null, operation: running });
+    expect(await screen.findByText("1/2")).toBeInTheDocument();
+
+    fixture.emitProgress({ phase: "running", error: null, operation: { ...running, objectsPromoted: 0 } });
+    expect(await screen.findByText("0/2")).toBeInTheDocument();
+
+    fixture.emitProgress({ phase: "completed", error: null, operation: { ...running, state: "completed", objectsPromoted: 2, completedRevision: installedRevision("2") } });
+    expect(await screen.findByText("Completed")).toBeInTheDocument();
+    fixture.emitProgress({
+      phase: "started",
+      error: null,
+      operation: {
+        ...running,
+        operationId: operationId("d".repeat(32)),
+        catalogRoot: ROOT_B,
+        kind: "repair",
+        objectsPromoted: 0,
+        completedRevision: null,
+      },
+    });
+    expect(await screen.findByText("0/2")).toBeInTheDocument();
+  });
+
+  it("keeps unknown image totals indeterminate until finalization makes the total authoritative", async () => {
+    const fixture = backend();
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+    await waitFor(() => expect(fixture.value.subscribeProgress).toHaveBeenCalled());
+    const operation = {
+      operationId: OPERATION, catalogRoot: ROOT_A, kind: "repair" as const, state: "downloading" as const,
+      packTotal: 1, packsPromoted: 0, objectTotal: 0, objectEstimate: null, objectsPromoted: 0, completedRevision: null,
+    };
+    fixture.emitProgress({
+      phase: "running",
+      error: null,
+      operation,
+    });
+    expect(await screen.findByText("Images downloaded: 0")).toBeInTheDocument();
+    const progressBars = screen.getAllByRole("progressbar");
+    expect(progressBars[progressBars.length - 1]).not.toHaveAttribute("value");
+
+    fixture.emitProgress({ phase: "running", error: null, operation: { ...operation, objectEstimate: 0 } });
+    expect(await screen.findByText("0/0")).toBeInTheDocument();
+    const knownProgressBars = screen.getAllByRole("progressbar");
+    expect(knownProgressBars[knownProgressBars.length - 1]).toHaveAttribute("value", "0");
+
+    fixture.emitProgress({ phase: "running", error: null, operation: { ...operation, objectTotal: 2, objectsPromoted: 1 } });
+    expect(await screen.findByText("Images downloaded: 1")).toBeInTheDocument();
+    fixture.emitProgress({ phase: "running", error: null, operation: { ...operation, state: "finalizing", objectTotal: 2, objectsPromoted: 1 } });
+    expect(await screen.findByText("1/2")).toBeInTheDocument();
+  });
+
+  it("restores a removal confirmation to its pointer launcher", async () => {
+    const fixture = backend();
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    const prior = await screen.findByRole("button", { name: /verify metadata/i });
+    const trigger = screen.getByRole("button", {
+      name: /remove all offline visuals/i,
+    });
+
+    prior.focus();
+    fireEvent.click(trigger);
+    const dialog = await screen.findByRole("alertdialog");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus(),
+    );
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    await waitFor(() =>
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument(),
+    );
+    expect(trigger).toHaveFocus();
+  });
+
+  it("keeps the causal removal launcher across an asynchronous conflict", async () => {
+    const fixture = backend();
+    const pending = deferred<Awaited<ReturnType<VisualPackBackend["remove"]>>>();
+    vi.mocked(fixture.value.remove).mockReturnValue(pending.promise);
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+    fireEvent.click(screen.getByRole("checkbox"));
+    const trigger = screen.getByRole("button", { name: /remove selected/i });
+
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("button", { name: /verify metadata/i }));
+    pending.reject(new VisualPackBackendError("conflict"));
+    const dialog = await screen.findByRole("alertdialog");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus(),
+    );
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    await waitFor(() =>
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument(),
+    );
+    expect(trigger).toHaveFocus();
+  });
+
+  it("moves direct selected-removal focus before its launcher disables", async () => {
+    const fixture = backend();
+    const pending = deferred<Awaited<ReturnType<VisualPackBackend["remove"]>>>();
+    vi.mocked(fixture.value.remove).mockReturnValue(pending.promise);
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    const heading = await screen.findByRole("heading", {
+      name: /offline card images/i,
+    });
+    fireEvent.click(screen.getByRole("checkbox"));
+    const trigger = screen.getByRole("button", { name: /remove selected/i });
+    trigger.focus();
+
+    fireEvent.click(trigger);
+
+    await waitFor(() => expect(fixture.value.remove).toHaveBeenCalledOnce());
+    expect(trigger).toBeDisabled();
+    expect(heading).toHaveFocus();
+    expect(document.body).not.toHaveFocus();
+
+    pending.resolve({
+      removed: [],
+      revision: installedRevision("90071992547409931"),
+      cleanupIssues: [],
+    });
+    await waitFor(() => expect(trigger).toBeEnabled());
+  });
+
+  it("hands confirmed removal focus to the durable section heading", async () => {
+    const fixture = backend();
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    const trigger = await screen.findByRole("button", {
+      name: /remove all offline visuals/i,
+    });
+    const heading = screen.getByRole("heading", { name: /offline card images/i });
+
+    fireEvent.click(trigger);
+    fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
+
+    await waitFor(() => expect(fixture.value.remove).toHaveBeenCalledOnce());
+    await waitFor(() =>
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument(),
+    );
+    expect(heading).toHaveFocus();
   });
 
   it("disposes a progress listener whose promise resolves after unmount", async () => {
@@ -321,6 +516,46 @@ describe("VisualPackManager initialization", () => {
       selector: { kind: "core" },
       objectEstimate: 353331,
     });
+  });
+
+  it.each(["en", "de", "es", "fr", "it", "pt"])("installs %s through the combined set-printings selector", async (language) => {
+    const fixture = backend();
+    vi.mocked(fixture.value.estimateInstall).mockImplementation(async (selector) => {
+      const id = selector.kind === "printing" ? `printing:${selector.set}`
+        : selector.kind === "locale" ? `locale:${selector.language}:${selector.set}` : "core";
+      return {
+        catalogRoot: ROOT_A, installedRevision: summary().installedRevision,
+        selector: id, packIds: [packId(id)],
+        assetRecords: "1", uniqueObjects: "1", logicalImageBytes: "2", uniqueImageBytes: "2",
+        shardCount: "1", shardBytes: "3", estimatedImageBytes: estimatedImageBytes(1),
+        storage: STORAGE, headroom: "sufficient",
+      };
+    });
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    fireEvent.click(await screen.findByRole("radio", { name: /^Set printings$/i }));
+    expect(screen.queryByRole("radio", { name: /English set printings|Localized set printings/i })).not.toBeInTheDocument();
+    const languages = screen.getByRole("combobox", { name: /image language/i });
+    expect(languages).toHaveValue("en");
+    expect(screen.getByRole("option", { name: "English" })).toHaveValue("en");
+    expect(screen.getByRole("button", { name: /scan catalog and estimate/i })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText(/set code/i), { target: { value: " FIN " } });
+
+    fireEvent.click(screen.getByRole("button", { name: /scan catalog and estimate/i }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /install selection/i })).toBeEnabled());
+    expect(fixture.value.estimateInstall).toHaveBeenLastCalledWith({ kind: "printing", set: "fin" }, expect.any(Function));
+    if (language !== "en") {
+      fireEvent.change(languages, { target: { value: language } });
+      expect(screen.getByRole("button", { name: /install selection/i })).toBeDisabled();
+      expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(1);
+      fireEvent.click(screen.getByRole("button", { name: /scan catalog and estimate/i }));
+      await waitFor(() => expect(screen.getByRole("button", { name: /install selection/i })).toBeEnabled());
+    }
+    const selector = language === "en" ? { kind: "printing", set: "fin" }
+      : { kind: "locale", language, set: "fin" };
+    expect(fixture.value.estimateInstall).toHaveBeenLastCalledWith(selector, expect.any(Function));
+    fireEvent.click(screen.getByRole("button", { name: /install selection/i }));
+    expect(fixture.value.start).toHaveBeenCalledWith({ kind: "install", selector, objectEstimate: 1 });
   });
 
   it("allows unrelated estimate and verification reads to overlap", async () => {
@@ -505,6 +740,15 @@ describe("VisualPackManager initialization", () => {
     };
   }
 
+  function deckLibraryEstimate(overrides: Partial<InstallEstimate> = {}): InstallEstimate {
+    return {
+      ...curatedEstimate(),
+      selector: "deck_library",
+      packIds: [packId("deck_library")],
+      ...overrides,
+    };
+  }
+
   /** Longer than PackSelector's curated debounce, so an estimate that was
    *  going to fire has fired by the time this resolves. */
   /** A `complete` estimate — what displaces a curated one from the panel. */
@@ -523,6 +767,10 @@ describe("VisualPackManager initialization", () => {
 
   function chooseCurated(): void {
     fireEvent.click(screen.getByRole("radio", { name: /one image per card/i }));
+  }
+
+  function chooseDeckLibrary(): void {
+    fireEvent.click(screen.getByRole("radio", { name: /deck library/i }));
   }
 
   it("estimates the curated pack on selection and installs it without a second click", async () => {
@@ -558,6 +806,584 @@ describe("VisualPackManager initialization", () => {
       selector: { kind: "curated", membershipDigest: CURATED_DIGEST },
       objectEstimate: 6,
     });
+  });
+
+  it("keeps the deck library opt-in idle until selected, then estimates before its explicit install", async () => {
+    const fixture = backend();
+    vi.mocked(fixture.value.estimateInstall).mockResolvedValue(deckLibraryEstimate({ assetRecords: "7", uniqueObjects: "7" }));
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    expect(fixture.value.deckLibrarySelector).not.toHaveBeenCalled();
+    expect(fixture.value.estimateInstall).not.toHaveBeenCalled();
+    expect(fixture.value.start).not.toHaveBeenCalled();
+
+    const deckChoice = screen.getByRole("radio", { name: /deck library/i });
+    deckChoice.focus();
+    fireEvent.click(deckChoice);
+    expect(deckChoice).toHaveFocus();
+    expect(await screen.findByText(/one image per card used in the shared deck library, including AI Commander precons/i)).toBeInTheDocument();
+    expect(screen.getByText(/removing this pack stops that synchronization/i)).toBeInTheDocument();
+    await waitFor(() => expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledWith(
+      { kind: "deck_library", membershipDigest: DECK_LIBRARY_DIGEST },
+      expect.any(Function),
+    ));
+    expect(fixture.value.start).not.toHaveBeenCalled();
+
+    const install = await screen.findByRole("button", { name: /install selection/i });
+    await waitFor(() => expect(install).toBeEnabled());
+    fireEvent.click(install);
+    expect(fixture.value.start).toHaveBeenCalledWith({
+      kind: "install",
+      selector: { kind: "deck_library", membershipDigest: DECK_LIBRARY_DIGEST },
+      objectEstimate: 7,
+    });
+  });
+
+  it("keeps a bulk estimate available while the deck-library selector resolves", async () => {
+    const fixture = backend();
+    const resolvingDeckLibrary = deferred<Awaited<ReturnType<VisualPackBackend["deckLibrarySelector"]>>>();
+    vi.mocked(fixture.value.deckLibrarySelector).mockReturnValue(resolvingDeckLibrary.promise);
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+    await waitFor(() => expect(fixture.value.deckLibrarySelector).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("radio", { name: /card back/i }));
+
+    const estimate = screen.getByRole("button", { name: /scan catalog and estimate/i });
+    expect(estimate).toBeEnabled();
+    fireEvent.click(estimate);
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledWith(
+      { kind: "core" },
+      expect.any(Function),
+    ));
+    await waitFor(() => expect(screen.getByRole("button", { name: /install selection/i })).toBeEnabled());
+
+    resolvingDeckLibrary.resolve({ kind: "deck_library", membershipDigest: DECK_LIBRARY_DIGEST });
+  });
+
+  it("binds automatic estimates to the local pack identity when digests match", async () => {
+    const fixture = backend();
+    vi.mocked(fixture.value.deckLibrarySelector).mockResolvedValue({ kind: "deck_library", membershipDigest: CURATED_DIGEST });
+    vi.mocked(fixture.value.estimateInstall).mockImplementation(async (selector) =>
+      selector.kind === "deck_library" ? deckLibraryEstimate() : curatedEstimate(),
+    );
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseCurated();
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(1));
+    chooseDeckLibrary();
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(fixture.value.estimateInstall).mock.calls.map(([selector]) => selector.kind))
+      .toEqual(["curated", "deck_library"]);
+  });
+
+  it("retries a rejected deck-library selector only after explicit reselection", async () => {
+    const fixture = backend();
+    vi.mocked(fixture.value.deckLibrarySelector)
+      .mockRejectedValueOnce(new VisualPackBackendError("network"))
+      .mockResolvedValueOnce({ kind: "deck_library", membershipDigest: DECK_LIBRARY_DIGEST });
+    vi.mocked(fixture.value.estimateInstall).mockResolvedValue(deckLibraryEstimate());
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Scryfall catalog or image download failed/i);
+    await pastCuratedDebounce();
+    expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("radio", { name: /all current english card images/i }));
+    chooseDeckLibrary();
+    await waitFor(() => expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(/Estimated download size/i)).toBeInTheDocument();
+  });
+
+  it("does not retry a failed deck-library resolver when an older curated resolver completes", async () => {
+    const fixture = backend();
+    const pendingCurated = deferred<Awaited<ReturnType<VisualPackBackend["curatedSelector"]>>>();
+    vi.mocked(fixture.value.curatedSelector).mockReturnValueOnce(pendingCurated.promise);
+    vi.mocked(fixture.value.deckLibrarySelector)
+      .mockRejectedValueOnce(new VisualPackBackendError("network"))
+      .mockResolvedValueOnce({ kind: "deck_library", membershipDigest: DECK_LIBRARY_DIGEST });
+    vi.mocked(fixture.value.estimateInstall).mockResolvedValue(deckLibraryEstimate());
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseCurated();
+    await waitFor(() => expect(fixture.value.curatedSelector).toHaveBeenCalledTimes(1));
+    chooseDeckLibrary();
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Scryfall catalog or image download failed/i);
+    expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(1);
+
+    pendingCurated.resolve({ kind: "curated", membershipDigest: CURATED_DIGEST });
+    await pastCuratedDebounce();
+
+    expect(fixture.value.curatedSelector).toHaveBeenCalledTimes(1);
+    expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("alert")).toHaveTextContent(/Scryfall catalog or image download failed/i);
+
+    fireEvent.click(screen.getByRole("button", { name: /recalculate size/i }));
+    await waitFor(() => expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(/Estimated download size/i)).toBeInTheDocument();
+  });
+
+  it("refreshes a stale deck-library request after art preferences invalidate it", async () => {
+    const fixture = backend();
+    const stale = deferred<Awaited<ReturnType<VisualPackBackend["deckLibrarySelector"]>>>();
+    vi.mocked(fixture.value.deckLibrarySelector)
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValueOnce({ kind: "deck_library", membershipDigest: DECK_LIBRARY_DIGEST });
+    vi.mocked(fixture.value.estimateInstall).mockResolvedValue(deckLibraryEstimate());
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+    await waitFor(() => expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(1));
+    usePreferencesStore.setState({ artChain: [{ type: "newest" }] });
+    stale.resolve({ kind: "deck_library", membershipDigest: CURATED_DIGEST });
+
+    await waitFor(() => expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledWith(
+      { kind: "deck_library", membershipDigest: DECK_LIBRARY_DIGEST },
+      expect.any(Function),
+    ));
+  });
+
+  it("shows deck-library membership and removes only that pack", async () => {
+    const fixture = backend(vi.fn(async () => ({ status: "ready" as const, summary: localPackSummary() })));
+    vi.mocked(fixture.value.catalogSummary).mockResolvedValue(curatedSummary(CURATED_DIGEST, "90071992547409931"));
+    vi.mocked(fixture.value.deckLibraryDrift).mockResolvedValue({
+      membershipDigest: ROOT_B,
+      installedDigest: DECK_LIBRARY_DIGEST,
+      add: 3,
+      remove: 2,
+      refresh: 1,
+    });
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    expect(await screen.findByText(/Membership fingerprint: e{12}…/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Upgrade available/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("checkbox", { name: /deck library/i }));
+    fireEvent.click(screen.getByRole("button", { name: /remove selected/i }));
+    await waitFor(() => expect(fixture.value.remove).toHaveBeenCalledWith(
+      { kind: "packs", packIds: [packId("deck_library")] },
+      "reject_dependents",
+    ));
+    await waitFor(() => expect(screen.queryByRole("checkbox", { name: /deck library/i })).not.toBeInTheDocument());
+    expect(screen.getByRole("checkbox", { name: /one image per card/i })).toBeInTheDocument();
+  });
+
+  it("keeps an installed deck library unmeasured when its drift is unavailable", async () => {
+    const fixture = backend(vi.fn(async () => ({ status: "ready" as const, summary: deckLibrarySummary() })));
+    vi.mocked(fixture.value.deckLibraryDrift).mockResolvedValue(null);
+    vi.mocked(fixture.value.estimateInstall).mockResolvedValue(deckLibraryEstimate());
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+    await waitFor(() => expect(fixture.value.deckLibraryDrift).toHaveBeenCalledTimes(1));
+
+    chooseDeckLibrary();
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /sync images/i })).toBeEnabled());
+    expect(screen.queryByText(/already match/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/to add/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Upgrade available/i)).not.toBeInTheDocument();
+  });
+
+  it("uses the deck-library membership digest rather than a catalog root or curated drift", async () => {
+    const fixture = backend(vi.fn(async () => ({ status: "ready" as const, summary: deckLibrarySummary() })));
+    vi.mocked(fixture.value.deckLibraryDrift).mockResolvedValue({
+      membershipDigest: DECK_LIBRARY_DIGEST,
+      installedDigest: DECK_LIBRARY_DIGEST,
+      add: 0,
+      remove: 0,
+      refresh: 0,
+    });
+    vi.mocked(fixture.value.curatedDrift).mockResolvedValue({
+      membershipDigest: ROOT_B,
+      installedDigest: CURATED_DIGEST,
+      add: 7,
+      remove: 5,
+      refresh: 3,
+    });
+    vi.mocked(fixture.value.estimateInstall).mockResolvedValue(deckLibraryEstimate());
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+
+    expect(await screen.findByText(/already match/i)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: /sync images/i })).toBeEnabled());
+    expect(screen.queryByText(/Upgrade available/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/7 to add, 5 to remove, 3 to refresh/i)).not.toBeInTheDocument();
+  });
+
+  it("reports deck-library drift counts from the deck membership and keeps Sync available", async () => {
+    const fixture = backend(vi.fn(async () => ({ status: "ready" as const, summary: deckLibrarySummary() })));
+    vi.mocked(fixture.value.deckLibraryDrift).mockResolvedValue({
+      membershipDigest: ROOT_B,
+      installedDigest: DECK_LIBRARY_DIGEST,
+      add: 7,
+      remove: 5,
+      refresh: 3,
+    });
+    vi.mocked(fixture.value.estimateInstall).mockResolvedValue(deckLibraryEstimate());
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+
+    expect(await screen.findByText(/7 to add, 5 to remove, 3 to refresh/i)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: /sync images/i })).toBeEnabled());
+    expect(await screen.findByText(/Upgrade available/i)).toBeInTheDocument();
+  });
+
+  it("clears stale scan progress when a newer summary invalidates a pending bulk estimate", async () => {
+    const fixture = backend();
+    const scan = deferred<InstallEstimate>();
+    vi.mocked(fixture.value.estimateInstall).mockImplementationOnce((_selector, onProgress) => {
+      onProgress?.({ compressedBytesRead: 10, compressedBytesTotal: 20, recordsScanned: 1, assetRecords: 1 });
+      return scan.promise;
+    });
+    vi.mocked(fixture.value.refreshCatalog).mockResolvedValue(summary(ROOT_B, "90071992547409931"));
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    fireEvent.click(screen.getByRole("radio", { name: /all current english card images/i }));
+    fireEvent.click(screen.getByRole("button", { name: /scan catalog and estimate/i }));
+    expect(await screen.findByRole("progressbar")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /check Scryfall catalog/i }));
+    await screen.findByText(shortDigest(ROOT_B));
+    scan.resolve(bulkEstimate());
+
+    await waitFor(() => expect(screen.queryByRole("progressbar")).not.toBeInTheDocument());
+    expect(screen.queryByText(/Scryfall snapshot scan/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("re-estimates a selected deck library after art preferences change to the same digest", async () => {
+    const fixture = backend();
+    vi.mocked(fixture.value.estimateInstall).mockResolvedValue(deckLibraryEstimate());
+    platform.load.mockResolvedValue(fixture.value);
+    usePreferencesStore.setState({ artChain: [], artOverrides: {} });
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(1));
+    usePreferencesStore.setState({ artChain: [{ type: "newest" }] });
+
+    await waitFor(() => expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("button", { name: /install selection/i })).toBeEnabled();
+    await pastCuratedDebounce();
+    expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers a selected deck library estimate after its catalog membership changes", async () => {
+    const fixture = backend();
+    vi.mocked(fixture.value.deckLibrarySelector)
+      .mockResolvedValueOnce({ kind: "deck_library", membershipDigest: DECK_LIBRARY_DIGEST })
+      .mockResolvedValueOnce({ kind: "deck_library", membershipDigest: ROOT_B });
+    vi.mocked(fixture.value.estimateInstall)
+      .mockRejectedValueOnce(new VisualPackBackendError("conflict"))
+      .mockResolvedValueOnce(deckLibraryEstimate());
+    platform.load.mockResolvedValue(fixture.value);
+    usePreferencesStore.setState({ artChain: [], artOverrides: {} });
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+
+    await waitFor(() => expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenNthCalledWith(
+      2,
+      { kind: "deck_library", membershipDigest: ROOT_B },
+      expect.any(Function),
+    ));
+    expect(await screen.findByRole("button", { name: /install selection/i })).toBeEnabled();
+    expect(fixture.value.start).not.toHaveBeenCalled();
+    expect(fixture.value.curatedSelector).not.toHaveBeenCalled();
+  });
+
+  it("requires a second explicit click after recovering a deck-library install conflict", async () => {
+    const fixture = backend();
+    vi.mocked(fixture.value.deckLibrarySelector)
+      .mockResolvedValueOnce({ kind: "deck_library", membershipDigest: DECK_LIBRARY_DIGEST })
+      .mockResolvedValueOnce({ kind: "deck_library", membershipDigest: ROOT_B });
+    vi.mocked(fixture.value.estimateInstall).mockResolvedValue(deckLibraryEstimate({ assetRecords: "7" }));
+    vi.mocked(fixture.value.start)
+      .mockRejectedValueOnce(new VisualPackBackendError("conflict"))
+      .mockResolvedValueOnce({ status: "healthy" });
+    platform.load.mockResolvedValue(fixture.value);
+    usePreferencesStore.setState({ artChain: [], artOverrides: {} });
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+    const install = await screen.findByRole("button", { name: /install selection/i });
+    await waitFor(() => expect(install).toBeEnabled());
+    fireEvent.click(install);
+    await waitFor(() => expect(fixture.value.start).toHaveBeenCalledTimes(1));
+
+    await waitFor(() => expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenNthCalledWith(
+      2,
+      { kind: "deck_library", membershipDigest: ROOT_B },
+      expect.any(Function),
+    ));
+    const recoveredInstall = await screen.findByRole("button", { name: /install selection/i });
+    await waitFor(() => expect(recoveredInstall).toBeEnabled());
+    expect(fixture.value.start).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(recoveredInstall);
+    await waitFor(() => expect(fixture.value.start).toHaveBeenCalledTimes(2));
+    expect(fixture.value.start).toHaveBeenLastCalledWith({
+      kind: "install",
+      selector: { kind: "deck_library", membershipDigest: ROOT_B },
+      objectEstimate: 7,
+    });
+  });
+
+  it("ignores a stale deck-library estimate conflict after a newer art selection succeeds", async () => {
+    const fixture = backend();
+    const stale = deferred<InstallEstimate>();
+    vi.mocked(fixture.value.deckLibrarySelector)
+      .mockResolvedValueOnce({ kind: "deck_library", membershipDigest: DECK_LIBRARY_DIGEST })
+      .mockResolvedValueOnce({ kind: "deck_library", membershipDigest: ROOT_B });
+    vi.mocked(fixture.value.estimateInstall)
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValueOnce(deckLibraryEstimate());
+    platform.load.mockResolvedValue(fixture.value);
+    usePreferencesStore.setState({ artChain: [], artOverrides: {} });
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(1));
+    usePreferencesStore.setState({ artChain: [{ type: "newest" }] });
+    await waitFor(() => expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(2));
+    stale.reject(new VisualPackBackendError("conflict"));
+
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenNthCalledWith(
+      2,
+      { kind: "deck_library", membershipDigest: ROOT_B },
+      expect.any(Function),
+    ));
+    expect(await screen.findByRole("button", { name: /install selection/i })).toBeEnabled();
+    await pastCuratedDebounce();
+    expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(2);
+    expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2);
+    expect(fixture.value.start).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("ignores a stale deck-library install conflict after a newer art selection succeeds", async () => {
+    const fixture = backend();
+    const stale = deferred<Awaited<ReturnType<VisualPackBackend["start"]>>>();
+    vi.mocked(fixture.value.deckLibrarySelector)
+      .mockResolvedValueOnce({ kind: "deck_library", membershipDigest: DECK_LIBRARY_DIGEST })
+      .mockResolvedValueOnce({ kind: "deck_library", membershipDigest: ROOT_B });
+    vi.mocked(fixture.value.estimateInstall).mockResolvedValue(deckLibraryEstimate());
+    vi.mocked(fixture.value.start).mockReturnValue(stale.promise);
+    platform.load.mockResolvedValue(fixture.value);
+    usePreferencesStore.setState({ artChain: [], artOverrides: {} });
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+    const install = await screen.findByRole("button", { name: /install selection/i });
+    await waitFor(() => expect(install).toBeEnabled());
+    fireEvent.click(install);
+    await waitFor(() => expect(fixture.value.start).toHaveBeenCalledTimes(1));
+    usePreferencesStore.setState({ artChain: [{ type: "newest" }] });
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenNthCalledWith(
+      2,
+      { kind: "deck_library", membershipDigest: ROOT_B },
+      expect.any(Function),
+    ));
+    stale.reject(new VisualPackBackendError("conflict"));
+
+    const recoveredInstall = await screen.findByRole("button", { name: /install selection/i });
+    await waitFor(() => expect(recoveredInstall).toBeEnabled());
+    await pastCuratedDebounce();
+    expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(2);
+    expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2);
+    expect(fixture.value.start).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("preserves a pending curated estimate when an older deck-library start conflicts", async () => {
+    const fixture = backend();
+    const staleStart = deferred<Awaited<ReturnType<VisualPackBackend["start"]>>>();
+    const pendingCuratedEstimate = deferred<InstallEstimate>();
+    vi.mocked(fixture.value.estimateInstall)
+      .mockResolvedValueOnce(deckLibraryEstimate())
+      .mockReturnValueOnce(pendingCuratedEstimate.promise);
+    vi.mocked(fixture.value.start).mockReturnValue(staleStart.promise);
+    platform.load.mockResolvedValue(fixture.value);
+    usePreferencesStore.setState({ artChain: [], artOverrides: {} });
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+    const install = await screen.findByRole("button", { name: /install selection/i });
+    await waitFor(() => expect(install).toBeEnabled());
+    fireEvent.click(install);
+    await waitFor(() => expect(fixture.value.start).toHaveBeenCalledTimes(1));
+
+    chooseCurated();
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2));
+    staleStart.reject(new VisualPackBackendError("conflict"));
+    pendingCuratedEstimate.resolve(curatedEstimate());
+
+    expect(await screen.findByRole("button", { name: /install selection/i })).toBeEnabled();
+    expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(1);
+    expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops conflict recovery after a fresh deck-library selector network failure until the user retries", async () => {
+    const fixture = backend();
+    vi.mocked(fixture.value.deckLibrarySelector)
+      .mockResolvedValueOnce({ kind: "deck_library", membershipDigest: DECK_LIBRARY_DIGEST })
+      .mockRejectedValueOnce(new VisualPackBackendError("network"))
+      .mockResolvedValueOnce({ kind: "deck_library", membershipDigest: ROOT_B });
+    vi.mocked(fixture.value.estimateInstall)
+      .mockRejectedValueOnce(new VisualPackBackendError("conflict"))
+      .mockResolvedValueOnce(deckLibraryEstimate());
+    platform.load.mockResolvedValue(fixture.value);
+    usePreferencesStore.setState({ artChain: [], artOverrides: {} });
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+
+    expect(await screen.findByText(/Scryfall catalog or image download failed/i)).toBeInTheDocument();
+    await pastCuratedDebounce();
+    expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(2);
+    expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(1);
+    expect(fixture.value.start).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: /recalculate size/i }));
+    await waitFor(() => expect(fixture.value.deckLibrarySelector).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledWith(
+      { kind: "deck_library", membershipDigest: ROOT_B },
+      expect.any(Function),
+    ));
+    expect(await screen.findByRole("button", { name: /install selection/i })).toBeEnabled();
+  });
+
+  it("retries a failed deck estimate after visiting a curated estimate that already matches", async () => {
+    const fixture = backend();
+    vi.mocked(fixture.value.estimateInstall)
+      .mockResolvedValueOnce(curatedEstimate())
+      .mockRejectedValueOnce(new VisualPackBackendError("network"))
+      .mockResolvedValueOnce(deckLibraryEstimate());
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseCurated();
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole("button", { name: /install selection/i })).toBeEnabled();
+
+    chooseDeckLibrary();
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Scryfall catalog or image download failed/i);
+    await pastCuratedDebounce();
+    expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2);
+
+    chooseCurated();
+    await pastCuratedDebounce();
+    expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2);
+
+    chooseDeckLibrary();
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(3));
+    expect(await screen.findByRole("button", { name: /install selection/i })).toBeEnabled();
+    await pastCuratedDebounce();
+    expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(3);
+  });
+
+  it("ignores a stale pending deck estimate and performs one fresh estimate", async () => {
+    const fixture = backend();
+    const stale = deferred<InstallEstimate>();
+    vi.mocked(fixture.value.estimateInstall)
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValueOnce(deckLibraryEstimate());
+    platform.load.mockResolvedValue(fixture.value);
+    usePreferencesStore.setState({ artChain: [], artOverrides: {} });
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(1));
+    usePreferencesStore.setState({ artChain: [{ type: "newest" }] });
+    stale.resolve(deckLibraryEstimate());
+
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("button", { name: /install selection/i })).toBeEnabled();
+    await pastCuratedDebounce();
+    expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores a stale pending deck-estimate failure and does not retry it", async () => {
+    const fixture = backend();
+    const stale = deferred<InstallEstimate>();
+    vi.mocked(fixture.value.estimateInstall)
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValueOnce(deckLibraryEstimate());
+    platform.load.mockResolvedValue(fixture.value);
+    usePreferencesStore.setState({ artChain: [], artOverrides: {} });
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(1));
+    usePreferencesStore.setState({ artChain: [{ type: "newest" }] });
+    stale.reject(new VisualPackBackendError("network"));
+
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /install selection/i })).toBeEnabled();
+    await pastCuratedDebounce();
+    expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers one fresh deck estimate after an installed-revision invalidation releases its pending slot", async () => {
+    const fixture = backend();
+    const stale = deferred<InstallEstimate>();
+    vi.mocked(fixture.value.estimateInstall)
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValueOnce({ ...deckLibraryEstimate(), installedRevision: installedRevision("90071992547409931") });
+    vi.mocked(fixture.value.catalogSummary).mockResolvedValue(summary(ROOT_A, "90071992547409931"));
+    platform.load.mockResolvedValue(fixture.value);
+    usePreferencesStore.setState({ artChain: [], artOverrides: {} });
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+
+    chooseDeckLibrary();
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(1));
+    fixture.emitRevision({ cause: "install", operationId: null, catalogRoot: ROOT_A, revision: installedRevision("90071992547409931") });
+    await screen.findByText("90071992547409931");
+    stale.resolve(deckLibraryEstimate());
+
+    await waitFor(() => expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("button", { name: /install selection/i })).toBeEnabled();
+    await pastCuratedDebounce();
+    expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(2);
   });
 
   it("leaves the bulk selectors' catalog scan behind a deliberate click", async () => {
@@ -923,7 +1749,86 @@ describe("VisualPackManager initialization", () => {
   });
 
   /** Drive the panel to an operation that has failed and is offering Resume. */
-  async function reachFailedOperation(fixture: ReturnType<typeof backend>): Promise<void> {
+  async function reachFailedOperation(
+    fixture: ReturnType<typeof backend>,
+    state: "downloading" | "finalizing" = "downloading",
+  ): Promise<void> {
+    await pressInstall(/scan catalog and estimate/i, /install selection/i);
+    await waitFor(() => expect(fixture.value.start).toHaveBeenCalled());
+    fixture.emitProgress({
+      phase: "failed",
+      error: "network",
+      operation: {
+        operationId: OPERATION, catalogRoot: ROOT_A, kind: "install", state,
+        packTotal: 1, packsPromoted: 0, objectTotal: 2, objectEstimate: null, objectsPromoted: 1, completedRevision: null,
+      },
+    });
+    await screen.findByRole("button", { name: /resume operation/i });
+  }
+
+  it.each(["downloading", "finalizing"] as const)("adopts a different durable operation after a failed %s operation", async (state) => {
+    const fixture = backend();
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+    await reachFailedOperation(fixture, state);
+
+    await act(async () => {
+      fixture.emitProgress({
+        phase: "running",
+        error: null,
+        operation: {
+          operationId: OTHER_OPERATION, catalogRoot: ROOT_B, kind: "install", state: "downloading",
+          packTotal: 1, packsPromoted: 0, objectTotal: 3, objectEstimate: 3, objectsPromoted: 2, completedRevision: null,
+        },
+      });
+    });
+
+    expect(await screen.findByText("2/3")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /resume operation/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("does not let a different durable operation replace an active operation", async () => {
+    const fixture = backend();
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+    await pressInstall(/scan catalog and estimate/i, /install selection/i);
+    await waitFor(() => expect(fixture.value.start).toHaveBeenCalled());
+
+    fixture.emitProgress({
+      phase: "running",
+      error: null,
+      operation: {
+        operationId: OPERATION, catalogRoot: ROOT_A, kind: "install", state: "downloading",
+        packTotal: 1, packsPromoted: 0, objectTotal: 2, objectEstimate: 2, objectsPromoted: 1, completedRevision: null,
+      },
+    });
+    expect(await screen.findByText("1/2")).toBeInTheDocument();
+
+    await act(async () => {
+      fixture.emitProgress({
+        phase: "running",
+        error: null,
+        operation: {
+          operationId: OTHER_OPERATION, catalogRoot: ROOT_B, kind: "install", state: "downloading",
+          packTotal: 1, packsPromoted: 0, objectTotal: 3, objectEstimate: 3, objectsPromoted: 2, completedRevision: null,
+        },
+      });
+    });
+
+    expect(screen.getByText("1/2")).toBeInTheDocument();
+    expect(screen.queryByText("2/3")).not.toBeInTheDocument();
+  });
+
+  it("preserves a failed progress event emitted before a manual start reply", async () => {
+    const fixture = backend();
+    const started = deferred<Awaited<ReturnType<VisualPackBackend["start"]>>>();
+    vi.mocked(fixture.value.start).mockReturnValue(started.promise);
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
     await pressInstall(/scan catalog and estimate/i, /install selection/i);
     await waitFor(() => expect(fixture.value.start).toHaveBeenCalled());
     fixture.emitProgress({
@@ -931,11 +1836,62 @@ describe("VisualPackManager initialization", () => {
       error: "network",
       operation: {
         operationId: OPERATION, catalogRoot: ROOT_A, kind: "install", state: "downloading",
-        packTotal: 1, packsPromoted: 0, objectTotal: 2, objectEstimate: null, objectsPromoted: 1, completedRevision: null,
+        packTotal: 1, packsPromoted: 0, objectTotal: 2, objectEstimate: 2, objectsPromoted: 1, completedRevision: null,
       },
     });
-    await screen.findByRole("button", { name: /resume operation/i });
-  }
+    started.resolve({ status: "started", operationId: OPERATION, catalogRoot: ROOT_A, persistence: "persisted" });
+
+    expect(await screen.findByRole("button", { name: /resume operation/i })).toBeInTheDocument();
+  });
+
+  it("reopens a failed operation only when the backend starts its retry", async () => {
+    const fixture = backend();
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+    await reachFailedOperation(fixture);
+
+    fixture.emitProgress({
+      phase: "started",
+      error: null,
+      operation: {
+        operationId: OPERATION, catalogRoot: ROOT_A, kind: "install", state: "downloading",
+        packTotal: 1, packsPromoted: 0, objectTotal: 2, objectEstimate: 2, objectsPromoted: 0, completedRevision: null,
+      },
+    });
+    expect(await screen.findByText("0/2")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /resume operation/i })).not.toBeInTheDocument();
+
+    fixture.emitProgress({
+      phase: "completed",
+      error: null,
+      operation: {
+        operationId: OPERATION, catalogRoot: ROOT_A, kind: "install", state: "completed",
+        packTotal: 1, packsPromoted: 1, objectTotal: 2, objectEstimate: 2, objectsPromoted: 2, completedRevision: installedRevision("2"),
+      },
+    });
+    expect(await screen.findByText("Completed")).toBeInTheDocument();
+  });
+
+  it("accepts reconciliation cancellation after a retryable failure", async () => {
+    const fixture = backend();
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+    await reachFailedOperation(fixture);
+
+    fixture.emitProgress({
+      phase: "cancelled",
+      error: null,
+      operation: {
+        operationId: OPERATION, catalogRoot: ROOT_A, kind: "install", state: "cancelled",
+        packTotal: 1, packsPromoted: 0, objectTotal: 2, objectEstimate: 2, objectsPromoted: 1, completedRevision: null,
+      },
+    });
+
+    expect(await screen.findByText("Cancelled")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /resume operation/i })).not.toBeInTheDocument();
+  });
 
   it("reports a terminated operation as stopped, not as a cancellation", async () => {
     const fixture = backend();
@@ -1133,5 +2089,175 @@ describe("VisualPackManager initialization", () => {
     render(<VisualPackManager />);
     expect(await screen.findByText("Catálogo visual sin conexión")).toBeInTheDocument();
     expect(screen.getByText(/no ofrece las funciones de almacenamiento local/i)).toBeInTheDocument();
+  });
+});
+
+describe("VisualPackManager offline network boundary", () => {
+  beforeEach(() => {
+    platform.load.mockReset();
+    useConnectivityStore.setState({ forcedOffline: false, browserOnline: true });
+  });
+  afterEach(() => {
+    cleanup();
+    useConnectivityStore.setState({ forcedOffline: false, browserOnline: true });
+  });
+
+  it.each([
+    ["forced offline", { forcedOffline: true, browserOnline: true }],
+    ["browser offline", { forcedOffline: false, browserOnline: false }],
+  ])("disables network actions while %s but keeps local controls available", async (_name, offline) => {
+    useConnectivityStore.setState(offline);
+    const fixture = backend();
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+
+    expect(await screen.findByText(/Network downloads are unavailable while offline/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /check scryfall catalog/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /scan catalog and estimate/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /install selection/i })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("radio", { name: /one image per card/i }));
+    fireEvent.click(screen.getByRole("radio", { name: /deck library/i }));
+    expect(fixture.value.curatedSelector).not.toHaveBeenCalled();
+    expect(fixture.value.deckLibrarySelector).not.toHaveBeenCalled();
+    expect(fixture.value.estimateInstall).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("checkbox"));
+    expect(screen.getByRole("button", { name: /repair selected/i })).toBeDisabled();
+    const verify = screen.getByRole("button", { name: /verify metadata/i });
+    const remove = screen.getByRole("button", { name: /remove selected/i });
+    expect(verify).toBeEnabled();
+    expect(remove).toBeEnabled();
+    fireEvent.click(verify);
+    await waitFor(() => expect(fixture.value.verify).toHaveBeenCalledWith("metadata"));
+    fireEvent.click(screen.getByRole("button", { name: /verify all files/i }));
+    await waitFor(() => expect(fixture.value.verify).toHaveBeenCalledWith("full"));
+    fireEvent.click(remove);
+    await waitFor(() => expect(fixture.value.remove).toHaveBeenCalled());
+    expect(fixture.value.refreshCatalog).not.toHaveBeenCalled();
+    expect(fixture.value.start).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["empty", "forced offline", { forcedOffline: true, browserOnline: true }],
+    ["empty", "browser offline", { forcedOffline: false, browserOnline: false }],
+    ["invalid", "forced offline", { forcedOffline: true, browserOnline: true }],
+    ["invalid", "browser offline", { forcedOffline: false, browserOnline: false }],
+  ] as const)("does not refresh a %s catalog while %s", async (status, _name, offline) => {
+    useConnectivityStore.setState(offline);
+    const fixture = backend(vi.fn(async () => status === "empty"
+      ? { status: "empty" as const }
+      : { status: "invalid" as const }));
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+
+    expect(await screen.findByRole("button", { name: /check scryfall catalog/i })).toBeDisabled();
+    expect(fixture.value.refreshCatalog).not.toHaveBeenCalled();
+  });
+
+  it("rechecks a captured stale callback before pending mutation", async () => {
+    const fixture = backend();
+    platform.load.mockResolvedValue(fixture.value);
+    const { result } = renderHook(() => useVisualPackManager());
+    await waitFor(() => expect(result.current.availability.kind).toBe("ready"));
+
+    const staleRefresh = result.current.refresh;
+    act(() => useConnectivityStore.setState({ forcedOffline: true }));
+    await act(async () => { await staleRefresh(); });
+
+    expect(fixture.value.refreshCatalog).not.toHaveBeenCalled();
+    expect(result.current.pendingActions.size).toBe(0);
+    expect(result.current.availability.kind).toBe("ready");
+  });
+
+  it.each([
+    ["forced offline", { forcedOffline: true, browserOnline: true }],
+    ["browser offline", { forcedOffline: false, browserOnline: false }],
+  ])("cancels a pending curated estimate debounce while %s", async (_name, offline) => {
+    const selector = deferred<CuratedInstallSelector>();
+    const fixture = backend();
+    vi.mocked(fixture.value.curatedSelector).mockReturnValue(selector.promise);
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    const curatedSelection = await screen.findByRole("radio", { name: /one image per card/i });
+    fireEvent.click(curatedSelection);
+    await waitFor(() => expect(fixture.value.curatedSelector).toHaveBeenCalledTimes(1));
+    await act(async () => { selector.resolve({ kind: "curated", membershipDigest: CURATED_DIGEST }); });
+    expect(screen.getByRole("button", { name: /recalculate size/i })).toBeEnabled();
+    act(() => useConnectivityStore.setState(offline));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 250)); });
+
+    expect(fixture.value.estimateInstall).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: /recalculate size/i })).toBeDisabled();
+    expect(screen.queryByText(/working out the size/i)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["forced offline", { forcedOffline: true, browserOnline: true }],
+    ["browser offline", { forcedOffline: false, browserOnline: false }],
+  ])("disables Recalculate and Sync while %s after an estimate, then reconnects without auto-starting", async (_name, offline) => {
+    const fixture = backend(vi.fn(async () => ({ status: "ready" as const, summary: curatedSummary() })));
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    const curatedSelection = await screen.findByRole("radio", { name: /one image per card/i });
+    fireEvent.click(curatedSelection);
+    const sync = await screen.findByRole("button", { name: /sync images/i });
+    await waitFor(() => expect(sync).toBeEnabled());
+    expect(fixture.value.estimateInstall).toHaveBeenCalledWith(
+      { kind: "curated", membershipDigest: CURATED_DIGEST },
+      expect.any(Function),
+    );
+    const estimateCalls = vi.mocked(fixture.value.estimateInstall).mock.calls.length;
+    expect(screen.getByRole("button", { name: /recalculate size/i })).toBeEnabled();
+    expect(sync).toBeEnabled();
+
+    act(() => useConnectivityStore.setState(offline));
+    expect(screen.getByRole("button", { name: /recalculate size/i })).toBeDisabled();
+    expect(sync).toBeDisabled();
+    expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(estimateCalls);
+
+    act(() => useConnectivityStore.setState({ forcedOffline: false, browserOnline: true }));
+    expect(screen.getByRole("button", { name: /recalculate size/i })).toBeEnabled();
+    expect(sync).toBeEnabled();
+    expect(fixture.value.estimateInstall).toHaveBeenCalledTimes(estimateCalls);
+    expect(fixture.value.start).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["forced offline", { forcedOffline: true, browserOnline: true }],
+    ["browser offline", { forcedOffline: false, browserOnline: false }],
+  ])("disables Resume while %s", async (_name, offline) => {
+    const fixture = backend();
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+    await waitFor(() => expect(fixture.value.subscribeProgress).toHaveBeenCalled());
+    const operation = {
+      operationId: OPERATION, catalogRoot: ROOT_A, kind: "install" as const, state: "downloading" as const,
+      packTotal: 1, packsPromoted: 0, objectTotal: 1, objectEstimate: 1, objectsPromoted: 0, completedRevision: null,
+    };
+    fixture.emitProgress({ phase: "failed", error: "network", operation });
+    const resume = await screen.findByRole("button", { name: /resume operation/i });
+    act(() => useConnectivityStore.setState(offline));
+    expect(resume).toBeDisabled();
+    expect(fixture.value.start).not.toHaveBeenCalled();
+  });
+
+  it("keeps cancel available for a fresh active operation offline", async () => {
+    const fixture = backend();
+    platform.load.mockResolvedValue(fixture.value);
+    render(<VisualPackManager />);
+    await screen.findByText(/Offline card images/i);
+    await waitFor(() => expect(fixture.value.subscribeProgress).toHaveBeenCalled());
+    const operation = {
+      operationId: OPERATION, catalogRoot: ROOT_A, kind: "install" as const, state: "downloading" as const,
+      packTotal: 1, packsPromoted: 0, objectTotal: 1, objectEstimate: 1, objectsPromoted: 0, completedRevision: null,
+    };
+    fixture.emitProgress({ phase: "running", error: null, operation });
+    act(() => useConnectivityStore.setState({ forcedOffline: true }));
+    const cancel = await screen.findByRole("button", { name: /cancel operation/i });
+    expect(cancel).toBeEnabled();
+    fireEvent.click(cancel);
+    await waitFor(() => expect(fixture.value.cancel).toHaveBeenCalledWith(OPERATION));
   });
 });

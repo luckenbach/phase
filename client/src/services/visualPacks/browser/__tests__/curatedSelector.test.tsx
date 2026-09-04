@@ -68,7 +68,18 @@ const BOLT_NEW = printing("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "m20", "2019-0
 const BOLT_OLD = printing("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "lea", "1993-08-05");
 
 function cardEntry(oracleId: string, name: string, faceName: string) {
-  return { oracle_id: oracleId, name, face_names: [faceName], faces: [imageFace(oracleId)] };
+  return {
+    oracle_id: oracleId,
+    name,
+    face_names: [faceName],
+    faces: [imageFace(oracleId)],
+    mana_cost: "",
+    cmc: 0,
+    type_line: "",
+    colors: [],
+    color_identity: [],
+    keywords: [],
+  };
 }
 
 const BOLT_ENTRY = cardEntry(BOLT, "Lightning Bolt", "lightning bolt");
@@ -126,6 +137,9 @@ function imageResponse(source: string): Response {
 
 /** A transient image outage: `fetchImage` rejects a non-200 as `network`. */
 let failImages = false;
+let holdLaterImages = false;
+let releaseHeldImages: (() => void) | null = null;
+let heldImages: Promise<void> = Promise.resolve();
 
 const fetchStub = vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
   const source = String(input);
@@ -134,6 +148,7 @@ const fetchStub = vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
   if (source === "/scryfall-data.json") return jsonResponse(CARDS);
   if (source === "/scryfall-printings.json") return jsonResponse(PRINTINGS);
   if (source.startsWith("https://cards.scryfall.io/") || source.startsWith("https://backs.scryfall.io/")) {
+    if (holdLaterImages && imageRequests().length > 1) await heldImages;
     return failImages ? new Response("", { status: 503 }) : imageResponse(source);
   }
   throw new Error(`unexpected fetch: ${source}`);
@@ -155,7 +170,7 @@ const DATABASE = "phase-visual-packs-scryfall-v1";
  * `settle()` reaching `completed`.
  */
 async function interrupt(operation: OperationId): Promise<void> {
-  const database = await openDB(DATABASE, 1);
+  const database = await openDB(DATABASE);
   const record = await database.get("operations", operation);
   await database.put("operations", { ...record, state: "downloading", completedRevision: null });
   database.close();
@@ -184,7 +199,7 @@ async function failures(backend: ScryfallBrowserVisualPackBackend): Promise<Prog
 
 /** Every persisted operation record, read the way a fresh launch reads them. */
 async function operationRecords(): Promise<unknown[]> {
-  const database = await openDB(DATABASE, 1);
+  const database = await openDB(DATABASE);
   const records = await database.getAll("operations");
   database.close();
   return records;
@@ -225,6 +240,8 @@ describe("curated install selector", () => {
     cache = new MemoryCache();
     requested = [];
     failImages = false;
+    holdLaterImages = false;
+    heldImages = new Promise((resolve) => { releaseHeldImages = resolve; });
     fetchStub.mockClear();
     vi.stubGlobal("fetch", fetchStub);
     vi.stubGlobal("caches", { open: async () => cache } as unknown as CacheStorage);
@@ -233,6 +250,8 @@ describe("curated install selector", () => {
   });
 
   afterEach(() => {
+    releaseHeldImages?.();
+    releaseHeldImages = null;
     cleanup();
     vi.unstubAllGlobals();
   });
@@ -258,7 +277,7 @@ describe("curated install selector", () => {
     const status = await backend.operationStatus(operation);
     expect(status.catalogRoot).toBe(summary.catalogRoot);
     expect(status.catalogRoot).not.toBe(digest);
-    expect(summary.selectorCount).toBe(5);
+    expect(summary.selectorCount).toBe(6);
   });
 
   it("records the curated pack at its membership digest and starts at the catalog root", async () => {
@@ -427,7 +446,7 @@ describe("curated install selector", () => {
       const source = String(input);
       if (!promoted && source.startsWith("https://cards.scryfall.io/")) {
         promoted = true;
-        const database = await openDB(DATABASE, 1);
+        const database = await openDB(DATABASE);
         await database.put("packs", {
           id: packId("curated"),
           packId: packId("curated"),
@@ -623,5 +642,30 @@ describe("curated install selector", () => {
     // bulk stream would fail this test at the fetch rather than here.
     expect(requested).not.toContain(BULK_DOWNLOAD_URL);
     expect(imageRequests()).toHaveLength(descriptors.length);
+  });
+
+  it("restores a paused manual install with its saved-image progress", async () => {
+    const backend = await ScryfallBrowserVisualPackBackend.create();
+    await backend.refreshCatalog();
+    const { selector, descriptors } = await curatedSelector();
+    holdLaterImages = true;
+    const started = await backend.start({ kind: "install", selector, objectEstimate: descriptors.length });
+    if (started.status !== "started") throw new Error("curated install did not start");
+
+    await vi.waitFor(async () => {
+      expect((await backend.operationStatus(started.operationId)).objectsPromoted).toBeGreaterThan(0);
+    });
+    platform.load.mockResolvedValue(backend);
+    render(<VisualPackManager />);
+
+    // This panel did not start the operation. Its first visible count therefore
+    // comes from subscribeProgress's current-operation snapshot, not a mocked
+    // progress event or an eventual completion.
+    expect(await screen.findByText(`1/${descriptors.length}`)).toBeInTheDocument();
+    const progress = screen.getAllByRole("progressbar").find((element) => element.getAttribute("value") === "1");
+    expect(progress).toBeDefined();
+
+    releaseHeldImages?.();
+    await settle(backend, started.operationId);
   });
 });

@@ -230,7 +230,7 @@ pub fn resolve(
     }
 
     let live_targets = ability.live_object_targets(state);
-    let targeted_objects = if matches!(
+    let mut targeted_objects = if matches!(
         sacrifice_controller_scope(filter),
         Some(ControllerRef::ParentTargetController)
     ) {
@@ -246,6 +246,24 @@ pub fn resolve(
         };
         crate::game::effects::effect_object_targets(filter, pool)
     };
+
+    // CR 400.7 + CR 603.7c: preserve declared slot numbering while rejecting
+    // the individual stale referent after indexing. Falling through to the
+    // untargeted sacrifice path would make a controller sacrifice a different
+    // permanent, so this exact stale-slot shape resolves as a no-op instead.
+    let stale_parent_target_slot = matches!(filter, TargetFilter::ParentTargetSlot { .. })
+        && targeted_objects
+            .iter()
+            .any(|id| !ability.target_pin_is_current(*id, state));
+    targeted_objects.retain(|id| ability.target_pin_is_current(*id, state));
+    if stale_parent_target_slot {
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+            subject: None,
+        });
+        return Ok(completed_result(0));
+    }
 
     if targeted_objects.is_empty() {
         // CR 701.21a: Derive the player(s) whose permanents are in scope from
@@ -377,6 +395,7 @@ pub fn resolve(
             conditional_enter_with_counters: vec![],
             count_param: 0,
             library_position: None,
+            mass_library_order: None,
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
@@ -389,14 +408,18 @@ pub fn resolve(
 
     let mut selections = Vec::new();
     for obj_id in targeted_objects {
-        // CR 608.2b + CR 111.7: a snapshotted member that no longer exists is a
-        // normal outcome, not an error — a token that left the battlefield
-        // ceases to exist, so a delayed "sacrifice them" whose set lost a member
-        // in the meantime must still sacrifice the survivors ("does as much as
-        // it can"). Erroring here aborted the WHOLE effect on the first missing
-        // id, which is how a Mobilize pair that traded one Warrior in combat
-        // left the other on the battlefield forever (#8147). Skipping matches
-        // the emblem / wrong-zone / wrong-controller guards immediately below.
+        // CR 609.3 / CR 608.2b + CR 111.7: a member of this set that no longer
+        // exists is a normal outcome, not an error. Which rule says so depends
+        // on the caller, and this resolver serves both: for a snapshotted,
+        // non-targeted set the effect "does only as much as possible"
+        // (CR 609.3), while for a genuinely targeted sacrifice the vanished
+        // object is simply an illegal target (CR 608.2b). Either way a token
+        // that left the battlefield has ceased to exist (CR 111.7), so a
+        // delayed "sacrifice them" whose set lost a member must still sacrifice
+        // the survivors. Erroring here aborted the WHOLE effect on the first
+        // missing id, which is how a Mobilize pair that traded one Warrior in
+        // combat left the other on the battlefield forever (#8147). Skipping
+        // matches the emblem / wrong-zone / wrong-controller guards below.
         let Some(obj) = state.objects.get(&obj_id) else {
             continue;
         };

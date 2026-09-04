@@ -1,4 +1,5 @@
 import type { TFunction } from "i18next";
+import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 
 import type {
@@ -15,6 +16,7 @@ import {
   useVisualPackManager,
   type FrozenConfirmation,
 } from "./useVisualPackManager.ts";
+import { useEffectiveOffline } from "../../../stores/connectivityStore.ts";
 
 function errorKey(kind: VisualPackErrorKind): string {
   switch (kind) {
@@ -69,7 +71,10 @@ function confirmationKeys(confirmation: FrozenConfirmation): { title: string; me
 
 export function VisualPackManager() {
   const { t, i18n } = useTranslation("settings");
+  const networkActionsDisabled = useEffectiveOffline();
   const manager = useVisualPackManager();
+  const confirmationLauncherRef = useRef<HTMLButtonElement>(null);
+  const durableFocusRef = useRef<HTMLHeadingElement>(null);
   const confirmationCopy = manager.confirmation ? confirmationKeys(manager.confirmation) : null;
   const refusal = manager.actionErrorRefusal;
   // One message for both places the panel reports a failed action. The figures
@@ -87,10 +92,15 @@ export function VisualPackManager() {
   return (
     <section className="rounded-[20px] border border-white/10 bg-black/18 p-4 shadow-[0_18px_54px_rgba(0,0,0,0.18)] backdrop-blur-md sm:p-5">
       <div className="mb-4">
-        <h3 className="text-[0.68rem] font-semibold uppercase tracking-[0.22em] text-slate-500">
+        <h3
+          ref={durableFocusRef}
+          tabIndex={-1}
+          className="text-[0.68rem] font-semibold uppercase tracking-[0.22em] text-slate-500"
+        >
           {t("visualPacks.title")}
         </h3>
         <p className="mt-2 text-xs leading-relaxed text-slate-400">{t("visualPacks.description")}</p>
+        {networkActionsDisabled && <p className="mt-2 text-xs leading-relaxed text-amber-200">{t("visualPacks.offlineUnavailable")}</p>}
       </div>
       <div aria-live="polite" className="flex flex-col gap-4">
         {manager.availability.kind === "loading" && <p className="text-sm text-slate-300">{t("visualPacks.availability.loading")}</p>}
@@ -116,14 +126,14 @@ export function VisualPackManager() {
             <p className="text-sm text-amber-200">
               {t(manager.availability.kind === "empty" ? "visualPacks.availability.empty" : "visualPacks.availability.invalid")}
             </p>
-            <button type="button" disabled={manager.pendingActions.has("refresh")} onClick={manager.refresh} className="min-h-11 rounded-[12px] border border-sky-400/50 px-4 text-sm text-sky-100 disabled:opacity-40">
+            <button type="button" disabled={networkActionsDisabled || manager.pendingActions.has("refresh")} onClick={manager.refresh} className="min-h-11 rounded-[12px] border border-sky-400/50 px-4 text-sm text-sky-100 disabled:opacity-40">
               {manager.pendingActions.has("refresh") ? t("visualPacks.actions.refreshing") : t("visualPacks.actions.refresh")}
             </button>
           </div>
         )}
         {manager.availability.kind === "ready" && manager.summary && (
           <>
-            <button type="button" disabled={manager.pendingActions.has("refresh")} onClick={manager.refresh} className="min-h-11 self-start rounded-[12px] border border-sky-400/50 px-4 text-sm text-sky-100 disabled:opacity-40">
+            <button type="button" disabled={networkActionsDisabled || manager.pendingActions.has("refresh")} onClick={manager.refresh} className="min-h-11 self-start rounded-[12px] border border-sky-400/50 px-4 text-sm text-sky-100 disabled:opacity-40">
               {manager.pendingActions.has("refresh") ? t("visualPacks.actions.refreshing") : t("visualPacks.actions.refresh")}
             </button>
             {manager.operation && (
@@ -131,6 +141,7 @@ export function VisualPackManager() {
                 operation={manager.operation}
                 progressPhase={manager.progress?.phase ?? null}
                 pendingActions={manager.pendingActions}
+                networkActionsDisabled={networkActionsDisabled}
                 onCancel={manager.cancel}
                 onResume={manager.resume}
               />
@@ -148,27 +159,47 @@ export function VisualPackManager() {
             <PackSelector
               summary={manager.summary}
               curatedSelector={manager.curatedSelector}
+              deckLibrarySelector={manager.deckLibrarySelector}
               curatedDrift={manager.curatedDrift}
+              deckLibraryDrift={manager.deckLibraryDrift}
               estimate={manager.estimate}
               estimateProgress={manager.estimateProgress}
               pendingActions={manager.pendingActions}
               durableMutationActive={manager.durableMutationActive}
+              networkActionsDisabled={networkActionsDisabled}
               onSelectCurated={manager.resolveCuratedSelector}
+              onSelectDeckLibrary={manager.resolveDeckLibrarySelector}
               onEstimate={manager.estimateInstall}
               onInstall={manager.install}
             />
             <PackStatus
               summary={manager.summary}
               curatedDrift={manager.curatedDrift}
+              deckLibraryDrift={manager.deckLibraryDrift}
               verification={manager.verification?.value ?? null}
               removal={manager.removal}
               pendingActions={manager.pendingActions}
               durableMutationActive={manager.durableMutationActive}
+              networkActionsDisabled={networkActionsDisabled}
               onVerify={manager.verify}
               onRepair={manager.repair}
-              onRemoveSelected={manager.removeSelected}
-              onRemoveComplete={manager.removeComplete}
-              onRemoveAll={manager.removeAll}
+              onRemoveSelected={(ids, launcher) => {
+                confirmationLauncherRef.current = launcher;
+                // Non-cascading selections remove immediately. Move focus off
+                // the launcher before that asynchronous mutation disables it;
+                // a cascade confirmation still restores to the explicit
+                // launcher when cancelled.
+                durableFocusRef.current?.focus();
+                manager.removeSelected(ids);
+              }}
+              onRemoveComplete={(launcher) => {
+                confirmationLauncherRef.current = launcher;
+                manager.removeComplete();
+              }}
+              onRemoveAll={(launcher) => {
+                confirmationLauncherRef.current = launcher;
+                manager.removeAll();
+              }}
             />
           </>
         )}
@@ -190,9 +221,15 @@ export function VisualPackManager() {
           ? t(confirmationCopy.message as never, { selection: selectorLabel(manager.confirmation.selector, t) })
           : ""}
         confirmLabel={confirmationCopy ? t(confirmationCopy.action as never) : ""}
-        onConfirm={manager.confirmRemoval}
+        onConfirm={() => {
+          // A successful removal may disable its launcher. Move focus to a
+          // durable section landmark before the nested scope unmounts.
+          durableFocusRef.current?.focus();
+          manager.confirmRemoval();
+        }}
         onCancel={manager.dismissConfirmation}
         tone="danger"
+        returnFocusRef={confirmationLauncherRef}
       />
     </section>
   );

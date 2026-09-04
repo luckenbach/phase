@@ -1116,7 +1116,15 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
             && state.resolution_stack.is_empty()
             && state.resolving_stack_entry.is_none()
             && matches!(state.waiting_for, WaitingFor::Priority { .. }),
-        "start_next_turn requires an empty stack, no pending resolution carrier, and a settled Priority window"
+        "start_next_turn requires an empty stack, no pending resolution carrier, and a settled \
+         Priority window (turn {}, phase {:?}, stack {}, waiting_for {:?}, carrier {:?}, \
+         resolution_stack {:?})",
+        state.turn_number,
+        state.phase,
+        state.stack.len(),
+        state.waiting_for,
+        state.resolving_stack_entry,
+        state.resolution_stack,
     );
     // CR 805.4b: defensively drop any stale draw-step queue entries. The
     // queue is normally drained to empty before a turn ends, but a turn
@@ -1587,10 +1595,11 @@ pub fn execute_untap_with_choices(
             );
         }
     }
-    // CR 514.2 + CR 611.2a/b: Expire `PlayFromExile` permissions granted to
-    // the active player with `UntilYourNextTurn` duration (impulse draws that
-    // last "until your next turn").
-    super::layers::prune_until_next_turn_casting_permissions(state, active);
+    // CR 500.4 + CR 514.2: the untap-step seam for casting permissions — arms
+    // "until the end of your next turn" grants and expires both untap-step
+    // shapes ("until your next turn" and "until [its controller's] next untap
+    // step"). See `layers::prune_untap_step_casting_permissions`.
+    super::layers::prune_untap_step_casting_permissions(state, active);
     for obj in state.objects.iter_mut().map(|(_, v)| v) {
         obj.replacement_definitions.retain(|r| {
             !matches!(r.expiry, Some(RestrictionExpiry::UntilPlayerNextTurn { player }) if player == active)
@@ -3285,14 +3294,11 @@ fn auto_advance_once(state: &mut GameState, events: &mut Vec<GameEvent>) -> Auto
             super::combat::prune_attackers_not_in_play(state);
             let has_attackers = super::combat::has_attackers_in_play(state);
             if has_attackers {
-                // CR 509.1 + CR 117.1c: The declare blockers turn-based action always
-                // runs — even when no legal blocks are available — and the active
-                // player always receives priority during the step (required for
-                // instants and Ninjutsu-family activations per CR 702.49, notably
-                // Sneak which is restricted to this step). The phase layer only
-                // emits the interactive waiting state; whether to auto-submit empty
-                // blockers (because no legal blocks exist, or because the defender
-                // is in UntilEndOfTurn mode) is decided by `run_auto_pass_loop`.
+                // CR 509.1: The declare blockers turn-based action always runs,
+                // including when no legal blocks are available. The phase layer emits
+                // the defender's interactive waiting state; `run_auto_pass_loop`
+                // auto-submits only declarations with no remaining blocking choice.
+                // CR 509.2 gives the active player priority after the declaration.
                 let defending = combat::next_defending_player_to_declare_blockers(state)
                     .unwrap_or_else(|| super::players::next_player(state, state.active_player));
                 let valid_block_targets =
@@ -3485,7 +3491,10 @@ mod tests {
                 .downcast_ref::<&str>()
                 .copied()
                 .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
-            assert_eq!(message, Some(MESSAGE));
+            assert!(
+                message.is_some_and(|message| message.starts_with(MESSAGE)),
+                "unexpected panic payload: {message:?}"
+            );
             assert_eq!(
                 serde_json::to_vec(&state).expect("serialize rejected state"),
                 before
@@ -3842,6 +3851,127 @@ mod tests {
                 player: PlayerId(0)
             }
         ));
+    }
+
+    /// CR 509.1 + CR 802.4: Each defending player makes a separate blocker
+    /// declaration in turn order. P1's turn-boundary preference may be stored,
+    /// but it cannot choose P1's optional blocks or leak into P2's declaration.
+    #[test]
+    fn multiplayer_blocker_auto_pass_retains_owner_prompt_and_does_not_leak() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 42);
+        state.active_player = PlayerId(0);
+        state.phase = Phase::DeclareBlockers;
+
+        let attacker_to_p1 = create_object(
+            &mut state,
+            CardId(5),
+            PlayerId(0),
+            "Attacker to P1".to_string(),
+            Zone::Battlefield,
+        );
+        let attacker_to_p2 = create_object(
+            &mut state,
+            CardId(6),
+            PlayerId(0),
+            "Attacker to P2".to_string(),
+            Zone::Battlefield,
+        );
+        let blocker_p1 = create_object(
+            &mut state,
+            CardId(7),
+            PlayerId(1),
+            "P1 Blocker".to_string(),
+            Zone::Battlefield,
+        );
+        let blocker_p2 = create_object(
+            &mut state,
+            CardId(8),
+            PlayerId(2),
+            "P2 Blocker".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [attacker_to_p1, attacker_to_p2, blocker_p1, blocker_p2] {
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(crate::types::card_type::CoreType::Creature);
+        }
+        state.combat = Some(combat::CombatState {
+            attackers: vec![
+                combat::AttackerInfo::new(
+                    attacker_to_p1,
+                    combat::AttackTarget::Player(PlayerId(1)),
+                    PlayerId(1),
+                ),
+                combat::AttackerInfo::new(
+                    attacker_to_p2,
+                    combat::AttackTarget::Player(PlayerId(2)),
+                    PlayerId(2),
+                ),
+            ],
+            ..Default::default()
+        });
+
+        let waiting = auto_advance(&mut state, &mut Vec::new());
+        assert!(matches!(
+            waiting,
+            WaitingFor::DeclareBlockers {
+                player: PlayerId(1),
+                ..
+            }
+        ));
+        state.waiting_for = waiting;
+
+        let armed = apply(
+            &mut state,
+            PlayerId(1),
+            GameAction::SetAutoPass {
+                mode: crate::types::game_state::AutoPassRequest::UntilTurnBoundary {
+                    until: TurnBoundary::EndOfCurrentTurn,
+                },
+            },
+        )
+        .expect("P1 can store a turn-boundary preference while declaring blockers");
+        assert!(matches!(
+            armed.waiting_for,
+            WaitingFor::DeclareBlockers {
+                player: PlayerId(1),
+                ..
+            }
+        ));
+        assert!(armed
+            .events
+            .iter()
+            .all(|event| !matches!(event, GameEvent::BlockersDeclared { .. })));
+
+        let result = apply(
+            &mut state,
+            PlayerId(1),
+            GameAction::DeclareBlockers {
+                assignments: Vec::new(),
+            },
+        )
+        .expect("P1 may manually decline its optional block");
+
+        assert!(matches!(
+            result.waiting_for,
+            WaitingFor::DeclareBlockers {
+                player: PlayerId(2),
+                ..
+            }
+        ));
+        assert!(
+            !state.auto_pass.contains_key(&PlayerId(1)),
+            "P1's manual declaration cancels only P1's standing preference"
+        );
+        assert_eq!(
+            state.combat.as_ref().unwrap().blockers_declared_by,
+            vec![PlayerId(1)],
+            "P2 has not yet declared blockers"
+        );
     }
 
     #[test]

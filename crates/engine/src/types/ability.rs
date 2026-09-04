@@ -57,6 +57,22 @@ pub enum Chooser {
     OwningPlayer,
 }
 
+/// CR 608.2d: Resolution-time choice cardinality.
+///
+/// Unlike the legacy `min`/`max` range, an exact selection is infeasible when
+/// fewer eligible objects exist and is therefore suitable for optional actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ObjectSelectionCardinality {
+    Exactly { count: u32 },
+}
+
+/// CR 608.2d + CR 101.2: Additional eligibility required before an object may
+/// be selected for a counter-removal instruction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObjectSelectionEligibility {
+    RemovableCounter { counter_type: Option<CounterType> },
+}
+
 #[cfg(test)]
 mod trigger_occurrence_tests {
     use super::*;
@@ -1639,6 +1655,16 @@ pub enum CardPlayMode {
     Play,
 }
 
+impl CardPlayMode {
+    pub fn is_play(&self) -> bool {
+        matches!(self, Self::Play)
+    }
+}
+
+fn play_from_exile_mode_default() -> CardPlayMode {
+    CardPlayMode::Play
+}
+
 impl fmt::Display for CardPlayMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2465,9 +2491,13 @@ pub enum EventCounterReproductionCount {
 /// than as sibling `Option` fields on `Effect::Counter` (parameterize, don't
 /// proliferate).
 /// serde default for `CounterSourceRider::LosesAbilities::duration` — keeps
-/// card-data serialized before the field was added deserializing correctly
-/// (CR 611.2a: the loses-abilities effect lasts until the counter source leaves
-/// the battlefield).
+/// card-data serialized before the field was added deserializing correctly.
+/// Deliberately the OLD reading: before the field existed the resolver
+/// hard-coded the CR 702.26d event deadline (`UntilHostLeavesPlay`, running
+/// across a phase-out), so pre-field data keeps exactly the behavior it was
+/// serialized with. The CURRENT parser emits `WhileHostOnBattlefield`
+/// (see the doc on `LosesAbilities`), so freshly parsed data never takes this
+/// default.
 fn duration_until_host_leaves_play() -> Box<Duration> {
     Box::new(Duration::UntilHostLeavesPlay)
 }
@@ -2480,10 +2510,14 @@ pub enum CounterSourceRider {
     /// (Tishana's Tidebinder).
     ///
     /// CR 611.2a: `duration` is the continuous effect's lifetime — Tishana's
-    /// "for as long as this creature remains on the battlefield" is
-    /// `Duration::UntilHostLeavesPlay`. Surfaced as an explicit field (rather
-    /// than hard-coded in the resolver) so the "as long as" clause is visible
-    /// in the serialized AST and threaded to the transient continuous effect.
+    /// "for as long as this creature remains on the battlefield" is the
+    /// presence-bound state reading, `Duration::WhileHostOnBattlefield`
+    /// (emitted by `sequence.rs`'s rider assembly): per CR 611.2b +
+    /// CR 702.26f it also ends when Tishana phases out, not only when she
+    /// leaves the battlefield, and once lapsed it never restarts. Surfaced as
+    /// an explicit field (rather than hard-coded in the resolver) so the
+    /// "as long as" clause is visible in the serialized AST and threaded to
+    /// the transient continuous effect.
     LosesAbilities {
         static_def: Box<StaticDefinition>,
         // Boxed: `Duration` is a large enum, and this rider is embedded in the
@@ -3487,9 +3521,64 @@ pub enum Duration {
         player: PlayerScope,
     },
     /// CR 611.2a: Effect expires when the source object leaves the
-    /// battlefield.
+    /// battlefield — the general "lasts as long as stated" rule.
+    ///
+    /// This is the EVENT-deadline reading: the printed wording "until ~
+    /// leaves the battlefield", plus the implicit host-lifetime stamps that
+    /// name the same boundary without printing a duration (the CR 610.3
+    /// exile/return pairs, the Saga chapter grants). CR 611.2b does not
+    /// govern it, and neither does
+    /// CR 702.26f: a phase-out is not the permanent leaving the battlefield
+    /// (CR 702.26d), so a phased-out host keeps this duration running.
+    ///
+    /// The stated state readings are separate variants:
+    /// [`Self::WhileHostOnBattlefield`] ("for as long as ~ remains on the
+    /// battlefield") and [`Self::WhileControllingHost`] ("for as long as you
+    /// control ~"). Conflating the presence reading with this one either ends
+    /// the event-bound cards on a phase-out or keeps the state-bound ones
+    /// alive across one — which is why they are two variants and not a text
+    /// match at the consumer.
+    ///
+    /// A control change ends neither this nor
+    /// [`Self::WhileHostOnBattlefield`]; that is
+    /// [`Self::WhileControllingHost`]'s extra leg.
     UntilHostLeavesPlay,
-    /// CR 500.1 + CR 611.2a: Effect expires at the beginning of `player`'s
+    /// CR 611.2b + CR 702.26f: "for as long as ~ remains on the battlefield"
+    /// (Intet, the Dreamer; The Day of the Doctor; Sower of Temptation;
+    /// Tishana's Tidebinder's countered-this-way rider) — the PRESENCE-bound
+    /// state reading. It is one of the "for as long as . . ." durations
+    /// CR 611.2b governs, so CR 702.26f ends it when the host phases out:
+    /// "effects with 'for as long as' durations that track that permanent
+    /// (see rule 611.2b) end when that permanent phases out because they can
+    /// no longer see it."
+    ///
+    /// ENDS — not pauses — so a later phase-in must not revive the effect:
+    /// `layers::prune_lapsed_host_bound_effects` removes a transient effect
+    /// whose host is phased out, and
+    /// `layers::prune_lapsed_host_bound_casting_permissions` revokes a
+    /// permission carrying it. The battlefield exit itself is ended by the
+    /// shared `ends_when_host_leaves_play` consumers, the boundary this
+    /// reading and the event reading have in common.
+    WhileHostOnBattlefield,
+    /// CR 611.2b: "for as long as you control ~" — the host-lifetime reading
+    /// that ALSO ends when control of the host changes. CR 611.2b's own Master
+    /// Thief example is this duration CLASS — it illustrates the duration failing
+    /// to START rather than this end, which is read off the wording — so the two
+    /// host readings are separate variants rather than one: conflating them either
+    /// keeps a permission alive after its grantor was stolen, or revokes
+    /// Intet's presence-bound permission on a control change that CR 611.2a
+    /// leaves untouched.
+    ///
+    /// Ends on any of the three legs of
+    /// `game::replacement::controller_controls_source_gate` — host left the
+    /// battlefield, another player gained control of it, or it phased out
+    /// (CR 702.26f) — which is the single authority for this duration and is
+    /// already shared by the `ControllerControlsSource` replacement condition.
+    /// The player control is measured against is the carrier's own controller
+    /// field (`TransientContinuousEffect::controller`, or a casting
+    /// permission's `granted_to`), so the variant carries no payload.
+    WhileControllingHost,
+    /// CR 500.4 + CR 611.2a: Effect expires at the beginning of `player`'s
     /// next named phase/step. `Phase::Untap` covers exert / "doesn't untap"
     /// effects (CR 502.3). `Phase::End` covers "until your next end step"
     /// floating play-permission patterns such as Rocco, Street Chef (CR 513.1).
@@ -3524,7 +3613,9 @@ pub enum DurationEvent {
 impl Duration {
     pub const fn zone_change_event(&self) -> Option<DurationEvent> {
         match self {
-            Self::UntilHostLeavesPlay => Some(DurationEvent::SourceLeftBattlefield),
+            Self::UntilHostLeavesPlay
+            | Self::WhileControllingHost
+            | Self::WhileHostOnBattlefield => Some(DurationEvent::SourceLeftBattlefield),
             Self::UntilOpponentBecomesMonarch => Some(DurationEvent::OpponentBecameMonarch),
             Self::UntilEndOfTurn
             | Self::UntilEndOfCombat
@@ -3534,6 +3625,40 @@ impl Duration {
             | Self::ForAsLongAs { .. }
             | Self::UntilSourceExilesAnotherCard
             | Self::Permanent => None,
+        }
+    }
+
+    /// CR 611.2a + CR 611.2b: true for every duration that ends when the host
+    /// leaves the battlefield.
+    ///
+    /// All three host-lifetime readings do: [`Self::UntilHostLeavesPlay`] ends
+    /// ONLY then, [`Self::WhileHostOnBattlefield`] ends then *or* on a
+    /// phase-out (CR 702.26f), [`Self::WhileControllingHost`] ends then *or*
+    /// on a control change or phase-out.
+    /// Every battlefield-exit consumer asks this instead of comparing against a
+    /// single variant, so a control-bound duration can never be left out of an
+    /// exit path by omission — the failure mode a hand-written variant list has
+    /// each time a sibling is added.
+    pub const fn ends_when_host_leaves_play(&self) -> bool {
+        match self {
+            Self::UntilHostLeavesPlay
+            | Self::WhileControllingHost
+            | Self::WhileHostOnBattlefield => true,
+            // Listed rather than swept into `_` for the reason above: this
+            // predicate gates EVERY battlefield-exit consumer, so a new
+            // duration that ends on a host exit has to register here by hand.
+            // Behind a wildcard it would fall to `false` silently and be left
+            // out of every exit path — the failure this predicate exists to
+            // prevent, one level up.
+            Self::UntilEndOfTurn
+            | Self::UntilEndOfCombat
+            | Self::UntilNextTurnOf { .. }
+            | Self::UntilEndOfNextTurnOf { .. }
+            | Self::UntilNextStepOf { .. }
+            | Self::ForAsLongAs { .. }
+            | Self::UntilSourceExilesAnotherCard
+            | Self::UntilOpponentBecomesMonarch
+            | Self::Permanent => false,
         }
     }
 }
@@ -3938,6 +4063,22 @@ pub enum CastingPermission {
         /// declines or fails to cast.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration: Option<Duration>,
+        /// CR 611.2a + CR 400.7: Identity of the permanent whose continued
+        /// presence bounds `duration`. `record_lingering_permissions` stamps
+        /// it for every grant it builds, host-bound or not; the battlefield-
+        /// exit pass consults it only after `ends_when_host_leaves_play`
+        /// affirms the duration, and grants serialized before the field
+        /// existed carry `None`. Parallel to
+        /// `PlayFromExile::source_id`, which the land-play companion of this
+        /// same grant already carries, so the cast and land halves of one
+        /// `CastFromZone` are revoked by the same battlefield-exit pass
+        /// (`layers::prune_host_left_casting_permissions`).
+        ///
+        /// Without it a `Duration::UntilHostLeavesPlay` grant is unenforceable:
+        /// the battlefield-exit lifecycle knows the departed object's id and
+        /// has no way to ask which permissions that object issued.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<ObjectId>,
         /// CR 614.1a + CR 608.2n: Torrential Gearhulk / Kylox's Voltstrider
         /// class — a `CastFromZone` grant whose sub-ability is "if that spell
         /// would be put into a graveyard, [exile it / put it on the bottom of
@@ -4003,6 +4144,17 @@ pub enum CastingPermission {
     PlayFromExile {
         duration: Duration,
         granted_to: PlayerId,
+        /// CR 305.1 + CR 305.9: A "play" permission can authorize either a
+        /// spell cast or a land special action; a "cast" permission cannot
+        /// authorize a land play. This field deliberately defaults to `Play` for legacy
+        /// serialized grants, even though `CardPlayMode` itself defaults to
+        /// `Cast`: `PlayFromExile` was historically the "may play" building
+        /// block.
+        #[serde(
+            default = "play_from_exile_mode_default",
+            skip_serializing_if = "CardPlayMode::is_play"
+        )]
+        mode: CardPlayMode,
         /// CR 601.2a: Per-source use frequency for persistent play
         /// permissions. `Unlimited` preserves existing impulse-draw behavior;
         /// `OncePerTurn` models linked static permissions like Evelyn.
@@ -4060,6 +4212,22 @@ pub enum CastingPermission {
         /// ("Each spell cast this way costs {1} more to cast." — Lightstall Inquisitor).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cast_cost_raise: Option<ManaCost>,
+        /// CR 118.9 + CR 119.4: Optional non-mana alternative cost that REPLACES
+        /// the mana cost for a spell cast via this permission ("If you cast a
+        /// spell this way, pay life equal to its mana value rather than pay its
+        /// mana cost." — Inside Information). Unlike `ExileWithAltAbilityCost`
+        /// (a standalone permission built by `CastFromZone`'s spell-only "cast"
+        /// grammar), this field lives directly on a `PlayFromExile` grant so a
+        /// single permission can authorize BOTH a CR 305.1 land play (unaffected
+        /// — lands have no mana cost to replace) and a spell cast (mana cost
+        /// replaced by this cost) from the same exiled batch. `None` (the common
+        /// case) leaves every other `PlayFromExile` grant's spells payable at
+        /// their normal printed mana cost. Read by
+        /// `casting::alt_cost_from_exile`-style zeroing and
+        /// `casting_costs::check_additional_cost_or_pay`'s alt-cost payment,
+        /// mirroring the `ExileWithAltAbilityCost` consumption path exactly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alt_ability_cost: Option<AbilityCost>,
         /// CR 614.1c: Lands played via this permission enter with this tap state
         /// ("Each land played this way enters tapped." — Lightstall Inquisitor).
         /// "enters tapped" is a CR 614.1c "[permanent] enters ..." replacement.
@@ -4107,6 +4275,31 @@ pub enum CastingPermission {
         /// that field for the full rationale on owner-versus-grantee binding.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         granted_to: Option<PlayerId>,
+        /// CR 611.2a: Mirrors `ExileWithAltCost.duration`. The non-mana
+        /// alternative cost changes only HOW the spell is paid for (CR 118.9),
+        /// never how long the permission lasts, so the two alternative-cost
+        /// forms carry the same lifetime slot and are pruned by the same
+        /// passes. Without it a stated lifetime printed on a non-mana
+        /// alternative-cost grant is dropped where the permission is built and
+        /// the grant becomes indefinite — Nashi, Moon Sage's Scion ("Until end
+        /// of turn, you may play one of those cards" + "pay life equal to its
+        /// mana value rather than paying its mana cost"), whose exiled cards
+        /// stayed playable for the rest of the game. Hama, the Bloodbender
+        /// prints the same pairing but does NOT reach this variant today: its
+        /// "waterbending {X}" is not recognised by `parse_alt_ability_cost_rider`,
+        /// so the grant lowers to `ExileWithAltCost`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration: Option<Duration>,
+        /// CR 611.2a + CR 400.7: Mirrors `ExileWithAltCost.source_id` — the
+        /// identity of the permanent whose continued presence (and, for
+        /// `Duration::WhileControllingHost`, continued control) bounds
+        /// `duration`. Stamped for every grant its builder emits; the
+        /// battlefield-exit pass consults it only after
+        /// `ends_when_host_leaves_play` affirms the duration, other deadline
+        /// prunes (the exile-link pass) read it for their own durations, and
+        /// grants serialized before the field existed carry `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<ObjectId>,
     },
     /// CR 702.185a: Warp — card may be cast from exile at its normal mana cost,
     /// but only after the specified turn ends. Persists for as long as card remains exiled.
@@ -4127,6 +4320,142 @@ pub enum CastingPermission {
     /// when the special action resolves; the permission is scoped to the exile
     /// zone and cleared when the object leaves exile.
     Foretold { cost: ManaCost, turn_foretold: u32 },
+}
+
+/// CR 611.2a: the stated lifetime of a casting permission together with the
+/// provenance its expiry needs. Produced by [`CastingPermission::lifetime`].
+///
+/// `keyed_player` is the player a `PlayerScope::Controller` duration is measured
+/// against; `source_id` is the permanent a host-bound duration follows.
+#[derive(Debug, Clone, Copy)]
+pub struct PermissionLifetime<'a> {
+    pub duration: Option<&'a Duration>,
+    pub keyed_player: Option<PlayerId>,
+    pub source_id: Option<ObjectId>,
+}
+
+impl CastingPermission {
+    /// CR 611.2a: read this permission's stated lifetime and the provenance
+    /// needed to evaluate it.
+    ///
+    /// This is the single place that knows WHICH variants carry a lifetime and
+    /// WHERE each keeps it. Every expiry pass in `game::layers` reads a
+    /// permission through it instead of repeating a per-variant arm list.
+    ///
+    /// That repetition is what let `ExileWithAltAbilityCost` ship with no
+    /// lifetime slot at all — not by being MISSING from the lists (it was in
+    /// every one of them) but by being in each list's retain-`true` arm, which
+    /// is where a variant with no `duration` field to match on inevitably
+    /// lands. No single place could be read to notice that the field was
+    /// absent. An accessor that must PRODUCE the field is that place.
+    ///
+    /// The match is wildcard-free, so a new permission variant is a COMPILE
+    /// ERROR here and must state whether it carries a lifetime.
+    ///
+    /// `keyed_player` for `PlayFromExile` is `exiled_by_ability_controller`
+    /// before `granted_to` (CR 611.2a): Memory Vessel's "Until your next turn,
+    /// players may play cards they exiled this way" measures "your" against the
+    /// activator, while each card's `granted_to` is its own owner. The two
+    /// alternative-cost forms (CR 118.9) carry only `granted_to`.
+    pub fn lifetime(&self) -> PermissionLifetime<'_> {
+        match self {
+            Self::PlayFromExile {
+                duration,
+                granted_to,
+                exiled_by_ability_controller,
+                source_id,
+                ..
+            } => PermissionLifetime {
+                duration: Some(duration),
+                keyed_player: Some(exiled_by_ability_controller.unwrap_or(*granted_to)),
+                source_id: *source_id,
+            },
+            // CR 118.9: the mana and non-mana alternative-cost forms differ only
+            // in HOW the spell is paid for, never in how long the permission
+            // lasts, so they answer this question identically.
+            Self::ExileWithAltCost {
+                duration,
+                granted_to,
+                source_id,
+                ..
+            }
+            | Self::ExileWithAltAbilityCost {
+                duration,
+                granted_to,
+                source_id,
+                ..
+            } => PermissionLifetime {
+                duration: duration.as_ref(),
+                keyed_player: *granted_to,
+                source_id: *source_id,
+            },
+            // CR 702.170d + CR 702.143a: Plot and Foretell are explicitly
+            // castable on a LATER turn, so no turn/step window may end them.
+            // The remaining three are exile-resident standing grants ended by
+            // `zones::apply_zone_exit_cleanup` when the card leaves exile.
+            Self::AdventureCreature
+            | Self::ExileWithEnergyCost
+            | Self::WarpExile { .. }
+            | Self::Plotted { .. }
+            | Self::Foretold { .. } => PermissionLifetime {
+                duration: None,
+                keyed_player: None,
+                source_id: None,
+            },
+        }
+    }
+
+    /// CR 514.2: mutable access to the same lifetime, for the untap-step
+    /// *arming* of `UntilEndOfNextTurnOf` (converted to `UntilEndOfTurn` so the
+    /// cleanup pass ends it at the end of that turn). Same variant knowledge as
+    /// [`Self::lifetime`], same wildcard-free match.
+    ///
+    /// The player it returns is the GRANTEE (`granted_to`), which is
+    /// deliberately NOT [`PermissionLifetime::keyed_player`]: arming and expiry
+    /// answer different questions.
+    ///
+    /// * Arming asks whose "next turn" the printed text names. For a per-owner
+    ///   grant that is the card's own owner — Suspend Aggression: "For each of
+    ///   those cards, ITS OWNER may play it until the end of THEIR next turn."
+    ///   `granted_to` carries exactly that.
+    /// * A `PlayerScope::Controller` step/turn deadline asks whose turn the
+    ///   granting effect meant by "your", which for the same per-owner grant is
+    ///   the activator — Memory Vessel: "Until YOUR next turn, players may play
+    ///   cards they exiled this way." That is `exiled_by_ability_controller`
+    ///   before `granted_to`, and it is what `lifetime()` returns.
+    ///
+    /// Collapsing the two lets a Suspend Aggression grant arm on the activator's
+    /// untap step instead of the owner's, which extends it by a full turn cycle.
+    pub fn lifetime_mut(&mut self) -> (Option<&mut Duration>, Option<PlayerId>) {
+        match self {
+            Self::PlayFromExile {
+                duration,
+                granted_to,
+                ..
+            } => {
+                let grantee = *granted_to;
+                (Some(duration), Some(grantee))
+            }
+            Self::ExileWithAltCost {
+                duration,
+                granted_to,
+                ..
+            }
+            | Self::ExileWithAltAbilityCost {
+                duration,
+                granted_to,
+                ..
+            } => {
+                let keyed = *granted_to;
+                (duration.as_mut(), keyed)
+            }
+            Self::AdventureCreature
+            | Self::ExileWithEnergyCost
+            | Self::WarpExile { .. }
+            | Self::Plotted { .. }
+            | Self::Foretold { .. } => (None, None),
+        }
+    }
 }
 
 /// CR 611.2a: Non-time condition that invalidates a per-card play permission.
@@ -6041,6 +6370,25 @@ pub enum ThisWayCause {
     /// CR 608.2c + CR 400.7: the member was bounced (returned to its owner's
     /// hand) this way by a mass-bounce instruction.
     Bounced,
+    /// CR 608.2c + CR 400.7: the member landed in a graveyard this way as the
+    /// non-selected "rest" partition of a reveal/look split (a Dig-style "put
+    /// [kept subset] into your hand and the rest into your graveyard" — no
+    /// dedicated keyword action governs this landing zone, so it is
+    /// distinguished purely by destination, like `Returned`/`Bounced`).
+    /// Dihada, Binder of Wills's -3: "Create a Treasure token for each card
+    /// put into your graveyard this way."
+    ///
+    /// This is the third member of the "plain zone change, distinguished
+    /// purely by destination" family alongside `Returned` (battlefield) and
+    /// `Bounced` (hand) — the add-engine-variant sibling-cluster check flags
+    /// three same-shape unit variants as a parameterization candidate (e.g.
+    /// `PutInto(PlainZoneMoveDestination)`). That consolidation is deferred
+    /// rather than folded into this issue-scoped fix: `ThisWayCause` is
+    /// `Serialize`/`Deserialize` and reachable from `GameState`, so collapsing
+    /// the two EXISTING variants would be a wire-format change with a much
+    /// wider blast radius than adding one new leaf — out of scope for a
+    /// single-card bug fix (issue #8159).
+    PutIntoGraveyard,
 }
 
 /// CR 113.3b / CR 113.3c: Which stack ability kinds a `StackAbility` filter accepts.
@@ -6300,14 +6648,12 @@ pub enum TargetFilter {
     TriggeringPlayer,
     /// CR 603.7c: Resolves to the source object of the triggering event.
     TriggeringSource,
-    /// CR 603.2 + CR 120.1: Resolves to the object that *received* the damage
-    /// referenced by the current trigger event — the recipient counterpart to
-    /// [`TargetFilter::TriggeringSource`] and the `TargetFilter`-side analogue of
-    /// [`ObjectScope::EventTarget`]. This binds "that creature" / "that
-    /// permanent" in an intervening-`if` (CR 603.4) to the *specific* damaged
-    /// object carried by the `DamageDealt` event, not a generic type filter, so
-    /// "if that creature was dealt excess damage this turn" (Maarika, Brutal
-    /// Gladiator) checks only the creature this trigger's damage went to.
+    /// CR 603.2: Resolves to the object targeted or receiving the current
+    /// trigger event — the target counterpart to [`TargetFilter::TriggeringSource`]
+    /// and the `TargetFilter`-side analogue of [`ObjectScope::EventTarget`].
+    /// This binds "that creature" / "that permanent" in an intervening-`if`
+    /// (CR 603.4) to the event's *specific* object, not a generic type filter.
+    /// It covers damage recipients and objects that become targets.
     /// Resolved via `extract_target_object_from_event` against
     /// `state.current_trigger_event`; matches no object outside a trigger.
     /// DealDamage has a narrow CR 115.10a / CR 120.3 exception for "that
@@ -6762,14 +7108,12 @@ pub enum ObjectScope {
     /// resolution-local state carried by `ResolvedAbility.amassed_army_object`,
     /// not the generic demonstrative/effect-context slot.
     AmassedArmy,
-    /// CR 603.2 + CR 120.1: The object that **received** the damage referenced
-    /// by the current trigger event — the recipient counterpart to
-    /// [`ObjectScope::EventSource`]. This is "that creature" in "deals
-    /// noncombat damage to a creature equal to that creature's toughness":
-    /// the antecedent is the damaged object carried by the `DamageDealt` event,
-    /// not the ability source or a target. Resolved at both trigger detection
-    /// and resolution (CR 603.4 intervening-if) via
-    /// `extract_target_object_from_event`.
+    /// CR 603.2: The object targeted or receiving the current trigger event —
+    /// the target counterpart to [`ObjectScope::EventSource`]. This includes a
+    /// damage recipient and a permanent that becomes a spell or ability target;
+    /// the antecedent is the event's carried object, not the ability source or
+    /// a newly chosen target. Resolved at both trigger detection and resolution
+    /// (CR 603.4 intervening-if) via `extract_target_object_from_event`.
     EventTarget,
     /// CR 608.2c + CR 701.20b + CR 108.3 + CR 202.3: In an exactly-two-target
     /// symmetric reveal ("two target players each reveal the top card of their
@@ -9488,6 +9832,76 @@ pub(crate) enum ConditionContinuation {
     PendingCast,
 }
 
+impl StaticMode {
+    /// Engine limitation, not CR-mandated: does THIS static mode's ENFORCEMENT
+    /// POINT actually run `continuation`?
+    ///
+    /// This is the mode-side half of the [`ConditionContinuation`] contract. A
+    /// leaf that needs a continuation ([`StaticCondition::required_continuation`])
+    /// is satisfiable only where the enforcement point runs it; everywhere else
+    /// the layer pipeline can only ever return its degenerate `false`, so a
+    /// parser that attaches such a leaf reports a condition "supported" that no
+    /// player can ever satisfy.
+    ///
+    /// Dispatching on the CONTINUATION (two variants, each naming the one
+    /// runtime site that provides it) rather than on `StaticMode` (122 variants)
+    /// is deliberate: the fact being encoded is "which enforcement point runs
+    /// this round-trip", and each answer is verifiable by reading that one site.
+    /// A 122-arm match would instead demand a guess per mode, and a wrong guess
+    /// in either direction is a defect — `false` demotes working cards to
+    /// unsupported, `true` re-creates the false green. Adding a
+    /// `ConditionContinuation` variant IS a compile error here.
+    pub(crate) fn provides_continuation(&self, continuation: ConditionContinuation) -> bool {
+        match continuation {
+            // CR 118.12a + CR 508.1h-j / CR 509.1d-f: the payment is OFFERED
+            // exactly once — CR 509.1d "if any of the chosen creatures require
+            // paying costs to block, the defending player determines the total
+            // cost to block" (CR 508.1h is the attack-side twin) — and
+            // CR 118.12a + CR 508.1d / CR 509.1c make that offer the whole
+            // enforcement mechanism, since the player is never REQUIRED to pay.
+            // The engine runs it in one place: `combat::combat_tax_mode_matches`
+            // / `WaitingFor::CombatTaxPayment` at attack/block declaration, and
+            // that site inspects exactly these three modes. Any other mode —
+            // `CantBeBlocked` (Awesome Presence), `BlockRestriction`
+            // (Hipparion), `CantUntap`, `CantBeActivated`, … — has no prompt,
+            // so an `UnlessPay` gate on it is unsatisfiable by construction.
+            // Kept in sync with combat.rs by
+            // `combat::tests::combat_tax_mode_match_agrees_with_provides_continuation`.
+            ConditionContinuation::OptionalCostPayment => matches!(
+                self,
+                StaticMode::CantAttack | StaticMode::CantBlock | StaticMode::CantAttackOrBlock
+            ),
+            // CR 601.2f: `casting::collect_self_spell_cost_modifiers` reads
+            // `state.pending_cast` while a cast of the source object is in
+            // flight. CR 502.3's untap step is the one enforcement point that
+            // has been AUDITED to lack it (PR #8012 round 5): it is a turn-based
+            // action, so there is never a cast in flight. Every other mode is
+            // left un-gated on this axis rather than guessed at — a wrong
+            // `false` here would demote working cost-modifier cards
+            // (`ModifyCost`, `CastWithAlternativeCost`, …) to unsupported.
+            // Narrowing this arm requires the same per-mode audit combat.rs got.
+            ConditionContinuation::PendingCast => !matches!(self, StaticMode::CantUntap),
+        }
+    }
+
+    /// Engine limitation, not CR-mandated: can THIS static mode's enforcement
+    /// point bind a scoped-player designation anchor
+    /// ([`StaticCondition::has_unbindable_designation_anchor`])?
+    ///
+    /// Separate axis from [`Self::provides_continuation`]: a designation anchor
+    /// needs a RECIPIENT (or a triggering event) to resolve "that player"
+    /// against, which recipient-bearing evaluators
+    /// (`game::layers::evaluate_condition_with_recipient`) supply and the plain
+    /// `evaluate_condition` does not. CR 502.3's untap step is the one
+    /// enforcement point audited to lack it (PR #8012 rounds 3-4); every other
+    /// mode is left un-gated rather than guessed at, for the same reason as
+    /// above. Widening this needs a per-mode audit of which evaluator each
+    /// enforcement point calls.
+    pub(crate) fn binds_scoped_player_anchor(&self) -> bool {
+        !matches!(self, StaticMode::CantUntap)
+    }
+}
+
 /// Condition for static ability applicability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -10012,7 +10426,7 @@ impl StaticCondition {
     /// latent false green in every gate that consults this.
     ///
     /// Boolean combinators return `None`; the tree-level view
-    /// ([`Self::requires_out_of_layer_continuation`]) walks them.
+    /// ([`Self::requires_unavailable_continuation`]) walks them.
     pub(crate) fn required_continuation(&self) -> Option<ConditionContinuation> {
         match self {
             // CR 118.12a: resolved by `WaitingFor::CombatTaxPayment` at
@@ -10094,18 +10508,56 @@ impl StaticCondition {
         }
     }
 
-    /// True when this condition, or a Boolean sub-condition of it at ANY
-    /// nesting depth, has a leaf whose truth is decided by an out-of-layer
-    /// [`ConditionContinuation`].
+    /// True when this condition, or a Boolean sub-condition of it at ANY nesting
+    /// depth, has a leaf whose truth is decided by a [`ConditionContinuation`]
+    /// that `mode`'s enforcement point does NOT run
+    /// ([`StaticMode::provides_continuation`]).
     ///
-    /// Callers must only use this where the enforcement point does NOT run the
-    /// continuation in question. The untap step (CR 502.3) is such a point: it
-    /// is a turn-based action with no cast in flight and no payment prompt, so
-    /// BOTH continuations are unavailable and any such leaf is unsatisfiable
-    /// there. The combat-tax and self-spell-cost gates deliberately do NOT call
-    /// this — they are the continuations.
-    pub(crate) fn requires_out_of_layer_continuation(&self) -> bool {
-        self.any_leaf(|leaf| leaf.required_continuation().is_some())
+    /// The mode parameter is load-bearing, not decoration: the same leaf is
+    /// legitimate on one mode and unsatisfiable on another. A CR 118.12a
+    /// `UnlessPay` is exactly right on `CantAttack` (Ghostly Prison —
+    /// `WaitingFor::CombatTaxPayment` prompts for it at declaration) and a false
+    /// green on `CantBeBlocked` (Awesome Presence) or `BlockRestriction`
+    /// (Hipparion), where no prompt exists and the layer pipeline returns
+    /// `false` forever. An earlier mode-blind form of this view was the reason
+    /// those two cards stayed falsely "supported" after the untap-step fix.
+    ///
+    /// The enforcement points that DO run a continuation
+    /// (`game::combat::compute_combat_tax`,
+    /// `game::casting::collect_self_spell_cost_modifiers`) deliberately never
+    /// consult this — they are the continuations.
+    pub(crate) fn requires_unavailable_continuation(&self, mode: &StaticMode) -> bool {
+        self.any_leaf(|leaf| {
+            leaf.required_continuation()
+                .is_some_and(|continuation| !mode.provides_continuation(continuation))
+        })
+    }
+
+    /// Engine limitation, not CR-mandated: the ACCEPTANCE PREDICATE — can this
+    /// condition ever be satisfied at `mode`'s enforcement point?
+    ///
+    /// The union of the two rejection classes, and the single authority both
+    /// consumers read:
+    ///
+    /// - `oracle_static::static_helpers::gate_static_condition` — the PARSER
+    ///   gate, which substitutes the honest gap marker when this is true.
+    /// - `database::CardDatabase::export_integrity_errors` — the corpus-wide
+    ///   CI gate, which fails the shipped export when any face still carries
+    ///   one.
+    ///
+    /// Having both read ONE predicate is the point. The parser gate is a
+    /// call-site discipline — it only fires where a call site routes through it
+    /// — and that discipline has now been breached three separate times
+    /// (PR #8012's `CantUntap`-only gate; the `" unless "` split in
+    /// `evasion::parse_subject_rule_static`; the `"as long as"` conditional
+    /// continuous grant in `grammar::parse_enchanted_equipped_predicate`). A
+    /// predicate the export must satisfy no matter WHICH parser route built the
+    /// definition converts that discipline into an invariant: a fourth bypass
+    /// fails CI on the card that reaches it instead of shipping as a false
+    /// green.
+    pub(crate) fn is_unenforceable_on(&self, mode: &StaticMode) -> bool {
+        self.requires_unavailable_continuation(mode)
+            || (!mode.binds_scoped_player_anchor() && self.has_unbindable_designation_anchor())
     }
 
     /// True when this condition (or a Boolean sub-condition of it, at ANY
@@ -10157,7 +10609,7 @@ impl StaticCondition {
     /// Single authority for tree recursion over `StaticCondition`. Every
     /// tree-level view — [`Self::contains_unrecognized`],
     /// [`Self::unrecognized_texts`], [`Self::has_unbindable_designation_anchor`],
-    /// [`Self::requires_out_of_layer_continuation`] — is DERIVED from this one
+    /// [`Self::requires_unavailable_continuation`] — is DERIVED from this one
     /// walk rather than reimplementing its own `And`/`Or`/`Not` recursion.
     /// Parallel walks are exactly how a nested `Unrecognized` came to be seen by
     /// one coverage check and missed by another (PR #8012, review rounds 2-5):
@@ -12460,6 +12912,38 @@ impl RevealUntilDisposition {
     pub fn is_keep_each(&self) -> bool {
         matches!(self, Self::KeepEach)
     }
+}
+
+/// CR 120.1 + CR 608.2b: How a `DamageSource::Target` clause's SUBJECT slot
+/// resolved during chain descent.
+///
+/// The subject ("Target creature you control deals damage equal to its power
+/// to any target") is declared by a PARENT node of the chain, while the damage
+/// itself lives on the child. The runtime contract the damage resolver reads is
+/// positional — `targets = [subject, recipient…]` — and it is reconstructed at
+/// resolution by prepending the parent's chosen object onto the child's list.
+///
+/// CR 608.2b prunes an illegal target out of the parent's list before any
+/// effect runs, which destroys the only evidence that a subject slot was ever
+/// declared: the child would then read its own recipient out of `targets[0]`
+/// and deal that recipient's power to itself. This binding preserves the
+/// distinction the pruned list can no longer express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TargetDamageSourceBinding {
+    /// The parent's chosen object was prepended, so the subject is `targets[0]`.
+    /// The id itself is deliberately NOT duplicated here: the target list stays
+    /// the single source of truth for WHICH object it is, and this binding
+    /// answers only WHETHER the positional contract holds. (It also keeps
+    /// `SpellContext` — and through it `ResolutionFrame` — from growing.)
+    Bound,
+    /// CR 608.2b: the parent declared a subject slot whose chosen object was an
+    /// illegal target at resolution. "If part of the effect requires
+    /// information about an illegal target, it fails to determine any such
+    /// information. Any part of the effect that requires that information won't
+    /// happen." — the damage clause needs both the subject's identity (CR 120.1:
+    /// an object that deals damage is the source of that damage) and its power,
+    /// so it deals no damage. The rest of the chain still resolves.
+    Illegal,
 }
 
 /// CR 120.3: Override for which object is the source of damage.
@@ -15751,6 +16235,14 @@ pub enum Effect {
         min: u32,
         /// Maximum number of objects selectable (`None` = "any number").
         max: Option<u32>,
+        /// An exact-cardinality selection. `None` preserves legacy min/max
+        /// semantics and its serialized shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cardinality: Option<ObjectSelectionCardinality>,
+        /// Extra resolution-time eligibility beyond the printed object filter.
+        /// `None` preserves legacy selection behavior and wire format.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        eligibility: Option<ObjectSelectionEligibility>,
     },
     /// CR 101.4 + CR 701.21a: Each player chooses one permanent per type category
     /// from among the permanents they control, then sacrifices the rest.
@@ -16342,6 +16834,21 @@ pub enum Effect {
         /// Number of +1/+1 counters to place.
         #[serde(default = "default_quantity_one")]
         count: QuantityExpr,
+        /// CR 109.4 + CR 701.47a: which player performs this amass instruction
+        /// (puts the counters, chooses/creates the Army). Every printed
+        /// imperative "amass [subtype] N" card (Awaken the Erstwhile, Saruman,
+        /// the White Hand, …) has the ability's own controller amass, so the
+        /// default is `TargetFilter::Controller` and existing JSON (which omits
+        /// the field) keeps that reading. Azog, Moria's Ruin's "Its controller
+        /// amasses Goblins X" binds this to `TargetFilter::ParentTargetController`
+        /// — the controller of the creature Azog just destroyed, not Azog's own
+        /// controller — resolved through `resolve_player_for_context_ref`, the
+        /// same path `Discover.player` / `Manifest.target` already use.
+        #[serde(
+            default = "default_target_filter_controller",
+            skip_serializing_if = "is_target_filter_controller"
+        )]
+        player: TargetFilter,
     },
     /// CR 701.37a: Monstrosity N — if not monstrous, put N +1/+1 counters and become monstrous.
     Monstrosity {
@@ -18196,7 +18703,11 @@ impl Effect {
             // target via the same `is_context_ref()` filter the other player-axis
             // effects use.
             | Effect::Discover { player, .. }
-            | Effect::BlightEffect { player, .. } => Some(player),
+            | Effect::BlightEffect { player, .. }
+            // CR 701.47a: Amass's performer. The default `Controller` is a
+            // context ref, but a subject-targeted form ("target player amasses
+            // Goblins 2") must surface its chosen player like `Discover`.
+            | Effect::Amass { player, .. } => Some(player),
 
             // Digital-only Alchemy: `ApplyPerpetual.target` selects the modified
             // object (`~` → Any/source fallback; "that creature"/"the duplicate"
@@ -18472,7 +18983,6 @@ impl Effect {
             | Effect::AssembleContraptionOnSprocket { .. }
             | Effect::ProcessRadCounters
             | Effect::Incubate { .. }
-            | Effect::Amass { .. }
             | Effect::Monstrosity { .. }
             | Effect::Specialize
             | Effect::Renown { .. }
@@ -23377,10 +23887,60 @@ pub struct EffectResolutionResult {
     pub count: usize,
 }
 
+/// CR 608.2c: Objects produced by a `forward_result` instruction, retained for
+/// the remainder of that resolution chain. This is distinct from declared
+/// targets: a producer may move zero objects (`Some(vec![])`), and that result
+/// must not fall back to an earlier target selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardedResultContext {
+    pub targets: Vec<TargetRef>,
+    /// CR 400.7: Exact identities of object results at the moment the producer
+    /// completed. A later continuation must not bind a new incarnation that
+    /// reused the same storage `ObjectId`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub object_incarnations: Vec<ObjectIncarnationRef>,
+}
+
+impl ForwardedResultContext {
+    /// Capture the complete ordered object result of a forwarding instruction.
+    pub fn from_object_ids(
+        state: &crate::types::game_state::GameState,
+        object_ids: &[ObjectId],
+    ) -> Self {
+        Self {
+            targets: object_ids.iter().copied().map(TargetRef::Object).collect(),
+            object_incarnations: object_ids
+                .iter()
+                .filter_map(|id| state.objects.get(id).map(ObjectIncarnationRef::from_object))
+                .collect(),
+        }
+    }
+
+    /// CR 400.7: A forwarded object referent remains valid only while its
+    /// producer-time incarnation is still current. Unpinned legacy payloads
+    /// remain readable for wire compatibility.
+    pub fn object_pin_is_current(
+        &self,
+        id: ObjectId,
+        state: &crate::types::game_state::GameState,
+    ) -> bool {
+        self.object_incarnations
+            .iter()
+            .find(|pin| pin.object_id == id)
+            .is_none_or(|pin| pin.is_current(state))
+    }
+}
+
 /// Casting-time facts that flow with a spell from casting through resolution.
 /// Conditions in the sub_ability chain are evaluated against this context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SpellContext {
+    /// CR 608.2c: The immediate `forward_result` producer's complete ordered
+    /// result. `None` means no producer has run in this resolution; `Some([])`
+    /// is a completed producer that moved no objects and intentionally blocks
+    /// inherited-target fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_result_context: Option<Box<ForwardedResultContext>>,
     /// CR 610.3b: specified duration events observed after a triggered ability
     /// triggered but before this initial zone-change effect occurred.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -23517,6 +24077,13 @@ pub struct SpellContext {
     /// `ResolvedAbility` literals.
     #[serde(default, skip_serializing_if = "AttachTargetBindings::is_empty")]
     pub attach_target_bindings: AttachTargetBindings,
+    /// CR 120.1 + CR 608.2b: How the `DamageSource::Target` subject slot bound
+    /// for the immediately following damage clause. Stamped by the chain
+    /// descent that reconstructs the `[subject, recipient…]` contract and read
+    /// by `deal_damage`'s subject authority. One-hop only: cleared by
+    /// `apply_parent_chain_context` so it never reaches a grandchild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_damage_source: Option<TargetDamageSourceBinding>,
 }
 
 impl SpellContext {
@@ -25611,6 +26178,17 @@ pub struct StaticDefinition {
     /// must list both explicitly, matching `TriggerDefinition.trigger_zones`.
     #[serde(default)]
     pub active_zones: Vec<Zone>,
+    /// CR 604.3: True when this static is a characteristic-defining ability
+    /// (CDA) — one that defines the object's own colors, subtypes, power, or
+    /// toughness, is printed on (or granted to a token by, or copied/text-
+    /// changed onto) the object it affects, and doesn't set those values only
+    /// conditionally. CDAs "function in all zones" per CR 604.3, regardless
+    /// of `active_zones` above: a CDA is not expected to separately opt into
+    /// every zone it should function in via `active_zones` (typically empty
+    /// for a CDA) — its all-zones behavior is intrinsic to the flag itself.
+    /// See `functioning_abilities::static_functions_in_zone`, the single
+    /// authority that checks this flag before falling back to the ordinary
+    /// `active_zones` gate.
     #[serde(default)]
     pub characteristic_defining: bool,
     #[serde(default)]
@@ -25795,6 +26373,44 @@ impl StaticDefinition {
             caster_scope: cost_modifier_caster_scope(self.affected.as_ref()),
             condition: self.condition.as_ref(),
         })
+    }
+
+    /// THE `StaticDefinition` nesting walk: visits `self`, then every static
+    /// definition nested beneath it by a
+    /// [`ContinuousModification::GrantStaticAbility`], transitively, in Oracle
+    /// order.
+    ///
+    /// CR 613.1f + CR 604.1: a granted static is a static ability in its own
+    /// right — it carries its own `mode`, `affected` scope, `modifications` and
+    /// (load-bearing here) its own `condition`. Any authority that asks a
+    /// question about "this face's static abilities" must therefore ask it of
+    /// the granted definitions too, or a nested definition is invisible to it.
+    ///
+    /// Single authority for that recursion, for the same reason
+    /// [`StaticCondition::walk_leaves`] is the single authority for the
+    /// condition-tree recursion: parallel walks are exactly how a nested node
+    /// comes to be seen by one coverage gate and missed by another. The
+    /// corpus-wide unenforceable-gate backstop
+    /// (`database::CardDatabase::export_integrity_errors`) originally read only
+    /// each face's top-level `static_abilities`, so an unofferable CR 118.12a
+    /// `UnlessPay` sitting on a definition inside a `GrantStaticAbility`
+    /// bypassed it entirely and the card shipped falsely supported.
+    ///
+    /// `GrantAbility` / `GrantTrigger` / `GrantReplacement` are deliberately NOT
+    /// descended into: they nest an `AbilityDefinition` / `TriggerDefinition` /
+    /// `ReplacementDefinition`, not a `StaticDefinition`, so they hold nothing
+    /// this walk's element type can yield.
+    pub(crate) fn walk_self_and_granted<F>(&self, visit: &mut F) -> ControlFlow<()>
+    where
+        F: FnMut(&StaticDefinition) -> ControlFlow<()>,
+    {
+        visit(self)?;
+        for modification in &self.modifications {
+            if let ContinuousModification::GrantStaticAbility { definition } = modification {
+                definition.walk_self_and_granted(visit)?;
+            }
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -29315,10 +29931,24 @@ mod tests {
             ..SpellContext::default()
         };
         assert!(external_style.attach_target_bindings.is_empty());
+        assert!(external_style.forwarded_result_context.is_none());
 
         let absent: SpellContext =
             serde_json::from_value(serde_json::json!({})).expect("legacy context deserializes");
         assert!(absent.attach_target_bindings.is_empty());
+        assert!(absent.forwarded_result_context.is_none());
+
+        let empty_forwarded: SpellContext = serde_json::from_value(serde_json::json!({
+            "forwarded_result_context": { "targets": [] }
+        }))
+        .expect("empty forward-result context deserializes");
+        assert_eq!(
+            empty_forwarded.forwarded_result_context,
+            Some(Box::new(ForwardedResultContext {
+                targets: vec![],
+                object_incarnations: vec![],
+            }))
+        );
 
         let empty: SpellContext = serde_json::from_value(serde_json::json!({
             "attach_target_bindings": {}
@@ -32188,6 +32818,136 @@ mod tests {
         assert_eq!(deserialized.duration, Some(Duration::UntilHostLeavesPlay));
     }
 
+    /// CR 611.2a: both serialized forms of the host-bound cast
+    /// permission — the pre-`source_id` snapshot and the current one.
+    ///
+    /// The old form is the honest limit, not an upgrade: a snapshot written
+    /// before the field existed records no host, so it deserializes to `None`
+    /// and `layers::prune_host_left_casting_permissions` keeps it. There is no
+    /// value a normalizer could invent — the granting permanent is simply not
+    /// in the data. The assertion below pins that, so the limit cannot be
+    /// forgotten and cannot silently change into a wrong guess.
+    #[test]
+    fn exile_with_alt_cost_source_id_reads_both_serialized_forms() {
+        let with_host = CastingPermission::ExileWithAltCost {
+            cost: crate::types::mana::ManaCost::zero(),
+            cost_provenance: ExileGrantCostProvenance::NormalCost,
+            cast_transformed: false,
+            constraint: None,
+            granted_to: Some(PlayerId(0)),
+            resolution_cleanup: None,
+            duration: Some(Duration::UntilHostLeavesPlay),
+            source_id: Some(ObjectId(7)),
+            graveyard_replacement: None,
+            enters_with_counter: None,
+            enters_with_modifications: Vec::new(),
+            mana_spend_permission: None,
+        };
+        let json = serde_json::to_string(&with_host).unwrap();
+        assert!(
+            json.contains("\"source_id\":7"),
+            "the current form carries the granting permanent on the wire: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<CastingPermission>(&json).unwrap(),
+            with_host,
+            "current form round-trips"
+        );
+
+        // The pre-`source_id` form: byte-identical to what a v36 peer wrote.
+        let legacy = json.replace(",\"source_id\":7", "");
+        assert!(
+            !legacy.contains("source_id"),
+            "probe removed the field: {legacy}"
+        );
+        let restored: CastingPermission = serde_json::from_str(&legacy)
+            .expect("a snapshot written before the field must still load");
+        match restored {
+            CastingPermission::ExileWithAltCost {
+                source_id,
+                duration,
+                ..
+            } => {
+                assert_eq!(
+                    source_id, None,
+                    "no host is recorded, so none may be invented"
+                );
+                assert_eq!(
+                    duration,
+                    Some(Duration::UntilHostLeavesPlay),
+                    "the stated lifetime survives the older form"
+                );
+            }
+            other => panic!("expected ExileWithAltCost, got {other:?}"),
+        }
+    }
+
+    /// CR 118.9 + CR 611.2a: the non-mana alternative-cost form gained the same
+    /// two fields, so it needs the same two-form proof.
+    ///
+    /// The legacy direction is the load-bearing one: every snapshot written
+    /// before this change carries this variant with only `cost`, `constraint`
+    /// and `granted_to`. It must still load, and it must load as an unbound
+    /// grant — inventing a host or a lifetime for it would revoke a permission
+    /// the writing engine never bounded.
+    #[test]
+    fn exile_with_alt_ability_cost_lifetime_reads_both_serialized_forms() {
+        let with_lifetime = CastingPermission::ExileWithAltAbilityCost {
+            cost: AbilityCost::Mana {
+                cost: crate::types::mana::ManaCost::zero(),
+            },
+            constraint: None,
+            granted_to: Some(PlayerId(0)),
+            duration: Some(Duration::WhileControllingHost),
+            source_id: Some(ObjectId(11)),
+        };
+        let json = serde_json::to_string(&with_lifetime).unwrap();
+        assert!(
+            json.contains("\"source_id\":11") && json.contains("WhileControllingHost"),
+            "the current form carries host and lifetime on the wire: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<CastingPermission>(&json).unwrap(),
+            with_lifetime,
+            "current form round-trips"
+        );
+
+        // The pre-lifetime form: what every snapshot written before this change
+        // holds for this variant.
+        let legacy = json
+            .replace(",\"duration\":\"WhileControllingHost\"", "")
+            .replace(",\"source_id\":11", "");
+        assert!(
+            !legacy.contains("source_id") && !legacy.contains("duration"),
+            "probe removed both fields: {legacy}"
+        );
+        let restored: CastingPermission = serde_json::from_str(&legacy)
+            .expect("a snapshot written before the fields must still load");
+        match restored {
+            CastingPermission::ExileWithAltAbilityCost {
+                duration,
+                source_id,
+                granted_to,
+                ..
+            } => {
+                assert_eq!(
+                    duration, None,
+                    "no lifetime was recorded, so none may be invented"
+                );
+                assert_eq!(
+                    source_id, None,
+                    "no host was recorded, so none may be invented"
+                );
+                assert_eq!(
+                    granted_to,
+                    Some(PlayerId(0)),
+                    "the fields the older form DID carry are untouched"
+                );
+            }
+            other => panic!("expected ExileWithAltAbilityCost, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parent_target_serde_roundtrip() {
         let filter = TargetFilter::ParentTarget;
@@ -32367,6 +33127,7 @@ mod tests {
     #[test]
     fn exile_with_alt_cost_reads_legacy_exile_on_resolve_bool() {
         let modern = CastingPermission::ExileWithAltCost {
+            source_id: None,
             cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
             cost: ManaCost::zero(),
             cast_transformed: false,
@@ -32411,6 +33172,49 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn play_from_exile_mode_serde_defaults_to_play_and_serializes_cast() {
+        let legacy = serde_json::json!({
+            "type": "PlayFromExile",
+            "duration": "UntilEndOfTurn",
+            "granted_to": 0,
+        });
+        let permission: CastingPermission = serde_json::from_value(legacy.clone())
+            .expect("legacy play-from-exile permission deserializes");
+        assert!(matches!(
+            permission,
+            CastingPermission::PlayFromExile {
+                mode: CardPlayMode::Play,
+                ..
+            }
+        ));
+        assert!(
+            !serde_json::to_value(&permission)
+                .expect("serialize legacy-default permission")
+                .as_object()
+                .expect("permission is an object")
+                .contains_key("mode"),
+            "Play is the field-specific wire default and stays omitted"
+        );
+
+        let mut explicit_cast = legacy;
+        explicit_cast["mode"] = serde_json::json!("Cast");
+        let permission: CastingPermission =
+            serde_json::from_value(explicit_cast).expect("explicit cast permission deserializes");
+        assert!(matches!(
+            permission,
+            CastingPermission::PlayFromExile {
+                mode: CardPlayMode::Cast,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(permission).expect("serialize explicit cast permission")["mode"],
+            serde_json::json!("Cast"),
+            "Cast must remain explicit because it narrows a legacy PlayFromExile grant"
+        );
     }
 
     /// CR 106.1 + CR 202.2c: the dynamic-color `AnyCombinationOfObjectColors`
@@ -34072,7 +34876,7 @@ mod monarch_subject_axis_tests {
 /// `contains_unrecognized`, `unrecognized_texts` and
 /// `has_unbindable_designation_anchor` used to be three INDEPENDENT
 /// wildcard-recursive walks that could silently diverge. They — plus the new
-/// `requires_out_of_layer_continuation` — are now all derived from the single
+/// `requires_unavailable_continuation` — are now all derived from the single
 /// exhaustive [`StaticCondition::walk_leaves`]. These tests pin that
 /// derivation: every view must agree on the same tree at the same depth.
 #[cfg(test)]
@@ -34199,7 +35003,8 @@ mod static_condition_traversal_tests {
                 "{leaf:?} has no layer-pipeline answer and must report a required continuation"
             );
             assert!(
-                nested_at_depth(leaf.clone()).requires_out_of_layer_continuation(),
+                nested_at_depth(leaf.clone())
+                    .requires_unavailable_continuation(&StaticMode::CantUntap),
                 "{leaf:?} nested under And(Or(Not(..))) must still be found"
             );
         }
@@ -34226,7 +35031,8 @@ mod static_condition_traversal_tests {
                 None,
                 "{leaf:?} is a pure function of game state and must stay enforceable"
             );
-            assert!(!nested_at_depth(leaf.clone()).requires_out_of_layer_continuation());
+            assert!(!nested_at_depth(leaf.clone())
+                .requires_unavailable_continuation(&StaticMode::CantUntap));
         }
     }
 }

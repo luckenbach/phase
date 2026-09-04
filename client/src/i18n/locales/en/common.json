@@ -5,6 +5,10 @@
     "close": "Close",
     "closeNamed": "Close {{name}}"
   },
+  "debug": {
+    "exportAuthoritative": "Export Authoritative Game State",
+    "exportAuthoritativeTitle": "Download the engine-owned state used to diagnose and restore this game"
+  },
   "quantityRef": {
     "highestNumber": "the highest number",
     "lowestNumber": "the lowest number",
@@ -61,7 +65,6 @@
   "comboDetector": {
     "label": "Combo Detector (experimental)",
     "title": "Detect infinite loops: end mandatory loops automatically and show ∞ resources (off by default)",
-    "on": "On",
     "off": "Off",
     "interactive": "Interactive"
   },
@@ -79,7 +82,8 @@
     "clickModeButton": "Click Mode Button",
     "shown": "Shown",
     "hidden": "Hidden",
-    "resume": "Resume",
+    "openGameLog": "Open Game Log",
+    "closeGameLog": "Close Game Log",
     "settings": "Settings",
     "boardLayoutSplit": "Split",
     "boardLayoutLegacy": "Legacy",

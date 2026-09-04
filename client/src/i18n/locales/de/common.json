@@ -5,6 +5,10 @@
     "close": "Schließen",
     "closeNamed": "{{name}} schließen"
   },
+  "debug": {
+    "exportAuthoritative": "Autoritativen Spielzustand exportieren",
+    "exportAuthoritativeTitle": "Lädt den engine-eigenen Zustand herunter, mit dem dieses Spiel diagnostiziert und wiederhergestellt wird"
+  },
   "quantityRef": {
     "highestNumber": "die höchste Zahl",
     "lowestNumber": "die niedrigste Zahl",
@@ -61,7 +65,6 @@
   "comboDetector": {
     "label": "Combo-Detektor (experimentell)",
     "title": "Unendliche Schleifen erkennen: Pflichtschleifen automatisch beenden und ∞-Ressourcen anzeigen (standardmäßig aus)",
-    "on": "An",
     "off": "Aus",
     "interactive": "Interaktiv"
   },
@@ -79,7 +82,8 @@
     "clickModeButton": "Klickmodus-Schaltfläche",
     "shown": "Sichtbar",
     "hidden": "Ausgeblendet",
-    "resume": "Fortsetzen",
+    "openGameLog": "Spielprotokoll öffnen",
+    "closeGameLog": "Spielprotokoll schließen",
     "settings": "Einstellungen",
     "boardLayoutSplit": "Geteilt",
     "boardLayoutLegacy": "Legacy",

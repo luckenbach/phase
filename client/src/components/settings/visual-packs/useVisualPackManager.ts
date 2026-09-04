@@ -13,6 +13,8 @@ import {
   type CatalogScanProgress,
   type CuratedDrift,
   type CuratedInstallSelector,
+  type DeckLibraryDrift,
+  type DeckLibraryInstallSelector,
   type InstallEstimate,
   type InstallSelector,
   type OperationStatus,
@@ -27,6 +29,7 @@ import {
   type VerificationResponse,
   type VisualPackErrorKind,
 } from "../../../services/visualPacks/types.ts";
+import { getEffectiveOffline } from "../../../stores/connectivityStore.ts";
 import { usePreferencesStore } from "../../../stores/preferencesStore.ts";
 
 export type ManagerAvailability =
@@ -83,6 +86,9 @@ export interface VisualPackManagerState {
    * curated pack.
    */
   curatedSelector: CuratedInstallSelector | null;
+  /** The deck-library selector as the backend resolved it after the user chose
+   * that option. It is intentionally not planned on panel mount. */
+  deckLibrarySelector: DeckLibraryInstallSelector | null;
   /**
    * How far the installed curated pack has drifted from what the stored
    * preferences name now, or null when there is nothing to say.
@@ -93,6 +99,8 @@ export interface VisualPackManagerState {
    * claim about a multi-gigabyte download, so it is never guessed.
    */
   curatedDrift: CuratedDrift | null;
+  /** The backend-owned deck-library membership delta, or null when unknown. */
+  deckLibraryDrift: DeckLibraryDrift | null;
   estimate: BoundEstimate | null;
   estimateProgress: CatalogScanProgress | null;
   operation: OperationStatus | null;
@@ -112,6 +120,7 @@ export interface VisualPackManagerState {
   retry(): void;
   refresh(): void;
   resolveCuratedSelector(): void;
+  resolveDeckLibrarySelector(): void;
   estimateInstall(selector: InstallSelector): void;
   install(selector: InstallSelector): void;
   cancel(): void;
@@ -128,6 +137,7 @@ export interface VisualPackManagerState {
 const MUTATION_ACTIONS: ReadonlySet<string> = new Set(["install", "cancel", "resume", "repair", "remove"]);
 const MAX_BUFFERED_START_OPERATIONS = 8;
 const CURATED = packId("curated");
+const DECK_LIBRARY = packId("deck_library");
 
 export function hasPendingVisualPackMutation(pending: ReadonlySet<string>): boolean {
   return [...pending].some((entry) => MUTATION_ACTIONS.has(entry));
@@ -141,7 +151,7 @@ export function hasPendingVisualPackMutation(pending: ReadonlySet<string>): bool
  * or measuring it failed. It is NEVER "no drift" — that is a measurement, and
  * this is its absence.
  */
-export type CuratedDriftState = "unknown" | "current" | "drifted";
+export type LocalMembershipDriftState = "unknown" | "current" | "drifted";
 
 /**
  * The single authority on what curated drift means, for every surface.
@@ -160,8 +170,12 @@ export type CuratedDriftState = "unknown" | "current" | "drifted";
  * what is on disk right now, while a drift is a measurement that may have been
  * taken before an install or a removal moved it.
  */
-export function curatedDriftState(summary: CatalogSummary, drift: CuratedDrift | null): CuratedDriftState {
-  const installed = summary.installedPacks.find((entry) => entry.packId === CURATED);
+export function localMembershipDriftState(
+  summary: CatalogSummary,
+  pack: PackId,
+  drift: CuratedDrift | DeckLibraryDrift | null,
+): LocalMembershipDriftState {
+  const installed = summary.installedPacks.find((entry) => entry.packId === pack);
   if (!drift || !installed) return "unknown";
   return installed.catalogRoot === drift.membershipDigest ? "current" : "drifted";
 }
@@ -206,6 +220,8 @@ function selectorIdentity(selector: InstallSelector): string {
       return `complete:${selector.rootSha256}`;
     case "curated":
       return `curated:${selector.membershipDigest}`;
+    case "deck_library":
+      return `deck_library:${selector.membershipDigest}`;
   }
 }
 
@@ -217,7 +233,9 @@ function selectorIdentity(selector: InstallSelector): string {
  * and their estimate would be discarded as stale rather than rendered.
  */
 function signedSelectorName(selector: InstallSelector): string {
-  return selector.kind === "complete" || selector.kind === "curated" ? selector.kind : selectorIdentity(selector);
+  return selector.kind === "complete" || selector.kind === "curated" || selector.kind === "deck_library"
+    ? selector.kind
+    : selectorIdentity(selector);
 }
 
 function operationIsTerminal(status: OperationStatus): boolean {
@@ -260,12 +278,16 @@ export function useVisualPackManager(): VisualPackManagerState {
   const pendingRef = useRef(new Set<string>());
   const listenersRef = useRef<Array<() => void>>([]);
   const initializedRef = useRef(false);
-  const requestRef = useRef({ initialize: 0, summary: 0, estimate: 0, verify: 0, curated: 0, drift: 0 });
+  const requestRef = useRef({ initialize: 0, summary: 0, estimate: 0, verify: 0, curated: 0, deckLibrary: 0, curatedDrift: 0, deckLibraryDrift: 0 });
 
   const [availability, setAvailability] = useState<ManagerAvailability>({ kind: "loading" });
   const [summary, setSummary] = useState<CatalogSummary | null>(null);
   const [curatedSelector, setCuratedSelector] = useState<CuratedInstallSelector | null>(null);
+  const [deckLibrarySelector, setDeckLibrarySelector] = useState<DeckLibraryInstallSelector | null>(null);
   const [curatedDrift, setCuratedDrift] = useState<CuratedDrift | null>(null);
+  const [deckLibraryDrift, setDeckLibraryDrift] = useState<DeckLibraryDrift | null>(null);
+  const [staleCuratedSelectorRetry, setStaleCuratedSelectorRetry] = useState(0);
+  const [staleDeckLibrarySelectorRetry, setStaleDeckLibrarySelectorRetry] = useState(0);
   const [estimate, setEstimate] = useState<BoundEstimate | null>(null);
   const [estimateProgress, setEstimateProgress] = useState<CatalogScanProgress | null>(null);
   const [operation, setOperation] = useState<OperationStatus | null>(null);
@@ -296,6 +318,13 @@ export function useVisualPackManager(): VisualPackManagerState {
     setPendingActions(new Set(pendingRef.current));
     return true;
   }, []);
+  // The rendered disabled state is only advisory: a click queued before an
+  // offline render commits must not begin a backend operation or publish a
+  // pending state. Network-starting paths share this imperative boundary.
+  const beginOnlinePending = useCallback((value: string): boolean => {
+    if (getEffectiveOffline()) return false;
+    return beginPending(value);
+  }, [beginPending]);
   const endPending = useCallback((value: string) => {
     pendingRef.current.delete(value);
     setPendingActions(new Set(pendingRef.current));
@@ -312,7 +341,13 @@ export function useVisualPackManager(): VisualPackManagerState {
     setAvailability({ kind: "ready" });
     if (changed) {
       requestRef.current.verify += 1;
+      requestRef.current.estimate += 1;
+      requestRef.current.curated += 1;
+      requestRef.current.deckLibrary += 1;
+      setCuratedSelector(null);
+      setDeckLibrarySelector(null);
       setEstimate(null);
+      setEstimateProgress(null);
       setVerification(null);
     }
     return true;
@@ -336,7 +371,20 @@ export function useVisualPackManager(): VisualPackManagerState {
 
   const handleProgress = useCallback((event: ProgressEvent) => {
     if (!mountedRef.current) return;
-    const selected = operationRef.current;
+    let selected = operationRef.current;
+    if (
+      operationIsDurableMutation(event.operation)
+      && !startEventBufferRef.current.active
+      && (!selected || ((progressOutcomeRef.current.failed || !operationIsDurableMutation(selected)) && progressIdentity(event) !== `${selected.operationId}:${selected.catalogRoot}`))
+    ) {
+      const identity = progressIdentity(event);
+      operationRef.current = event.operation;
+      progressRef.current = null;
+      progressOutcomeRef.current = { identity, failed: false, cancelled: false, terminal: false };
+      setOperation(event.operation);
+      setProgress(null);
+      selected = event.operation;
+    }
     if (
       !selected
       || event.operation.operationId !== selected.operationId
@@ -383,9 +431,31 @@ export function useVisualPackManager(): VisualPackManagerState {
     // `completed` is excluded from the reopening because that ending is
     // unambiguous: `run()`'s catch leaves an already-completed record alone, so
     // it can emit `failed` carrying one, and a finished install must not flip.
-    if (outcome.failed || outcome.cancelled) return;
+    // A retryable failure leaves its record live. Its next authoritative
+    // `started` event is a new run of THAT record, so it may reopen the
+    // failure latch. Do this only after proving the event still names a live
+    // operation: a late start must never revive a witnessed cancellation or a
+    // completed/terminal record.
+    const restartingAfterRetryableFailure = event.phase === "started"
+      && outcome.failed
+      && !outcome.cancelled
+      && !outcome.terminal
+      && operationIsDurableMutation(event.operation);
+    const acceptingCancellationAfterRetryableFailure = event.phase === "cancelled"
+      && outcome.failed
+      && !outcome.terminal
+      && operationIsDurableMutation(selected);
+    if (outcome.cancelled) return;
+    // Reconciliation can authoritatively cancel a previously failed but still
+    // retryable operation when its membership is superseded. That terminal
+    // event must replace the Resume state; ordinary running updates may not.
+    if (outcome.failed && !restartingAfterRetryableFailure && !acceptingCancellationAfterRetryableFailure) return;
     if (outcome.terminal && (event.phase !== "failed" || event.operation.state === "completed")) return;
     if (operationRank(event.operation) < operationRank(selected)) return;
+    if (restartingAfterRetryableFailure) {
+      outcome.failed = false;
+      outcome.terminal = false;
+    }
     if (event.phase === "failed") outcome.failed = true;
     if (event.phase === "cancelled") outcome.cancelled = true;
     if (progressIsTerminal(event)) outcome.terminal = true;
@@ -530,7 +600,9 @@ export function useVisualPackManager(): VisualPackManagerState {
       requests.estimate += 1;
       requests.verify += 1;
       requests.curated += 1;
-      requests.drift += 1;
+      requests.deckLibrary += 1;
+      requests.curatedDrift += 1;
+      requests.deckLibraryDrift += 1;
       for (const unlisten of listeners.splice(0)) unlisten();
     };
   }, [initialize]);
@@ -552,7 +624,27 @@ export function useVisualPackManager(): VisualPackManagerState {
   const artChain = usePreferencesStore((state) => state.artChain);
   const artOverrides = usePreferencesStore((state) => state.artOverrides);
   const curatedInstalled = summary?.installedPacks.some((entry) => entry.packId === CURATED) ?? false;
+  const deckLibraryInstalled = summary?.installedPacks.some((entry) => entry.packId === DECK_LIBRARY) ?? false;
   const installedRevisionValue = summary?.installedRevision;
+
+  // The two local memberships both depend on art selection. A changed rule
+  // invalidates selectors and estimates even when the resulting digest happens
+  // to be the same: the backend, not this display layer, owns whether its
+  // planner has freshened the underlying descriptor set. If a prior resolver
+  // is still holding its pending slot, its eventual result is generation-bound
+  // below; changing each pack's retry token lets its selected radio ask exactly
+  // once more after that pack's slot releases.
+  useEffect(() => {
+    requestRef.current.curated += 1;
+    requestRef.current.deckLibrary += 1;
+    requestRef.current.estimate += 1;
+    setCuratedSelector(null);
+    setDeckLibrarySelector(null);
+    setEstimate(null);
+    setEstimateProgress(null);
+    setStaleCuratedSelectorRetry((value) => value + 1);
+    setStaleDeckLibrarySelectorRetry((value) => value + 1);
+  }, [artChain, artOverrides]);
 
   /**
    * Recompute curated drift whenever the membership it compares against moves.
@@ -607,20 +699,37 @@ export function useVisualPackManager(): VisualPackManagerState {
       setCuratedDrift(null);
       return;
     }
-    const generation = ++requestRef.current.drift;
+    const generation = ++requestRef.current.curatedDrift;
     void backend.curatedDrift().then(
       (drift) => {
-        if (mountedRef.current && generation === requestRef.current.drift) setCuratedDrift(drift);
+        if (mountedRef.current && generation === requestRef.current.curatedDrift) setCuratedDrift(drift);
       },
       () => {
-        if (mountedRef.current && generation === requestRef.current.drift) setCuratedDrift(null);
+        if (mountedRef.current && generation === requestRef.current.curatedDrift) setCuratedDrift(null);
       },
     );
   }, [artChain, artOverrides, curatedInstalled, curatedSelector, installedRevisionValue]);
 
+  useEffect(() => {
+    const backend = backendRef.current;
+    if (!backend || !deckLibraryInstalled) {
+      setDeckLibraryDrift(null);
+      return;
+    }
+    const generation = ++requestRef.current.deckLibraryDrift;
+    void backend.deckLibraryDrift().then(
+      (drift) => {
+        if (mountedRef.current && generation === requestRef.current.deckLibraryDrift) setDeckLibraryDrift(drift);
+      },
+      () => {
+        if (mountedRef.current && generation === requestRef.current.deckLibraryDrift) setDeckLibraryDrift(null);
+      },
+    );
+  }, [artChain, artOverrides, deckLibraryInstalled, deckLibrarySelector, installedRevisionValue]);
+
   const refresh = useCallback(async () => {
     const backend = backendRef.current;
-    if (!backend || !beginPending("refresh")) return;
+    if (!backend || !beginOnlinePending("refresh")) return;
     clearActionError();
     const generation = ++requestRef.current.summary;
     try {
@@ -631,7 +740,7 @@ export function useVisualPackManager(): VisualPackManagerState {
     } finally {
       if (mountedRef.current) endPending("refresh");
     }
-  }, [acceptSummary, beginPending, clearActionError, endPending, reportActionError]);
+  }, [acceptSummary, beginOnlinePending, clearActionError, endPending, reportActionError]);
 
   /**
    * Ask the backend what "curated" currently means.
@@ -642,7 +751,7 @@ export function useVisualPackManager(): VisualPackManagerState {
    */
   const resolveCuratedSelector = useCallback(async () => {
     const backend = backendRef.current;
-    if (!backend || !beginPending("curated")) return;
+    if (!backend || !beginOnlinePending("curated")) return;
     clearActionError();
     const generation = ++requestRef.current.curated;
     try {
@@ -651,9 +760,49 @@ export function useVisualPackManager(): VisualPackManagerState {
     } catch (error) {
       if (mountedRef.current && generation === requestRef.current.curated) reportActionError(error);
     } finally {
+      if (mountedRef.current && generation !== requestRef.current.curated) setStaleCuratedSelectorRetry((value) => value + 1);
       if (mountedRef.current) endPending("curated");
     }
-  }, [beginPending, clearActionError, endPending, reportActionError]);
+  // This identity changes only when a stale Curated request releases its slot,
+  // so PackSelector gets one fresh selected-radio attempt without letting a
+  // Deck-library completion or failure retry Curated.
+  }, [beginOnlinePending, clearActionError, endPending, reportActionError, staleCuratedSelectorRetry]);
+
+  const resolveDeckLibrarySelector = useCallback(async () => {
+    const backend = backendRef.current;
+    if (!backend || !beginOnlinePending("deck_library")) return;
+    clearActionError();
+    const generation = ++requestRef.current.deckLibrary;
+    try {
+      const selector = await backend.deckLibrarySelector();
+      if (mountedRef.current && generation === requestRef.current.deckLibrary) setDeckLibrarySelector(selector);
+    } catch (error) {
+      if (mountedRef.current && generation === requestRef.current.deckLibrary) reportActionError(error);
+    } finally {
+      if (mountedRef.current && generation !== requestRef.current.deckLibrary) setStaleDeckLibrarySelectorRetry((value) => value + 1);
+      if (mountedRef.current) endPending("deck_library");
+    }
+  // Equivalent retry release for Deck library, independently of Curated.
+  }, [beginOnlinePending, clearActionError, endPending, reportActionError, staleDeckLibrarySelectorRetry]);
+
+  const recoverDeckLibraryConflict = useCallback((selectionGeneration: number, estimateGeneration: number): boolean => {
+    if (selectionGeneration !== requestRef.current.deckLibrary) return false;
+    // The rejected selector names a membership the planner has since replaced.
+    // Forget only this local membership so PackSelector's selected-radio effect
+    // can resolve the current digest and estimate it. It must never retry the
+    // install itself: that remains an explicit user action.
+    requestRef.current.deckLibrary += 1;
+    setDeckLibrarySelector(null);
+    setEstimate((current) => current?.selector.kind === "deck_library" ? null : current);
+    // A later Curated or bulk estimate owns the only estimate slot while the
+    // old start rejects. Do not invalidate its request or clear its progress:
+    // only the estimate that produced this deck selection may be superseded.
+    if (estimateGeneration === requestRef.current.estimate) {
+      requestRef.current.estimate += 1;
+      setEstimateProgress(null);
+    }
+    return true;
+  }, []);
 
   const estimateInstall = useCallback(async (selector: InstallSelector) => {
     const backend = backendRef.current;
@@ -664,8 +813,11 @@ export function useVisualPackManager(): VisualPackManagerState {
     // the one already running, so the in-flight estimate's own `finally` would
     // no longer recognise itself and would leave the scan-progress section on
     // screen for ever. A refused request must change nothing.
-    if (!beginPending("estimate")) return;
+    if (!beginOnlinePending("estimate")) return;
     const generation = ++requestRef.current.estimate;
+    const deckLibrarySelectionGeneration = selector.kind === "deck_library"
+      ? requestRef.current.deckLibrary
+      : null;
     const root = current.catalogRoot;
     const revision = current.installedRevision;
     clearActionError();
@@ -687,12 +839,18 @@ export function useVisualPackManager(): VisualPackManagerState {
       ) return;
       setEstimate({ selector, value });
     } catch (error) {
-      if (mountedRef.current && generation === requestRef.current.estimate) reportActionError(error);
+      if (!mountedRef.current || generation !== requestRef.current.estimate) return;
+      reportActionError(error);
+      if (
+        deckLibrarySelectionGeneration !== null
+        && error instanceof VisualPackBackendError
+        && error.kind === "conflict"
+      ) recoverDeckLibraryConflict(deckLibrarySelectionGeneration, generation);
     } finally {
       if (mountedRef.current && generation === requestRef.current.estimate) setEstimateProgress(null);
       if (mountedRef.current) endPending("estimate");
     }
-  }, [beginPending, clearActionError, endPending, reportActionError]);
+  }, [beginOnlinePending, clearActionError, endPending, recoverDeckLibraryConflict, reportActionError]);
 
   const trackStarted = useCallback(async (operationId: OperationStatus["operationId"], root: OperationStatus["catalogRoot"]) => {
     const backend = backendRef.current;
@@ -744,7 +902,11 @@ export function useVisualPackManager(): VisualPackManagerState {
       || bound.value.catalogRoot !== current.catalogRoot
       || bound.value.installedRevision !== current.installedRevision
     ) return;
-    if (!beginPending("install")) return;
+    if (!beginOnlinePending("install")) return;
+    const deckLibrarySelectionGeneration = selector.kind === "deck_library"
+      ? requestRef.current.deckLibrary
+      : null;
+    const deckLibraryEstimateGeneration = requestRef.current.estimate;
     clearActionError();
     beginStartEventBuffer();
     try {
@@ -762,15 +924,21 @@ export function useVisualPackManager(): VisualPackManagerState {
         await trackStarted(result.operationId, result.catalogRoot);
       }
     } catch (error) {
-      if (mountedRef.current) {
-        reportActionError(error);
-        void refreshSummary();
-      }
+      if (!mountedRef.current) return;
+      const deckLibraryConflict = deckLibrarySelectionGeneration !== null
+        && error instanceof VisualPackBackendError
+        && error.kind === "conflict";
+      // A newer art/revision invalidation may already have resolved D2 while
+      // D1's start was in flight. That old rejection has no current UI state
+      // to recover and must not overwrite the newer selection or its error.
+      if (deckLibraryConflict && !recoverDeckLibraryConflict(deckLibrarySelectionGeneration, deckLibraryEstimateGeneration)) return;
+      reportActionError(error);
+      void refreshSummary();
     } finally {
       clearStartEventBuffer();
       if (mountedRef.current) endPending("install");
     }
-  }, [adoptStartedOperation, beginPending, beginStartEventBuffer, clearActionError, clearStartEventBuffer, endPending, estimate, refreshSummary, reportActionError, trackStarted]);
+  }, [adoptStartedOperation, beginOnlinePending, beginStartEventBuffer, clearActionError, clearStartEventBuffer, endPending, estimate, recoverDeckLibraryConflict, refreshSummary, reportActionError, trackStarted]);
 
   const cancel = useCallback(async () => {
     const backend = backendRef.current;
@@ -825,7 +993,7 @@ export function useVisualPackManager(): VisualPackManagerState {
       || !selected
       || (selected.state !== "downloading" && selected.state !== "finalizing")
       || progressRef.current?.phase !== "failed"
-      || !beginPending("resume")
+      || !beginOnlinePending("resume")
     ) return;
     clearActionError();
     const previousOutcome = { ...progressOutcomeRef.current };
@@ -861,7 +1029,7 @@ export function useVisualPackManager(): VisualPackManagerState {
     } finally {
       if (mountedRef.current) endPending("resume");
     }
-  }, [beginPending, clearActionError, endPending, refreshSummary, reportActionError, trackStarted]);
+  }, [beginOnlinePending, clearActionError, endPending, refreshSummary, reportActionError, trackStarted]);
 
   const verify = useCallback(async (mode: VerificationMode) => {
     const backend = backendRef.current;
@@ -929,7 +1097,7 @@ export function useVisualPackManager(): VisualPackManagerState {
       !backend
       || packIds.length === 0
       || operationIsDurableMutation(operationRef.current)
-      || !beginPending("repair")
+      || !beginOnlinePending("repair")
     ) return;
     clearActionError();
     beginStartEventBuffer();
@@ -952,7 +1120,7 @@ export function useVisualPackManager(): VisualPackManagerState {
       clearStartEventBuffer();
       if (mountedRef.current) endPending("repair");
     }
-  }, [adoptStartedOperation, beginPending, beginStartEventBuffer, clearActionError, clearStartEventBuffer, endPending, refreshSummary, reportActionError, trackStarted]);
+  }, [adoptStartedOperation, beginOnlinePending, beginStartEventBuffer, clearActionError, clearStartEventBuffer, endPending, refreshSummary, reportActionError, trackStarted]);
 
   const runRemoval = useCallback(async (selector: RemovalSelector, mode: RemovalMode) => {
     const backend = backendRef.current;
@@ -1000,7 +1168,9 @@ export function useVisualPackManager(): VisualPackManagerState {
     availability,
     summary,
     curatedSelector,
+    deckLibrarySelector,
     curatedDrift,
+    deckLibraryDrift,
     estimate,
     estimateProgress,
     operation,
@@ -1016,6 +1186,7 @@ export function useVisualPackManager(): VisualPackManagerState {
     retry,
     refresh,
     resolveCuratedSelector,
+    resolveDeckLibrarySelector,
     estimateInstall,
     install,
     cancel,

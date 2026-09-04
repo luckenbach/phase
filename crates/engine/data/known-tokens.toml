@@ -20613,6 +20613,7 @@ source_card_names = [
     "Qarsi High Priest",
     "Rageform",
     "Reality Shift",
+    "Sash and Waistcoat, Unmen",
     "Scroll of Fate",
     "Soul Summons",
     "Soul-Strike Technique",
@@ -25858,6 +25859,40 @@ scryfall_id = "1e568e10-30e4-42ba-b364-f65c93f7da32"
 scryfall_id = "7b19a41d-95c1-4cd8-89fc-4ec89ab10884"
 scryfall_oracle_id = "f81c047d-de36-4aed-806b-f14a290771a4"
 preset_id = "1cb75630-1114-5430-b13c-b23dea69bb89"
+
+# Heartwood (Soul Tether, FRA "Reality Fracture", releases 2026-10-02): hand-
+# authored ahead of tokens-gen because MTGJSON has not yet published a set
+# file (with per-set token data) for FRA — only AtomicCards.json carries the
+# preview oracle text. `id` is therefore a deterministic uuid5 placeholder
+# (namespaced off the card's real Scryfall oracle_id, not a genuine MTGJSON
+# token uuid) so this entry sorts and dedupes safely; `source_card_refs`
+# below uses the real Scryfall identifiers. Once MTGJSON ships data/mtgjson
+# /sets/FRA.json with a real Heartwood token entry, a normal `tokens-gen`
+# regen will naturally replace this placeholder with the canonical one.
+[[token]]
+id = "1cb84b18-676d-5b79-9c4c-4f94af329ae5"
+category = "Artifact"
+fidelity = "PartialMissingAbilities"
+source_card_names = ["Soul Tether"]
+set_code = "FRA"
+set_name = "Reality Fracture"
+released_at = "2026-10-02"
+type_line = "Token Artifact — Heartwood"
+rules_text = "{T}: Add {R} or {G}."
+
+[token.body]
+display_name = "Heartwood"
+core_types = ["Artifact"]
+subtypes = ["Heartwood"]
+supertypes = []
+colors = ["Red", "Green"]
+keywords = []
+
+[[token.source_card_refs]]
+card_name = "Woodwork Prodigy // Soul Tether"
+face_name = "Soul Tether"
+scryfall_oracle_id = "f3ed157f-a09b-405f-aec4-0e7a81d80fc8"
+scryfall_id = "7d17f7e3-7b63-4674-9024-4fd1827f40ec"
 
 [[token]]
 id = "1cfb9daa-8bf2-52e4-a048-b442f30a3a56"
@@ -31331,6 +31366,7 @@ source_card_names = [
     "Qarsi High Priest",
     "Rageform",
     "Reality Shift",
+    "Sash and Waistcoat, Unmen",
     "Scroll of Fate",
     "Soul Summons",
     "Soul-Strike Technique",
@@ -37216,6 +37252,7 @@ source_card_names = [
     "Qarsi High Priest",
     "Rageform",
     "Reality Shift",
+    "Sash and Waistcoat, Unmen",
     "Scroll of Fate",
     "Soul Summons",
     "Soul-Strike Technique",
@@ -44328,6 +44365,7 @@ source_card_names = [
     "Qarsi High Priest",
     "Rageform",
     "Reality Shift",
+    "Sash and Waistcoat, Unmen",
     "Scroll of Fate",
     "Soul Summons",
     "Soul-Strike Technique",
@@ -47125,6 +47163,7 @@ source_card_names = [
     "Qarsi High Priest",
     "Rageform",
     "Reality Shift",
+    "Sash and Waistcoat, Unmen",
     "Scroll of Fate",
     "Soul Summons",
     "Soul-Strike Technique",
@@ -52870,6 +52909,57 @@ scryfall_oracle_id = "a1c2af93-83c0-4974-b4db-abf95981d4e3"
 preset_id = "3fe9b9d3-4117-51b3-a5eb-5cfd3f851e15"
 
 [[token]]
+id = "3ffa938a-a3fa-5abb-b52d-3e325cd043e2"
+category = "Creature"
+fidelity = "Full"
+source_card_names = ["The Theorist, Jace Beleren"]
+set_code = "FRA"
+set_name = "Reality Fracture"
+collector_number = "4"
+released_at = "2026-10-02"
+type_line = "Token Creature — Illusion"
+
+[token.body]
+display_name = "Illusion"
+power = 1
+toughness = 1
+core_types = ["Creature"]
+subtypes = ["Illusion"]
+supertypes = []
+colors = ["Blue"]
+keywords = []
+
+[[token.source_card_refs]]
+card_name = "The Theorist, Jace Beleren"
+scryfall_oracle_id = "89a6e876-0b00-4671-9652-766fd7ef9bf2"
+scryfall_id = "8bcdda05-4d27-4da7-9fdb-064195aca568"
+
+[[token.source_card_refs]]
+card_name = "The Theorist, Jace Beleren"
+scryfall_oracle_id = "89a6e876-0b00-4671-9652-766fd7ef9bf2"
+scryfall_id = "20bb8c55-4b0b-425f-8201-b54fa2fdde86"
+
+[[token.source_card_refs]]
+card_name = "The Theorist, Jace Beleren"
+scryfall_oracle_id = "89a6e876-0b00-4671-9652-766fd7ef9bf2"
+scryfall_id = "707f6fbb-94f6-459b-8a21-bec360b7b668"
+
+[[token.source_card_refs]]
+card_name = "The Theorist, Jace Beleren"
+scryfall_oracle_id = "89a6e876-0b00-4671-9652-766fd7ef9bf2"
+scryfall_id = "326894e1-469d-4586-b823-9d5038315078"
+
+[[token.source_card_refs]]
+card_name = "The Theorist, Jace Beleren"
+scryfall_oracle_id = "89a6e876-0b00-4671-9652-766fd7ef9bf2"
+scryfall_id = "29a7f3e8-efcd-42bb-b315-9e9c0794dddb"
+
+[token.token_image_ref]
+scryfall_id = "7bda0b63-fd0f-495d-9eb0-20057571c0ee"
+scryfall_oracle_id = "58a1e3c9-a718-4413-b14e-d8d6257567bf"
+preset_id = "3ffa938a-a3fa-5abb-b52d-3e325cd043e2"
+
+[[token]]
 id = "40127fba-2bcb-55f9-ad23-9d2b375c5933"
 category = "Creature"
 fidelity = "Full"
@@ -57662,6 +57752,7 @@ source_card_names = [
     "Qarsi High Priest",
     "Rageform",
     "Reality Shift",
+    "Sash and Waistcoat, Unmen",
     "Scroll of Fate",
     "Soul Summons",
     "Soul-Strike Technique",
@@ -91339,6 +91430,7 @@ source_card_names = [
     "Qarsi High Priest",
     "Rageform",
     "Reality Shift",
+    "Sash and Waistcoat, Unmen",
     "Scroll of Fate",
     "Soul Summons",
     "Soul-Strike Technique",
@@ -95804,6 +95896,7 @@ source_card_names = [
     "Qarsi High Priest",
     "Rageform",
     "Reality Shift",
+    "Sash and Waistcoat, Unmen",
     "Scroll of Fate",
     "Soul Summons",
     "Soul-Strike Technique",
@@ -103449,6 +103542,7 @@ source_card_names = [
     "Qarsi High Priest",
     "Rageform",
     "Reality Shift",
+    "Sash and Waistcoat, Unmen",
     "Scroll of Fate",
     "Soul Summons",
     "Soul-Strike Technique",

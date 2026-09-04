@@ -69,7 +69,18 @@ const BOLT_MID = printing("cccccccc-cccc-4ccc-8ccc-cccccccccccc", "mh1", "2019-0
 const BOLT_OLD = printing("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "lea", "1993-08-05");
 
 function cardEntry(oracleId: string, name: string, faceName: string) {
-  return { oracle_id: oracleId, name, face_names: [faceName], faces: [imageFace(oracleId)] };
+  return {
+    oracle_id: oracleId,
+    name,
+    face_names: [faceName],
+    faces: [imageFace(oracleId)],
+    mana_cost: "",
+    cmc: 0,
+    type_line: "",
+    colors: [],
+    color_identity: [],
+    keywords: [],
+  };
 }
 
 const BOLT_ENTRY = cardEntry(BOLT, "Lightning Bolt", "lightning bolt");
@@ -243,7 +254,7 @@ function imageRequests(): string[] {
 }
 
 async function objectRows(): Promise<StoredObject[]> {
-  const database = await openDB(DATABASE, 1);
+  const database = await openDB(DATABASE);
   const rows = await database.getAll("objects") as StoredObject[];
   database.close();
   return rows;
@@ -269,7 +280,7 @@ function cachedText(path: string): string | null {
  * about to test against actually existed.
  */
 async function dropStoredSourceUrls(): Promise<number> {
-  const database = await openDB(DATABASE, 1);
+  const database = await openDB(DATABASE);
   const rows = await database.getAll("objects") as StoredObject[];
   for (const row of rows) {
     const legacy: StoredObject = { ...row };
@@ -732,7 +743,7 @@ describe("curated delta install", () => {
     expect(source).toBeDefined();
     const foreignPack = packId("complete");
     const foreignRoot = "e".repeat(64) as CatalogRoot;
-    const database = await openDB(DATABASE, 1);
+    const database = await openDB(DATABASE);
     await database.put("objects", { ...source, id: `${foreignRoot}:${foreignPack}:${shared!.assetKey}`, root: foreignRoot, packId: foreignPack });
     await database.put("packs", { id: foreignPack, packId: foreignPack, root: foreignRoot, dependencies: [], operationId: "foreign-operation" });
     database.close();
@@ -823,7 +834,7 @@ describe("curated delta install", () => {
     internals().collectCuratedGarbage = async function (this: unknown, ...args: never[]) {
       if (!injected) {
         injected = true;
-        const database = await openDB(DATABASE, 1);
+        const database = await openDB(DATABASE);
         await database.put("objects", {
           id: `${foreignRoot}:${packId("curated")}:${foreignKey}`,
           root: foreignRoot,
@@ -1113,23 +1124,36 @@ describe("curated delta install", () => {
     // assertion below then holds or fails on timing rather than on behaviour.
     let seen = 0;
     let parked = false;
+    let heldSource: string | null = null;
     const release = holdImages((source) => {
       if (!source.startsWith("https://cards.scryfall.io/")) return false;
       if ((seen += 1) !== 2) return false;
       parked = true;
+      heldSource = source;
       return true;
     });
     const started = await startCurated(backend);
     await vi.waitFor(() => { expect(parked).toBe(true); }, { timeout: 5000 });
 
-    // Released on a timer rather than inline: `cancel()` now waits for the
-    // worker, so it cannot return until this fires, while a `cancel()` that
-    // did NOT wait returns first and reports a count the parked task then
-    // moves. That ordering is what the assertion reads.
+    // Wait until the cancellation is durable before releasing the held image:
+    // its promotion therefore proves the legacy non-Deck path is allowed to
+    // finish while `cancel()` is still waiting for its worker.
     const pending = backend.cancel(started.operation);
-    setTimeout(release, 150);
+    await vi.waitFor(async () => {
+      expect((await backend.operationStatus(started.operation)).state).toBe("cancel_requested");
+    }, { timeout: 5000 });
+    if (!heldSource) throw new Error("held source missing");
+    expect((await objectRows()).filter((row) =>
+      row.root === started.digest && row.packId === packId("curated") && row.sourceUrl === heldSource,
+    )).toHaveLength(0);
+    release();
     const status = await pending;
     expect(status.state).toBe("cancelled");
+    // Curated cancellation waits for the held non-Deck task to promote before
+    // returning. The deck-library removal fence intentionally stays stricter.
+    expect((await objectRows()).filter((row) =>
+      row.root === started.digest && row.packId === packId("curated") && row.sourceUrl === heldSource,
+    )).toHaveLength(1);
 
     // THE INVARIANT, asserted on the SNAPSHOT `cancel()` returns, because that
     // is the value the panel publishes its terminal outcome from. Once it is

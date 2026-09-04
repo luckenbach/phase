@@ -1383,7 +1383,14 @@ fn graveyard_spell_objects_available_to_cast(
         // cards reach the cast path (CR 305.1 — milled lands are played via
         // `graveyard_lands_playable_by_permission`).
         if play_from_exile_object_in_cast_path(obj)
-            && play_from_exile_permission_source(state, obj, player, state.turn_number).is_some()
+            && play_from_exile_permission_source(
+                state,
+                obj,
+                player,
+                state.turn_number,
+                Some(CardPlayMode::Cast),
+            )
+            .is_some()
         {
             play_from_exile_objects.push(obj_id);
         }
@@ -3199,11 +3206,13 @@ fn has_exile_cast_permission(
                     obj,
                     player,
                     CastingPermissionIndex(index),
+                    Some(CardPlayMode::Cast),
                 )
                 .is_some()
             })
     } else {
-        play_from_exile_permission_source(state, obj, player, turn_number).is_some()
+        play_from_exile_permission_source(state, obj, player, turn_number, Some(CardPlayMode::Cast))
+            .is_some()
     };
     play_from_exile_route
         || obj.casting_permissions.iter().any(|p| match p {
@@ -3911,8 +3920,9 @@ pub(crate) fn play_from_exile_permission_source(
     obj: &crate::game::game_object::GameObject,
     player: PlayerId,
     turn_number: u32,
+    requested_mode: Option<CardPlayMode>,
 ) -> Option<(ObjectId, CastFrequency)> {
-    play_from_exile_permission_source_with_index(state, obj, player, turn_number)
+    play_from_exile_permission_source_with_index(state, obj, player, turn_number, requested_mode)
         .map(|(_, source, frequency)| (source, frequency))
 }
 
@@ -3921,13 +3931,14 @@ fn play_from_exile_permission_source_with_index(
     obj: &crate::game::game_object::GameObject,
     player: PlayerId,
     _turn_number: u32,
+    requested_mode: Option<CardPlayMode>,
 ) -> Option<(CastingPermissionIndex, ObjectId, CastFrequency)> {
     obj.casting_permissions
         .iter()
         .enumerate()
         .find_map(|(index, _)| {
             let index = CastingPermissionIndex(index);
-            play_from_exile_permission_source_at_index(state, obj, player, index)
+            play_from_exile_permission_source_at_index(state, obj, player, index, requested_mode)
                 .map(|(source, frequency)| (index, source, frequency))
         })
 }
@@ -3940,9 +3951,11 @@ fn play_from_exile_permission_source_at_index(
     obj: &crate::game::game_object::GameObject,
     player: PlayerId,
     CastingPermissionIndex(index): CastingPermissionIndex,
+    requested_mode: Option<CardPlayMode>,
 ) -> Option<(ObjectId, CastFrequency)> {
     let crate::types::ability::CastingPermission::PlayFromExile {
         granted_to,
+        mode,
         frequency,
         source_id,
         exiled_by_ability_controller,
@@ -3955,6 +3968,12 @@ fn play_from_exile_permission_source_at_index(
         return None;
     };
     if *granted_to != player {
+        return None;
+    }
+    // CR 305.1 + CR 305.9: A "cast" permission authorizes spell casts only,
+    // while a "play" permission also authorizes the land special action.
+    // Spell casting may use either verb; land play requires the broader one.
+    if requested_mode == Some(CardPlayMode::Play) && *mode != CardPlayMode::Play {
         return None;
     }
     let source = source_id.unwrap_or(obj.id);
@@ -3998,8 +4017,20 @@ pub(super) fn selected_play_from_exile_permission_source(
     casting_permission_index: Option<CastingPermissionIndex>,
 ) -> Option<(ObjectId, CastFrequency)> {
     match casting_permission_index {
-        Some(index) => play_from_exile_permission_source_at_index(state, obj, player, index),
-        None => play_from_exile_permission_source(state, obj, player, state.turn_number),
+        Some(index) => play_from_exile_permission_source_at_index(
+            state,
+            obj,
+            player,
+            index,
+            Some(CardPlayMode::Cast),
+        ),
+        None => play_from_exile_permission_source(
+            state,
+            obj,
+            player,
+            state.turn_number,
+            Some(CardPlayMode::Cast),
+        ),
     }
 }
 
@@ -4110,6 +4141,7 @@ fn selected_object_cast_permission_index(
                     obj,
                     player,
                     CastingPermissionIndex(index),
+                    Some(CardPlayMode::Cast),
                 )
                 .map(|_| CastingPermissionIndex(index))
             })
@@ -4133,7 +4165,7 @@ pub(crate) fn player_may_look_at_facedown_exile(
     obj: &GameObject,
     player: PlayerId,
 ) -> bool {
-    play_from_exile_permission_source(state, obj, player, state.turn_number).is_some()
+    play_from_exile_permission_source(state, obj, player, state.turn_number, None).is_some()
 }
 
 /// CR 601.2f: The printed mana-cost increase a spell incurs when it is cast via
@@ -4166,6 +4198,7 @@ fn exile_play_cast_cost_raise(
                 obj,
                 player,
                 CastingPermissionIndex(index),
+                Some(CardPlayMode::Cast),
             )
             .is_some() =>
         {
@@ -4181,19 +4214,25 @@ fn exile_play_cast_cost_raise(
 /// [`exile_play_cast_cost_raise`]; consumed by `handle_play_land` to seed the
 /// tap state on the land's entry event.
 pub(crate) fn exile_play_land_enters_tapped(
+    state: &GameState,
     obj: &crate::game::game_object::GameObject,
     player: PlayerId,
+    casting_permission_index: CastingPermissionIndex,
 ) -> bool {
-    obj.casting_permissions.iter().any(|p| {
-        matches!(
-            p,
-            CastingPermission::PlayFromExile {
-                granted_to,
-                land_enter_tapped: crate::types::zones::EtbTapState::Tapped,
-                ..
-            } if *granted_to == player
-        )
-    })
+    matches!(
+        obj.casting_permissions.get(casting_permission_index.0),
+        Some(CastingPermission::PlayFromExile {
+            land_enter_tapped: crate::types::zones::EtbTapState::Tapped,
+            ..
+        })
+    ) && play_from_exile_permission_source_at_index(
+        state,
+        obj,
+        player,
+        casting_permission_index,
+        Some(CardPlayMode::Play),
+    )
+    .is_some()
 }
 
 /// CR 601.2a + CR 603.7 + CR 611.2a: Returns the tracked-set identity of a `single_use`
@@ -4221,6 +4260,7 @@ pub(crate) fn single_use_play_from_exile_group(
                 obj,
                 player,
                 CastingPermissionIndex(index),
+                Some(CardPlayMode::Cast),
             )
             .is_some() =>
         {
@@ -4364,6 +4404,7 @@ fn object_cast_permission_grants_any_color(
             obj,
             player,
             CastingPermissionIndex(index),
+            Some(CardPlayMode::Cast),
         )
         .is_some() =>
         {
@@ -5512,9 +5553,13 @@ pub fn graveyard_lands_playable_by_permission(
         {
             continue;
         }
-        if let Some((source, _)) =
-            play_from_exile_permission_source(state, obj, player, state.turn_number)
-        {
+        if let Some((source, _)) = play_from_exile_permission_source(
+            state,
+            obj,
+            player,
+            state.turn_number,
+            Some(CardPlayMode::Play),
+        ) {
             results.push((gy_obj_id, source));
         }
     }
@@ -5556,6 +5601,7 @@ pub(super) enum ExileLandPlayAuthorization {
     ObjectAttached {
         source: ObjectId,
         frequency: CastFrequency,
+        casting_permission_index: CastingPermissionIndex,
     },
     Static {
         source: ObjectId,
@@ -5567,6 +5613,16 @@ impl ExileLandPlayAuthorization {
     pub(super) fn source(self) -> ObjectId {
         match self {
             Self::ObjectAttached { source, .. } | Self::Static { source, .. } => source,
+        }
+    }
+
+    pub(super) fn casting_permission_index(self) -> Option<CastingPermissionIndex> {
+        match self {
+            Self::ObjectAttached {
+                casting_permission_index,
+                ..
+            } => Some(casting_permission_index),
+            Self::Static { .. } => None,
         }
     }
 }
@@ -5627,10 +5683,20 @@ pub(super) fn exile_land_play_authorization(
     {
         return None;
     }
-    if let Some((source, frequency)) =
-        play_from_exile_permission_source(state, obj, player, state.turn_number)
+    if let Some((casting_permission_index, source, frequency)) =
+        play_from_exile_permission_source_with_index(
+            state,
+            obj,
+            player,
+            state.turn_number,
+            Some(CardPlayMode::Play),
+        )
     {
-        return Some(ExileLandPlayAuthorization::ObjectAttached { source, frequency });
+        return Some(ExileLandPlayAuthorization::ObjectAttached {
+            source,
+            frequency,
+            casting_permission_index,
+        });
     }
     let (source, frequency) = exile_land_playable_by_static_permission(state, player, land_id)?;
     Some(ExileLandPlayAuthorization::Static { source, frequency })
@@ -6874,6 +6940,20 @@ fn prepare_spell_cast_with_variant_override_inner(
                 {
                     Some(crate::types::mana::ManaCost::zero())
                 }
+                // CR 118.9 + CR 119.4 + CR 305.1: Inside Information class — a
+                // `PlayFromExile` grant that ALSO authorizes land plays carries
+                // its alt cost directly on `alt_ability_cost` rather than as a
+                // standalone `ExileWithAltAbilityCost` permission (that would
+                // wrongly imply a SEPARATE cast route from the land-play grant).
+                // Zero the mana cost exactly like the sibling arm above; the
+                // `AbilityCost` body is paid by `check_additional_cost_or_pay`'s
+                // mirrored `PlayFromExile` arm. Land plays never reach this
+                // spell-casting cost pipeline, so they are unaffected.
+                crate::types::ability::CastingPermission::PlayFromExile {
+                    alt_ability_cost: Some(_),
+                    granted_to,
+                    ..
+                } if *granted_to == player => Some(crate::types::mana::ManaCost::zero()),
                 _ => None,
             })
             .or_else(|| {
@@ -11916,6 +11996,8 @@ pub(super) fn initiate_cast_during_resolution(
                 granted_to: Some(player),
                 resolution_cleanup: Some(cleanup),
                 duration: None,
+                // CR 611.2a: no duration, so no host to bind to.
+                source_id: None,
                 graveyard_replacement: graveyard_replacement.clone(),
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
@@ -22101,6 +22183,7 @@ mod castable_zone_authority_tests {
         );
 
         let permission = |granted_to: Option<PlayerId>| CastingPermission::ExileWithAltCost {
+            source_id: None,
             cost: ManaCost::default(),
             cost_provenance: ExileGrantCostProvenance::Alternative,
             cast_transformed: false,
@@ -22161,6 +22244,7 @@ mod castable_zone_authority_tests {
         let bare = state.objects[&id].clone();
 
         let permission = |granted_to: Option<PlayerId>| CastingPermission::ExileWithAltCost {
+            source_id: None,
             cost: ManaCost::default(),
             cost_provenance: ExileGrantCostProvenance::Alternative,
             cast_transformed: false,
@@ -22386,6 +22470,7 @@ mod castable_zone_authority_tests {
     fn the_graveyard_alt_cost_disjunct_refuses_a_land_and_admits_a_non_land() {
         let mut state = GameState::new_two_player(7);
         let permission = |granted_to: PlayerId| CastingPermission::ExileWithAltCost {
+            source_id: None,
             cost: ManaCost::default(),
             cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
             cast_transformed: false,
@@ -22518,6 +22603,7 @@ mod castable_zone_authority_tests {
                 {
                     let obj = state.objects.get_mut(&id).expect("just inserted");
                     obj.casting_permissions = vec![CastingPermission::ExileWithAltCost {
+                        source_id: None,
                         cost: ManaCost::default(),
                         cost_provenance:
                             crate::types::ability::ExileGrantCostProvenance::Alternative,

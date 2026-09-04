@@ -12,6 +12,11 @@ import {
   MAX_MATERIALIZED_VIRTUAL_BASICS,
   migrateLegacyWorkspace,
 } from "../../components/draft/workspace/workspaceMigration";
+import type {
+  ActiveQuickDraftMeta,
+  DraftMatchResult,
+  DraftRunState,
+} from "../../services/quickDraftPersistence";
 import {
   createDraftWorkspaceState,
   makeInteractiveVirtualBasicInstanceId,
@@ -44,13 +49,29 @@ const persistence = vi.hoisted(() => ({
   inspectActiveQuickDraftLifecycle: vi.fn<() => Promise<unknown>>(async () => null),
   loadDraftRun: vi.fn<() => Promise<unknown>>(async () => null),
   loadQuickDraftSession: vi.fn<() => Promise<unknown>>(async () => null),
-  persistQuickDraftSnapshot: vi.fn(async () => undefined),
+  persistQuickDraftSnapshot: vi.fn<
+    (
+      id: string,
+      sessionJson: string,
+      uiState: unknown,
+      meta: { runFormat?: string; phase?: string },
+    ) => Promise<void>
+  >(async () => undefined),
   publishInitialDraftMatch: vi.fn<(input: { run: unknown }) => Promise<void>>(
     async () => undefined,
   ),
   publishStagedDraftMatch: vi.fn(async () => undefined),
-  recordDraftMatchResult: vi.fn(async () => null),
-  runLimits: vi.fn(() => ({ maxWins: 1, maxLosses: 1 })),
+  recordDraftMatchResult: vi.fn<
+    (input: {
+      draftId: string;
+      gameId: string;
+      result: DraftMatchResult;
+      makeMeta: (run: DraftRunState) => ActiveQuickDraftMeta;
+    }) => Promise<{ run: DraftRunState; meta: ActiveQuickDraftMeta } | null>
+  >(async () => null),
+  runLimits: vi.fn((format: string) => (
+    format === "run" ? { maxWins: 7, maxLosses: 3 } : { maxWins: 1, maxLosses: 1 }
+  )),
 }));
 
 vi.mock("@wasm/draft", () => wasm);
@@ -78,6 +99,7 @@ function view(pool: DraftCardInstance[] = []): DraftPlayerView {
   return {
     status: "Drafting",
     kind: "Quick",
+    launch_capability: "None",
     pool,
     current_pack: [],
     draft_effects: [],
@@ -94,6 +116,7 @@ function view(pool: DraftCardInstance[] = []): DraftPlayerView {
     pass_direction: "Left",
     cards_per_pack: 14,
     required_pick_count: 0,
+    pick_selection_mode: "Direct",
     pick_steps_per_pack: 14,
     pack_count: 3,
     min_deck_size: 40,
@@ -299,6 +322,21 @@ describe("draft store workspace authority", () => {
     expect(useDraftStore.getState().workspaceState?.placements.unrelated.zone).toBe("deck");
   });
 
+  it("appends_an_acknowledged_single_pick_to_its_resolved_target_stack", async () => {
+    await start([card("target")]);
+    useDraftStore.getState().setWorkspacePlacement("target", {
+      zone: "deck", row: 0, column: 5, order: 0,
+    });
+    wasm.submit_pick.mockReturnValue(view([card("target"), card("picked")]));
+
+    await expect(useDraftStore.getState().pickCard("picked", "deck", { column: 5, row: 0 }))
+      .resolves.toEqual({ status: "acknowledged" });
+
+    const placements = useDraftStore.getState().workspaceState!.placements;
+    expect(placements.target).toEqual({ zone: "deck", column: 5, row: 0, order: 0 });
+    expect(placements.picked).toEqual({ zone: "deck", column: 5, row: 0, order: 1 });
+  });
+
   it("acknowledges_a_selected_card_through_confirm_pick", async () => {
     await start();
     useDraftStore.getState().selectCard("selected");
@@ -308,6 +346,17 @@ describe("draft store workspace authority", () => {
     expect(useDraftStore.getState().workspaceState?.placements.selected)
       .toMatchObject({ zone: "sideboard", column: 2 });
     expect(useDraftStore.getState().selectedCard).toBeNull();
+  });
+
+  it("ignores_selection_replacement_while_pick_interaction_is_locked", () => {
+    useDraftStore.setState({ selectedCard: "prior", pickInteractionLocked: true });
+
+    useDraftStore.getState().selectCard("replacement");
+    expect(useDraftStore.getState().selectedCard).toBe("prior");
+
+    useDraftStore.setState({ pickInteractionLocked: false });
+    useDraftStore.getState().selectCard("replacement");
+    expect(useDraftStore.getState().selectedCard).toBe("replacement");
   });
 
   it.each([
@@ -343,7 +392,7 @@ describe("draft store workspace authority", () => {
     expect(adapterIds).not.toBe(tuple);
   });
 
-  it("acknowledges_both_effect_ids_and_places_only_them", async () => {
+  it("appends_acknowledged_draft_effect_cards_in_request_order", async () => {
     await start([card("effect")]);
     wasm.submit_pick_with_draft_effect.mockReturnValue(view([
       card("effect"), card("first"), card("second"),
@@ -353,9 +402,8 @@ describe("draft store workspace authority", () => {
     )).resolves.toEqual({ status: "acknowledged" });
     const placements = useDraftStore.getState().workspaceState!.placements;
     expect(placements.effect.zone).toBe("deck");
-    expect(placements.first).toMatchObject({ zone: "sideboard", column: 4 });
-    expect(placements.second).toMatchObject({ zone: "sideboard", column: 4 });
-    expect(placements.first.order).not.toBe(placements.second.order);
+    expect(placements.first).toEqual({ zone: "sideboard", column: 4, row: 0, order: 0 });
+    expect(placements.second).toEqual({ zone: "sideboard", column: 4, row: 0, order: 1 });
   });
 
   it.each([
@@ -371,19 +419,24 @@ describe("draft store workspace authority", () => {
     expect(useDraftStore.getState().workspaceState).toBe(original);
   });
 
-  it("acknowledges_exactly_one_new_auto_pick_in_deck", async () => {
-    await start([card("existing")]);
+  it("appends_the_acknowledged_auto_pick_to_its_resolved_target_stack", async () => {
+    await start([card("existing"), card("target")]);
     useDraftStore.getState().setWorkspacePlacement("existing", {
       zone: "sideboard", row: 0, column: 2, order: 0,
     });
-    wasm.auto_pick.mockReturnValue(view([card("existing"), card("added")]));
+    useDraftStore.getState().setWorkspacePlacement("target", {
+      zone: "deck", row: 1, column: 4, order: 0,
+    });
+    wasm.auto_pick.mockReturnValue(view([card("existing"), card("target"), card("added")]));
     await expect(useDraftStore.getState().autoPickCard("deck", {
       added: { column: 4, row: 1 },
     }))
       .resolves.toEqual({ status: "acknowledged" });
     expect(useDraftStore.getState().workspaceState?.placements.existing.zone).toBe("sideboard");
+    expect(useDraftStore.getState().workspaceState?.placements.target)
+      .toEqual({ zone: "deck", column: 4, row: 1, order: 0 });
     expect(useDraftStore.getState().workspaceState?.placements.added)
-      .toMatchObject({ zone: "deck", column: 4, row: 1 });
+      .toEqual({ zone: "deck", column: 4, row: 1, order: 1 });
   });
 
   it.each([
@@ -600,6 +653,358 @@ describe("draft store workspace authority", () => {
       useDraftStore.getState().workspaceState!,
       useDraftStore.getState().view!.pool,
     )).toEqual(["Returned"]);
+  });
+
+  it.each([
+    {
+      label: "Sealed run between games (session Pairing, run in progress)",
+      kind: "Sealed",
+      persistedPhase: "playing",
+      sessionStatus: "Pairing",
+      expectedPhase: "playing",
+      fetchDatabase: true,
+    },
+    {
+      label: "Sealed run finished (session Pairing, run complete)",
+      kind: "Sealed",
+      persistedPhase: "complete",
+      sessionStatus: "Pairing",
+      expectedPhase: "complete",
+      fetchDatabase: true,
+    },
+    {
+      label: "Quick run between games (session Complete, run in progress)",
+      kind: "Quick",
+      persistedPhase: "playing",
+      sessionStatus: "Complete",
+      expectedPhase: "playing",
+      fetchDatabase: false,
+    },
+    {
+      label: "Quick run finished (session Complete, run complete)",
+      kind: "Quick",
+      persistedPhase: "complete",
+      sessionStatus: "Complete",
+      expectedPhase: "complete",
+      fetchDatabase: false,
+    },
+  ])("resume keeps the run phase: $label", async ({
+    kind,
+    persistedPhase,
+    sessionStatus,
+    expectedPhase,
+    fetchDatabase,
+  }) => {
+    if (fetchDatabase) {
+      vi.stubGlobal("fetch", vi.fn(async () => ({ text: async () => "database" })));
+    }
+    persistence.inspectActiveQuickDraftLifecycle.mockResolvedValue({
+      id: "run-id",
+      setCode: "TST",
+      setName: "Test",
+      difficulty: 2,
+      kind,
+      phase: persistedPhase,
+      runFormat: "run",
+      runWins: persistedPhase === "complete" ? 7 : 1,
+      runLosses: persistedPhase === "complete" ? 3 : 0,
+      runDraws: 0,
+    });
+    persistence.loadQuickDraftSession.mockResolvedValue({
+      sessionJson: "session",
+      mainDeck: ["C1", "C2"],
+      landCounts: {},
+      poolSortMode: "color",
+      poolPanelOpen: true,
+      workspace: null,
+    });
+    persistence.loadDraftRun.mockResolvedValue({
+      format: "run",
+      results: persistedPhase === "complete"
+        ? [
+          { gameId: "g1", result: "win" }, { gameId: "g2", result: "win" },
+          { gameId: "g3", result: "win" }, { gameId: "g4", result: "win" },
+          { gameId: "g5", result: "win" }, { gameId: "g6", result: "win" },
+          { gameId: "g7", result: "win" },
+        ]
+        : [{ gameId: "g1", result: "win" }],
+      playerDeck: ["C1", "C2"],
+      opponentDeck: ["O1", "O2"],
+      usedBotSeats: [1],
+    });
+    wasm.import_draft_session.mockReturnValue({
+      ...view([card("c1", "C1"), card("c2", "C2")]),
+      kind,
+      status: sessionStatus,
+    });
+
+    await useDraftStore.getState().resumeDraft();
+
+    expect(useDraftStore.getState().phase).toBe(expectedPhase);
+    // A Sealed run launched as Full Run must resume as Full Run, not fall
+    // back to the event's single-match default — next-match staging compares
+    // the store format against the persisted run's format.
+    expect(useDraftStore.getState().runFormat).toBe("run");
+    expect(useDraftStore.getState().runState?.format).toBe("run");
+  });
+
+  it("resume before a Sealed run's first match keeps launching with the remembered format", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ text: async () => "database" })));
+    persistence.inspectActiveQuickDraftLifecycle.mockResolvedValue({
+      id: "sealed-pre-run-id",
+      setCode: "TST",
+      setName: "Test",
+      difficulty: 2,
+      kind: "Sealed",
+      phase: "launching",
+      runFormat: "run", // user already picked Full Run on the format picker
+    });
+    persistence.loadQuickDraftSession.mockResolvedValue({
+      sessionJson: "session",
+      mainDeck: ["C1", "C2"],
+      landCounts: { Plains: 2 },
+      poolSortMode: "color",
+      poolPanelOpen: true,
+      workspace: null,
+    });
+    persistence.loadDraftRun.mockResolvedValue(null);
+    wasm.import_draft_session.mockReturnValue({
+      ...view([card("c1", "C1"), card("c2", "C2")]),
+      kind: "Sealed",
+      status: "Pairing",
+    });
+
+    await useDraftStore.getState().resumeDraft();
+
+    expect(useDraftStore.getState().phase).toBe("launching");
+    expect(useDraftStore.getState().runFormat).toBe("run");
+    expect(useDraftStore.getState().runState).toBeNull();
+  });
+
+  it("persists a nondefault format picker choice before the first match and restores it on resume", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ text: async () => "database" })));
+    const poolView = {
+      ...view([card("c1", "C1"), card("c2", "C2")]),
+      kind: "Sealed" as const,
+      status: "Deckbuilding" as const,
+    };
+    wasm.start_sealed_draft.mockReturnValue(poolView);
+    await useDraftStore.getState().startSealedDraft("pool", "TST", "Test", 2);
+    useDraftStore.getState().completeSealedOpening();
+    wasm.submit_deck.mockReturnValue({ ...poolView, status: "Pairing" });
+    await useDraftStore.getState().submitDeck();
+    expect(useDraftStore.getState().phase).toBe("launching");
+    expect(useDraftStore.getState().runFormat).toBe("single");
+    const metaOf = (): { runFormat?: string; phase?: string } | null => {
+      const calls = persistence.persistQuickDraftSnapshot.mock.calls;
+      return calls.length > 0 ? calls[calls.length - 1][3] : null;
+    };
+
+    await settleTimers();
+    // Deck submission persisted the Sealed default (Single Match).
+    expect(metaOf()?.runFormat).toBe("single");
+
+    // Choosing Full Run on the picker must persist: the run record only
+    // appears at Start Match, so the persisted meta is the sole pre-run
+    // resume authority. Without the schedule, the last meta stays "single".
+    useDraftStore.getState().setRunFormat("run");
+    await settleTimers();
+    expect(metaOf()?.runFormat).toBe("run");
+
+    // Reload before a run exists — the resumed picker must show the choice.
+    persistence.inspectActiveQuickDraftLifecycle.mockResolvedValue(
+      metaOf(),
+    );
+    persistence.loadQuickDraftSession.mockResolvedValue({
+      sessionJson: "session",
+      mainDeck: ["C1", "C2"],
+      landCounts: {},
+      poolSortMode: "color",
+      poolPanelOpen: true,
+      workspace: null,
+    });
+    persistence.loadDraftRun.mockResolvedValue(null);
+    wasm.import_draft_session.mockReturnValue({ ...poolView, status: "Pairing" });
+
+    await useDraftStore.getState().resumeDraft();
+
+    expect(useDraftStore.getState().phase).toBe("launching");
+    expect(useDraftStore.getState().runFormat).toBe("run");
+    expect(useDraftStore.getState().runState).toBeNull();
+  });
+
+  it("resumes an interrupted first-match launch from the durable run (stale launching meta)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ text: async () => "database" })));
+    // Crash between publishInitialDraftMatch's run write and meta write:
+    // meta still says "launching", but the durable run is committed with an
+    // active staged match. Resume must show Between Matches, not the picker.
+    persistence.inspectActiveQuickDraftLifecycle.mockResolvedValueOnce({
+      id: "interrupted-launch-id",
+      setCode: "TST",
+      setName: "Test",
+      difficulty: 2,
+      kind: "Sealed",
+      phase: "launching",
+      runFormat: "run",
+    });
+    persistence.loadQuickDraftSession.mockResolvedValueOnce({
+      sessionJson: "session",
+      mainDeck: ["C1", "C2"],
+      landCounts: {},
+      poolSortMode: "color",
+      poolPanelOpen: true,
+      workspace: null,
+    });
+    persistence.loadDraftRun.mockResolvedValueOnce({
+      format: "run",
+      results: [],
+      playerDeck: ["C1", "C2"],
+      opponentDeck: ["O1", "O2"],
+      usedBotSeats: [1],
+      activeMatch: {
+        draftId: "interrupted-launch-id",
+        gameId: "g1",
+        format: "run",
+        resultCountAtLaunch: 0,
+        botSeat: 1,
+        opponentDeck: ["O1", "O2"],
+      },
+    });
+    wasm.import_draft_session.mockReturnValue({
+      ...view([card("c1", "C1"), card("c2", "C2")]),
+      kind: "Sealed",
+      status: "Pairing",
+    });
+
+    await useDraftStore.getState().resumeDraft();
+
+    expect(useDraftStore.getState().phase).toBe("playing");
+    expect(useDraftStore.getState().runState?.activeMatch?.gameId).toBe("g1");
+  });
+
+  it("resumes a terminal run as complete (stale playing meta)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ text: async () => "database" })));
+    // Crash between recordDraftMatchResult's run write and meta write: meta
+    // still says "playing", but the durable run has hit the 3-loss limit.
+    // Resume must show RunComplete — Between Matches would reject Next Match.
+    persistence.inspectActiveQuickDraftLifecycle.mockResolvedValueOnce({
+      id: "interrupted-result-id",
+      setCode: "TST",
+      setName: "Test",
+      difficulty: 2,
+      kind: "Sealed",
+      phase: "playing",
+      runFormat: "run",
+    });
+    persistence.loadQuickDraftSession.mockResolvedValueOnce({
+      sessionJson: "session",
+      mainDeck: ["C1", "C2"],
+      landCounts: {},
+      poolSortMode: "color",
+      poolPanelOpen: true,
+      workspace: null,
+    });
+    persistence.loadDraftRun.mockResolvedValueOnce({
+      format: "run",
+      results: [
+        { gameId: "g1", result: "loss" },
+        { gameId: "g2", result: "loss" },
+        { gameId: "g3", result: "loss" },
+      ],
+      playerDeck: ["C1", "C2"],
+      opponentDeck: ["O1", "O2"],
+      usedBotSeats: [1],
+      activeMatch: undefined,
+    });
+    wasm.import_draft_session.mockReturnValue({
+      ...view([card("c1", "C1"), card("c2", "C2")]),
+      kind: "Sealed",
+      status: "Pairing",
+    });
+
+    await useDraftStore.getState().resumeDraft();
+
+    expect(useDraftStore.getState().phase).toBe("complete");
+    expect(useDraftStore.getState().runState?.results).toHaveLength(3);
+  });
+
+  it("records a resumed run's result with legacy metadata lacking runFormat", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ text: async () => "database" })));
+    // ActiveQuickDraftMeta deliberately permits an absent runFormat (legacy
+    // metadata shape). Resume restores the format from the durable run —
+    // result recording must not gate out on the absent meta field and drop
+    // the match, and the replacement metadata must learn the run's format so
+    // a later recording is not dropped the same way.
+    persistence.inspectActiveQuickDraftLifecycle.mockResolvedValue({
+      id: "legacy-meta-id",
+      setCode: "TST",
+      setName: "Test",
+      difficulty: 2,
+      kind: "Sealed",
+      phase: "playing",
+      // no runFormat field — legacy shape
+    });
+    persistence.loadQuickDraftSession.mockResolvedValueOnce({
+      sessionJson: "session",
+      mainDeck: ["C1", "C2"],
+      landCounts: {},
+      poolSortMode: "color",
+      poolPanelOpen: true,
+      workspace: null,
+    });
+    persistence.loadDraftRun.mockResolvedValueOnce({
+      format: "run",
+      results: [{ gameId: "g1", result: "win" }],
+      playerDeck: ["C1", "C2"],
+      opponentDeck: ["O1", "O2"],
+      usedBotSeats: [1],
+      activeMatch: undefined,
+    });
+    wasm.import_draft_session.mockReturnValue({
+      ...view([card("c1", "C1"), card("c2", "C2")]),
+      kind: "Sealed",
+      status: "Pairing",
+    });
+
+    await useDraftStore.getState().resumeDraft();
+    expect(useDraftStore.getState().phase).toBe("playing");
+    expect(useDraftStore.getState().runFormat).toBe("run");
+
+    const recorded: Array<{
+      gameId: string;
+      result: DraftMatchResult;
+      metaRunFormat?: string;
+      metaPhase?: string;
+    }> = [];
+    persistence.recordDraftMatchResult.mockImplementation(async (input) => {
+      const nextRun: DraftRunState = {
+        format: "run",
+        results: [{ gameId: input.gameId, result: input.result }],
+        playerDeck: ["C1", "C2"],
+        opponentDeck: ["O1", "O2"],
+        usedBotSeats: [1],
+      };
+      const meta = input.makeMeta(nextRun);
+      recorded.push({
+        gameId: input.gameId,
+        result: input.result,
+        metaRunFormat: meta.runFormat,
+        metaPhase: meta.phase,
+      });
+      return { run: nextRun, meta };
+    });
+
+    await useDraftStore.getState().recordMatchResult("g2", "win");
+
+    // The result reached the durable writer at all (not gated out), and the
+    // replacement metadata carries the run's format for future recordings.
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]?.gameId).toBe("g2");
+    expect(recorded[0]?.result).toBe("win");
+    expect(recorded[0]?.metaRunFormat).toBe("run");
+    expect(recorded[0]?.metaPhase).toBe("playing");
+    expect(useDraftStore.getState().runState?.results).toHaveLength(1);
+    expect(useDraftStore.getState().phase).toBe("playing");
   });
 
   it.each([
@@ -994,6 +1399,7 @@ describe("draft store workspace authority", () => {
       connected: true,
       has_submitted_deck: true,
       pick_status: "NotDrafting",
+      active_pack_count: 0,
       face_up_draft_cards: [],
     }];
     wasm.start_quick_draft.mockReturnValue(draftView);

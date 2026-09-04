@@ -1,4 +1,10 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { useTranslation } from "react-i18next";
 
@@ -27,6 +33,8 @@ interface GameMenuProps {
   isOnlineMode: boolean;
   showAiHand: boolean;
   onToggleAiHand: () => void;
+  logPanelOpen: boolean;
+  onToggleGameLog: () => void;
   /** The currently displayed layout, already resolved from the raw preference. */
   multiplayerBoardLayout?: ResolvedMultiplayerBoardLayout;
   onToggleMultiplayerBoardLayout?: () => void;
@@ -34,6 +42,8 @@ interface GameMenuProps {
   onTryMultiplayerSplitLayout?: () => void;
   onDismissMultiplayerSplitLayoutNudge?: () => void;
   onSettingsClick: () => void;
+  /** Optional shared authority for the persistent hamburger launcher. */
+  menuTriggerRef?: RefObject<HTMLButtonElement | null>;
   onHelpClick: () => void;
   onConcede?: () => void;
   /** GH #1507: ask every other human player to approve rolling the game
@@ -61,12 +71,15 @@ export function GameMenu({
   isOnlineMode,
   showAiHand,
   onToggleAiHand,
+  logPanelOpen,
+  onToggleGameLog,
   multiplayerBoardLayout,
   onToggleMultiplayerBoardLayout,
   showMultiplayerSplitLayoutNudge = false,
   onTryMultiplayerSplitLayout,
   onDismissMultiplayerSplitLayoutNudge,
   onSettingsClick,
+  menuTriggerRef,
   onHelpClick,
   onConcede,
   onRequestTakeback,
@@ -83,6 +96,8 @@ export function GameMenu({
   const [searchParams] = useSearchParams();
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const ownedMenuTriggerRef = useRef<HTMLButtonElement>(null);
+  const resolvedMenuTriggerRef = menuTriggerRef ?? ownedMenuTriggerRef;
   const cardDataMeta = useCardDataMeta();
   const isDraft = searchParams.get("source") === "draft" && !!searchParams.get("draftId");
   const isDraftPodMatch = searchParams.get("mode") === "draft-match";
@@ -100,6 +115,15 @@ export function GameMenu({
     isDraftPodMatch,
     onConcede,
   });
+
+  const openSurfaceFromMenu = (openSurface: () => void) => {
+    // The selected menu item unmounts as this dropdown closes. Move focus to
+    // its stable launcher first so the surface can capture a durable return
+    // target rather than <body> during the same React commit.
+    resolvedMenuTriggerRef.current?.focus();
+    setOpen(false);
+    openSurface();
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -120,12 +144,16 @@ export function GameMenu({
          container's left edge and is unaffected by the row's flow. */
       className="fixed z-40 flex items-center gap-2"
       style={{
-        left: "calc(env(safe-area-inset-left) + 0.5rem)",
+        // Fixed, so the board grid's rail padding does not apply — the
+        // left-dock log offset has to be added here, mirroring how the action
+        // rail consumes `--game-right-rail-offset`.
+        left: "calc(env(safe-area-inset-left) + 0.5rem + var(--game-left-rail-offset, 0px))",
         top: "calc(env(safe-area-inset-top) + var(--game-top-overlay-offset, 0px) + 0.75rem)",
       }}
     >
       <div className="flex h-9 w-9 items-center justify-center rounded-full border border-cyan-200/45 bg-slate-950/84 shadow-[0_8px_22px_rgba(0,0,0,0.32),0_0_14px_rgba(34,211,238,0.22)] backdrop-blur-md">
         <button
+          ref={resolvedMenuTriggerRef}
           onClick={() => {
             setOpen(!open);
           }}
@@ -213,10 +241,7 @@ export function GameMenu({
             <MenuButton
               label={t("gameMenu.reportCard")}
               icon={<FlagIcon />}
-              onClick={() => {
-                onReportCardClick();
-                setOpen(false);
-              }}
+              onClick={() => openSurfaceFromMenu(onReportCardClick)}
             />
           )}
           {showSandboxTools && onSandboxToolsClick && (
@@ -244,21 +269,21 @@ export function GameMenu({
           )}
           <div className="my-1 border-t border-gray-700/70" />
           <MenuSectionLabel label={t("gameMenu.sections.game")} />
-          <MenuButton label={t("gameMenu.resume")} onClick={() => setOpen(false)} />
+          <MenuButton
+            label={logPanelOpen ? t("gameMenu.closeGameLog") : t("gameMenu.openGameLog")}
+            onClick={() => {
+              onToggleGameLog();
+              setOpen(false);
+            }}
+          />
           <MenuButton
             label={t("gameMenu.settings")}
-            onClick={() => {
-              setOpen(false);
-              onSettingsClick();
-            }}
+            onClick={() => openSurfaceFromMenu(onSettingsClick)}
           />
           <MenuButton
             label={t("gameMenu.helpShortcuts")}
             shortcut="?"
-            onClick={() => {
-              setOpen(false);
-              onHelpClick();
-            }}
+            onClick={() => openSurfaceFromMenu(onHelpClick)}
           />
           {isAiMode && (
             <MenuButton
@@ -290,15 +315,15 @@ export function GameMenu({
             label={t("gameMenu.concede")}
             variant="danger"
             onClick={() => {
-              setOpen(false);
               // Online concedes route through the confirmation dialog
               // (`onConcede` opens it). All other modes go straight through
               // the unified concede hook, which dispatches `Concede` to the
               // engine before clearing local state — see useConcedeHandler.
               if (isOnlineMode && onConcede) {
-                onConcede();
+                openSurfaceFromMenu(onConcede);
                 return;
               }
+              setOpen(false);
               handleConcede();
             }}
           />

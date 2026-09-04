@@ -212,6 +212,7 @@ pub fn resolve_exile(
                 obj.casting_permissions
                     .push(CastingPermission::PlayFromExile {
                         provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                        mode: crate::types::ability::CardPlayMode::Play,
                         duration: crate::types::ability::Duration::Permanent,
                         granted_to: controller,
                         frequency: CastFrequency::Unlimited,
@@ -223,6 +224,7 @@ pub fn resolve_exile(
                         single_use_group: None,
                         single_use: false,
                         cast_cost_raise: None,
+                        alt_ability_cost: None,
                         land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     });
             }

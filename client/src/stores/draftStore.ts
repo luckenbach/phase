@@ -18,6 +18,7 @@ import {
   normalizeVirtualBasicCount,
 } from "../components/draft/workspace/workspaceMigration";
 import {
+  appendWorkspaceInstanceToResolvedDestination,
   createDraftWorkspaceState,
   makeInteractiveVirtualBasicInstanceId,
   reconcileWorkspaceState,
@@ -325,10 +326,33 @@ function makeMeta(state: DraftStoreState, phase: ActiveQuickDraftMeta["phase"], 
 }
 
 function phaseForView(view: DraftPlayerView, persistedPhase: DraftPhase): DraftPhase {
+  // Run phases are owned by the run record, not the draft session's pairing
+  // status. A Sealed session sits idle in `Pairing` once its deck is in, so
+  // resuming BETWEEN run games (or after the last game) must keep the run
+  // phase (`playing` → BetweenMatches, `complete` → RunComplete) — mapping
+  // `Pairing` to `launching` there bounces the player back to the format
+  // picker mid-run.
+  if (persistedPhase === "playing" || persistedPhase === "complete") return persistedPhase;
   if (view.status === "Deckbuilding") {
     return view.kind === "Sealed" && persistedPhase === "opening" ? "opening" : "deckbuilding";
   }
   return view.status === "Pairing" ? "launching" : persistedPhase;
+}
+
+/** The run phase the durable record dictates: `complete` once the run hits its
+ * win/loss limits, otherwise `playing`. Single authority for run terminality —
+ * recordMatchResult's meta, launchNextMatch's guard, and resumeDraft all read
+ * this. The run is authoritative over the persisted metadata: the run and the
+ * meta are written as separate operations (publishInitialDraftMatch /
+ * recordDraftMatchResult save the run before the meta), so a crash between
+ * them leaves stale metadata that resume must not trust. Mirrors CR-adjacent
+ * ladder semantics (7 wins / 3 losses) owned by `runLimits` in
+ * quickDraftPersistence. */
+function draftRunPhase(run: DraftRunState): "playing" | "complete" {
+  const limits = runLimits(run.format);
+  const wins = run.results.filter((entry) => entry.result === "win").length;
+  const losses = run.results.filter((entry) => entry.result === "loss").length;
+  return wins >= limits.maxWins || losses >= limits.maxLosses ? "complete" : "playing";
 }
 
 type WorkspaceInstallPatch = Partial<Omit<
@@ -468,8 +492,7 @@ function applyDestination(
   for (const instanceId of instanceIds) {
     const placement = next.placements[instanceId];
     if (!placement) continue;
-    next = updateWorkspacePlacement(next, pool, instanceId, {
-      ...placement,
+    next = appendWorkspaceInstanceToResolvedDestination(next, pool, instanceId, {
       zone: destination,
       column: placementHint?.column ?? placement.column,
       row: placementHint?.row ?? placement.row,
@@ -896,6 +919,13 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
         return lease.importSession(saved.sessionJson, meta.difficulty);
       });
       if (lifecycle !== lifecycleGeneration) return;
+      // The durable run is authoritative for run phases: the run and the meta
+      // are persisted as separate writes (publishInitialDraftMatch /
+      // recordDraftMatchResult save the run first), so a crash between them
+      // leaves the meta stale — it may still say "launching" for an already
+      // active run, or "playing" for a terminal one. The run's results vs its
+      // limits decide; the meta's phase only matters before a run exists.
+      const resumedPhase: DraftPhase = run ? draftRunPhase(run) : meta.phase;
       installWorkspace({
         kind: "state",
         authoritativeView: view,
@@ -903,7 +933,7 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
         patch: {
           draftId: meta.id,
           adapter,
-          phase: phaseForView(view, meta.phase),
+          phase: phaseForView(view, resumedPhase),
           difficulty: meta.difficulty,
           selectedSet: meta.setCode,
           selectedSetName: meta.setName ?? null,
@@ -913,7 +943,11 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
           pickInteractionLocked: false,
           poolSortMode: saved.poolSortMode,
           poolPanelOpen: saved.poolPanelOpen,
-          runFormat: meta.kind === "Sealed" ? "single" : run?.format ?? "run",
+          // The persisted run's format is authoritative once a run exists — a
+          // Sealed run may be a 7W/3L ladder even though the event's picker
+          // default is a single match. Before the first match there is no run,
+          // so fall back to the meta's remembered choice, then the kind default.
+          runFormat: run?.format ?? meta.runFormat ?? (meta.kind === "Sealed" ? "single" : "run"),
           runState: run,
         },
         persistence: "skip",
@@ -1003,7 +1037,10 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
     });
   },
 
-  selectCard: (selectedCard) => set({ selectedCard }),
+  selectCard: (selectedCard) => {
+    if (get().pickInteractionLocked) return;
+    set({ selectedCard });
+  },
 
   addBasicLand: (name) => {
     const state = get();
@@ -1158,7 +1195,10 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
   togglePoolPanel: () => { set((state) => ({ poolPanelOpen: !state.poolPanelOpen })); schedulePersistence(); },
   setDifficulty: (difficulty) => set({ difficulty }),
   setSelectedSet: (selectedSet) => set({ selectedSet }),
-  setRunFormat: (runFormat) => set({ runFormat }),
+  // The picker selection is the resume authority before the first match (the
+  // run record only appears at launch), so persist it — otherwise reloading on
+  // the launching screen restores the stale default. Mirrors setPoolSortMode.
+  setRunFormat: (runFormat) => { set({ runFormat }); schedulePersistence(); },
 
   launchMatch: async (navigate) => {
     const token = admitExclusive("launch");
@@ -1248,7 +1288,7 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
 
   recordMatchResult: async (gameId, result) => {
     const meta = await inspectActiveQuickDraftLifecycle("inspect");
-    if (!meta?.runFormat) return;
+    if (!meta) return;
     const persisted = await recordDraftMatchResult({
       draftId: meta.id,
       gameId,
@@ -1257,10 +1297,14 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
         const wins = run.results.filter((entry) => entry.result === "win").length;
         const losses = run.results.filter((entry) => entry.result === "loss").length;
         const draws = run.results.filter((entry) => entry.result === "draw").length;
-        const limits = runLimits(run.format);
         return {
           ...meta,
-          phase: wins >= limits.maxWins || losses >= limits.maxLosses ? "complete" : "playing",
+          // Legacy metadata may predate the runFormat field; the durable run
+          // is the only authoritative source for it. Without this, a later
+          // recordMatchResult would gate out on the absent field and drop
+          // the next match's result too.
+          runFormat: run.format,
+          phase: draftRunPhase(run),
           updatedAt: Date.now(),
           runWins: wins,
           runLosses: losses,
@@ -1288,10 +1332,7 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
       const durableRun = await loadDraftRun(state.draftId);
       if (!durableRun) throw new Error("Missing durable draft run");
       const playerDeck = projectDeckNames(state.workspaceState, state.view.pool);
-      const limits = runLimits(durableRun.format);
-      const wins = durableRun.results.filter((entry) => entry.result === "win").length;
-      const losses = durableRun.results.filter((entry) => entry.result === "loss").length;
-      if (wins >= limits.maxWins || losses >= limits.maxLosses) throw new Error("Draft run is complete");
+      if (draftRunPhase(durableRun) === "complete") throw new Error("Draft run is complete");
       let run = durableRun;
       let saveRun = false;
       if (durableRun.activeMatch) {

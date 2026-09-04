@@ -70,7 +70,7 @@ pub fn resolve(
         // Contracts; Llanowar Greenwidow; Realmbreaker; Spirit-Sister's Call)
         // must last as long as the affected object exists, so promote that def to
         // Duration::Permanent. It then survives its granting source leaving
-        // (`prune_host_left_effects` only prunes UntilHostLeavesPlay) and is
+        // (`prune_host_left_effects` prunes all three host-lifetime readings) and is
         // cleaned up when the reanimated object itself leaves
         // (`prune_affected_object_left_effects`). A STATED duration arrives on the
         // wrapper (Elemental Expressionist's "Until end of turn" lives on the
@@ -500,15 +500,19 @@ fn register_transient_effect(
             .affected
             .as_ref()
             .is_some_and(crate::game::ability_utils::filter_references_target_player);
-    let inherited_object_target = static_def
+    let forwarded_parent_target = ability.context.forwarded_result_context.is_some()
+        && application_filter.is_some_and(crate::game::effects::filter_refs_parent_target);
+    let inherited_object_target = (static_def
         .affected
         .as_ref()
         .is_some_and(generic_effect_affected_uses_inherited_targets)
+        || application_filter.is_some_and(generic_effect_affected_uses_inherited_targets))
         && !static_affected_references_target_player
-        && ability
+        && (ability
             .targets
             .iter()
-            .any(|target| matches!(target, TargetRef::Object(_)));
+            .any(|target| matches!(target, TargetRef::Object(_)))
+            || forwarded_parent_target);
     let direct_binding_uses_targets = target_filter.is_some()
         || application_filter.is_some_and(generic_effect_affected_uses_inherited_targets)
         || inherited_object_target;
@@ -525,7 +529,7 @@ fn register_transient_effect(
     // that scan `state.transient_continuous_effects` directly.
     // A `ControllerRef::TargetPlayer` affected filter is different: its player
     // target parameterizes a broadcast object filter and is resolved below.
-    if !ability.targets.is_empty()
+    if (!ability.targets.is_empty() || forwarded_parent_target)
         && direct_binding_uses_targets
         && !static_affected_references_target_player
     {
@@ -793,6 +797,17 @@ fn transient_bound_filters(
         let Some(filter) = resolved_filter else {
             return Vec::new();
         };
+        if let Some(objects) = forwarded_result_object_targets(state, ability, filter) {
+            // CR 608.2c: A forward-result antecedent is independent of the
+            // ability's declared targets. `ParentTargetSlot` indexes the raw
+            // event-order list; broad `ParentTarget` filters only live objects
+            // after that contextual binding. An empty completed result returns
+            // no bindings instead of falling back to an older target list.
+            return objects
+                .into_iter()
+                .map(|id| TargetFilter::SpecificObject { id })
+                .collect();
+        }
         // Slot carve-out (§5.4b): this hands its list straight to
         // `effect_object_targets`, which indexes `ParentTargetSlot`
         // POSITIONALLY. A pin-filtered list would renumber the slots, so the
@@ -823,11 +838,32 @@ fn transient_bound_filters(
         .collect()
 }
 
+/// CR 400.7 + CR 608.2c: Resolve an inherited forward-result reference from the
+/// result event's ordered object list, keeping only the same object incarnations.
+/// `None` distinguishes absence of the carrier from an empty completed result.
+fn forwarded_result_object_targets(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    filter: &TargetFilter,
+) -> Option<Vec<ObjectId>> {
+    ability
+        .context
+        .forwarded_result_context
+        .as_ref()
+        .map(|context| {
+            crate::game::effects::effect_object_targets(filter, &context.targets)
+                .into_iter()
+                .filter(|id| context.object_pin_is_current(*id, state))
+                .collect()
+        })
+}
+
 pub fn generic_effect_affected_uses_inherited_targets(filter: &TargetFilter) -> bool {
     matches!(
         filter,
         TargetFilter::TriggeringSource
             | TargetFilter::ParentTarget
+            | TargetFilter::ParentTargetSlot { .. }
             | TargetFilter::CostPaidObject
             // CR 701.47c: "the amassed Army" is a resolution-local single-object
             // reference (`ResolvedAbility.amassed_army_object`), not a broadcast
@@ -944,7 +980,11 @@ fn snapshot_transient_modifications(
             ) =>
             {
                 let ids =
-                    crate::game::targeting::resolved_object_ids_for_filter(state, ability, filter);
+                    forwarded_result_object_targets(state, ability, filter).unwrap_or_else(|| {
+                        crate::game::targeting::resolved_object_ids_for_filter(
+                            state, ability, filter,
+                        )
+                    });
                 ContinuousModification::AddKeyword {
                     keyword: crate::types::keywords::Keyword::Enchant(
                         ids.first()
@@ -1222,6 +1262,159 @@ mod tests {
             tce.modifications,
             vec![ContinuousModification::AddKeyword {
                 keyword: Keyword::Menace,
+            }]
+        );
+    }
+
+    #[test]
+    fn forwarded_result_context_does_not_skip_cost_paid_object_binding() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let paid = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Paid Object".to_string(),
+            Zone::Exile,
+        );
+        let snapshot = crate::types::ability::CostPaidObjectSnapshot {
+            object_id: paid,
+            lki: state.objects[&paid].snapshot_public_characteristics(),
+        };
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::CostPaidObject)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Flying,
+            }]);
+        let mut ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+                end_cost: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+        ability.set_cost_paid_object_recursive(snapshot);
+        ability.context.forwarded_result_context = Some(Box::new(
+            crate::types::ability::ForwardedResultContext::from_object_ids(&state, &[]),
+        ));
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.transient_continuous_effects.len(), 1);
+        assert_eq!(
+            state.transient_continuous_effects[0].affected,
+            TargetFilter::SpecificObject { id: paid }
+        );
+    }
+
+    #[test]
+    fn forwarded_result_context_rejects_a_new_object_incarnation() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let target = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Forwarded Object".to_string(),
+            Zone::Battlefield,
+        );
+        let context =
+            crate::types::ability::ForwardedResultContext::from_object_ids(&state, &[target]);
+        state.objects.get_mut(&target).unwrap().bump_incarnation();
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::ParentTarget)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Haste,
+            }]);
+        let mut ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+                end_cost: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+        ability.context.forwarded_result_context = Some(Box::new(context));
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(state.transient_continuous_effects.is_empty());
+    }
+
+    #[test]
+    fn forwarded_result_context_concretizes_reanimator_enchant_target() {
+        let mut state = GameState::new_two_player(42);
+        let aura = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Reanimator Aura".to_string(),
+            Zone::Battlefield,
+        );
+        let reanimated_creature = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Reanimated Creature".to_string(),
+            Zone::Battlefield,
+        );
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::SelfRef)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Enchant(TargetFilter::ParentTarget),
+            }]);
+        let mut ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+                end_cost: None,
+            },
+            vec![],
+            aura,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+        ability.context.forwarded_result_context = Some(Box::new(
+            crate::types::ability::ForwardedResultContext::from_object_ids(
+                &state,
+                &[reanimated_creature],
+            ),
+        ));
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.transient_continuous_effects.len(), 1);
+        assert_eq!(
+            state.transient_continuous_effects[0].modifications,
+            vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Enchant(TargetFilter::SpecificObject {
+                    id: reanimated_creature,
+                }),
             }]
         );
     }

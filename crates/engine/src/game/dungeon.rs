@@ -417,6 +417,7 @@ pub fn room_effects(
                 Effect::GrantCastingPermission {
                     permission: CastingPermission::PlayFromExile {
                         provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                        mode: crate::types::ability::CardPlayMode::Play,
                         duration: Duration::UntilEndOfTurn,
                         // Placeholder — rewritten to ability.controller at
                         // grant time by `grant_permission::resolve`.
@@ -430,6 +431,7 @@ pub fn room_effects(
                         single_use_group: None,
                         single_use: false,
                         cast_cost_raise: None,
+                        alt_ability_cost: None,
                         land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     },
                     target: TargetFilter::Any,

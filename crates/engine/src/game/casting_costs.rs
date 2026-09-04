@@ -6955,17 +6955,36 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
     // are paid through the same pipeline as flashback's non-mana cost.
     let alt_ability_cost = state.objects.get(&object_id).and_then(|obj| {
         if obj.zone == Zone::Exile {
-            // CR 611.2a: Match the grantee filter used by
-            // `prepare_spell_cast_with_variant_override` so the alt-ability
-            // cost is only consumed by the granted player.
-            obj.casting_permissions
-                .iter()
+            // CR 611.2a: Restrict to the exact permission instance selected for
+            // this cast (`casting_permission_index`), not a scan of every exile
+            // permission on the object. `casting::cast_spell`'s `alt_cost_from_exile`
+            // already zeroes the mana cost only for that same selected permission
+            // (see `casting.rs`'s mirrored `selected_permission` lookup); charging
+            // the `AbilityCost` body from an unscoped scan would let an object
+            // with two overlapping `PlayFromExile`/`ExileWithAltAbilityCost` grants
+            // (e.g. a normal grant plus an Inside Information-class grant) pay the
+            // OTHER grant's alt cost instead of the one actually elected.
+            let selected_permission = casting_permission_index
+                .and_then(|CastingPermissionIndex(index)| obj.casting_permissions.get(index));
+            selected_permission
+                .into_iter()
                 .find_map(|p| match p {
                     crate::types::ability::CastingPermission::ExileWithAltAbilityCost {
                         cost,
                         granted_to,
                         ..
                     } if granted_to.is_none() || *granted_to == Some(player) => Some(cost.clone()),
+                    // CR 118.9 + CR 119.4 + CR 305.1: Inside Information class —
+                    // the alt cost lives on the `PlayFromExile` grant itself (see
+                    // `types::ability::CastingPermission::PlayFromExile::alt_ability_cost`)
+                    // so the same grant can also authorize land plays, which
+                    // never reach this spell-cost pipeline and so stay unaffected.
+                    // Mirrors the `ExileWithAltAbilityCost` arm above.
+                    crate::types::ability::CastingPermission::PlayFromExile {
+                        alt_ability_cost: Some(cost),
+                        granted_to,
+                        ..
+                    } if *granted_to == player => Some(cost.clone()),
                     _ => None,
                 })
                 .or_else(|| {
@@ -10655,6 +10674,8 @@ fn evaluate_cascade_constraint_with_resulting_mv(
                 granted_to,
                 resolution_cleanup: None,
                 duration: None,
+                // CR 611.2a: no duration, so no host to bind to.
+                source_id: None,
                 graveyard_replacement: None,
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
@@ -16409,6 +16430,262 @@ mod tests {
         );
     }
 
+    /// CR 601.2f + CR 301.5 + CR 301.5f: Glamdring, Foe-hammer — "Instant and
+    /// sorcery spells you cast cost {X} less to cast, where X is equipped
+    /// creature's power." Parses the real static line (parser -> runtime, like
+    /// `mana_value_gated_cost_reduction_reaches_cost_resolver` above), then
+    /// exercises the three static shapes that matter: attached to a 4-power
+    /// creature reduces instant/sorcery cost by 4; unattached applies NO
+    /// reduction (CR 301.5f: no creature is "equipped by" Glamdring, so the
+    /// `EquippedBy` aggregate is empty and sums to 0 — not a panic, not a
+    /// default value); and a creature spell is untouched (Instant/Sorcery only).
+    #[test]
+    fn glamdring_foe_hammer_cost_reduction_reaches_cost_resolver() {
+        let mut state = GameState::new_two_player(42);
+        let caster = PlayerId(0);
+
+        let host = create_object(
+            &mut state,
+            CardId(1),
+            caster,
+            "Host Creature".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&host).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_power = Some(4);
+            obj.base_toughness = Some(4);
+            obj.power = Some(4);
+            obj.toughness = Some(4);
+        }
+
+        let glamdring = create_object(
+            &mut state,
+            CardId(2),
+            caster,
+            "Glamdring, Foe-hammer".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&glamdring).unwrap();
+            obj.card_types.core_types.push(CoreType::Artifact);
+            obj.card_types.subtypes.push("Equipment".to_string());
+        }
+        let static_def = crate::parser::oracle_static::parse_static_line(
+            "Instant and sorcery spells you cast cost {X} less to cast, where X is equipped creature's power.",
+        )
+        .expect("Glamdring, Foe-hammer's cost reduction should parse");
+        state
+            .objects
+            .get_mut(&glamdring)
+            .unwrap()
+            .static_definitions
+            .push(static_def);
+
+        let mut add_spell = |id: u64, core: CoreType| -> ObjectId {
+            let obj_id = create_object(
+                &mut state,
+                CardId(id),
+                caster,
+                format!("Spell {id}"),
+                Zone::Hand,
+            );
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            obj.card_types.core_types.push(core);
+            obj.mana_cost = ManaCost::generic(6);
+            obj_id
+        };
+        let instant = add_spell(10, CoreType::Instant);
+        let sorcery = add_spell(11, CoreType::Sorcery);
+        let creature_spell = add_spell(12, CoreType::Creature);
+
+        // `display_spell_cost` is the engine-authoritative post-modifier cost
+        // (see the mana-value-gated precedent above). Called directly at each
+        // site (not via a closure) — a closure capturing `&state` would keep
+        // that borrow alive across the intervening `state.objects.get_mut`
+        // calls that attach Glamdring and pump the host below.
+        fn cost(state: &GameState, caster: PlayerId, id: ObjectId) -> Option<ManaCost> {
+            crate::game::casting::display_spell_cost(state, caster, id)
+        }
+
+        // (c) UNATTACHED: Glamdring is on the battlefield but equipped to
+        // nothing — CR 301.5f means the `EquippedBy` population is empty, so
+        // the Sum aggregate is 0 and NO reduction applies (not a panic, not a
+        // garbage default).
+        assert_eq!(
+            cost(&state, caster, instant),
+            Some(ManaCost::generic(6)),
+            "unattached Glamdring must not reduce cost"
+        );
+
+        // Attach Glamdring to the 4-power creature (CR 301.5c: one Equipment
+        // may be attached to at most one creature).
+        state.objects.get_mut(&glamdring).unwrap().attached_to = Some(host.into());
+        state
+            .objects
+            .get_mut(&host)
+            .unwrap()
+            .attachments
+            .push(glamdring);
+
+        // (a) ATTACHED to a 4-power creature: instant/sorcery cost {4} less.
+        assert_eq!(
+            cost(&state, caster, instant),
+            Some(ManaCost::generic(2)),
+            "instant must be reduced by the equipped creature's power (4)"
+        );
+        assert_eq!(
+            cost(&state, caster, sorcery),
+            Some(ManaCost::generic(2)),
+            "sorcery must be reduced by the equipped creature's power (4)"
+        );
+        // (d) Creature spells are NOT reduced — the static only affects
+        // instant/sorcery spells.
+        assert_eq!(
+            cost(&state, caster, creature_spell),
+            Some(ManaCost::generic(6)),
+            "creature spells must not be reduced by Glamdring"
+        );
+
+        // CR 601.2f + CR 107.1b: a reduction can never take a cost below 0 —
+        // an oversized equipped creature (power 9 against a {6} spell) floors
+        // the generic cost at 0, it does not go negative or panic.
+        state.objects.get_mut(&host).unwrap().power = Some(9);
+        assert_eq!(
+            cost(&state, caster, instant),
+            Some(ManaCost::generic(0)),
+            "an equipped creature's power greater than the spell's cost must floor at 0"
+        );
+    }
+
+    /// CR 611.3a + CR 301.5: Glamdring, Foe-hammer's reduction is a LIVE
+    /// reference to the equipped creature's power, re-evaluated at every cost
+    /// determination — a continuous effect from a static ability isn't locked
+    /// in. Casts two {10}-generic instants in the same turn with a real pump
+    /// spell resolved in between: the first cast is funded to exactly
+    /// `10 - 4 = 6` (the creature's power at that moment) and the second to
+    /// exactly `10 - 7 = 3` (after "Target creature gets +3/+3 until end of
+    /// turn" resolves). If the reduction were snapshotted at parse/attach time
+    /// instead of read live, the second cast's cost would still be 6 and the
+    /// {3}-funded cast would fail for insufficient mana instead of resolving
+    /// with 0 mana left over.
+    #[test]
+    fn glamdring_foe_hammer_cost_reduction_is_live_not_snapshotted() {
+        let caster = PlayerId(0);
+        let mut scenario = crate::game::scenario::GameScenario::new();
+        scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+
+        let host = scenario.add_creature(caster, "Host Creature", 4, 4).id();
+
+        let glamdring = scenario
+            .add_artifact_from_oracle(
+                caster,
+                "Glamdring, Foe-hammer",
+                "Instant and sorcery spells you cast cost {X} less to cast, where X is equipped creature's power.\nEquip {2}",
+            )
+            .with_subtypes(vec!["Equipment"])
+            .id();
+        // Attach directly (bypassing the Equip activation, which is not under
+        // test here) — mirrors the equipment test convention used throughout
+        // `game/combat.rs`.
+        scenario
+            .state
+            .objects
+            .get_mut(&glamdring)
+            .unwrap()
+            .attached_to = Some(host.into());
+        scenario
+            .state
+            .objects
+            .get_mut(&host)
+            .unwrap()
+            .attachments
+            .push(glamdring);
+
+        let spell_a = scenario
+            .add_spell_to_hand_from_oracle(caster, "Test Instant A", true, "You gain 1 life.")
+            .with_mana_cost(ManaCost::generic(10))
+            .id();
+        let spell_b = scenario
+            .add_spell_to_hand_from_oracle(caster, "Test Instant B", true, "You gain 1 life.")
+            .with_mana_cost(ManaCost::generic(10))
+            .id();
+        let pump = scenario
+            .add_spell_to_hand_from_oracle(
+                caster,
+                "Test Pump",
+                true,
+                "Target creature gets +3/+3 until end of turn.",
+            )
+            .with_mana_cost(ManaCost::generic(0))
+            .id();
+
+        let make_pool = |n: u32| {
+            (0..n)
+                .map(|_| ManaUnit::new(ManaType::Colorless, ObjectId(9999), false, vec![]))
+                .collect::<Vec<_>>()
+        };
+
+        // First cast: power is 4, so {10} - {4} = {6}. Fund exactly {6}.
+        scenario.with_mana_pool(caster, make_pool(6));
+        let mut runner = scenario.build();
+        let outcome = runner.cast(spell_a).resolve();
+        let leftover = |state: &GameState| {
+            state
+                .players
+                .iter()
+                .find(|p| p.id == caster)
+                .map(|p| p.mana_pool.total() as u32)
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            leftover(outcome.state()),
+            0,
+            "first cast must consume exactly the {{6}} reduced cost (power 4)"
+        );
+
+        // Pump the equipped creature mid-turn via a REAL resolved spell (not a
+        // raw field poke) — power becomes 4 + 3 = 7.
+        let outcome = runner.cast(pump).target_object(host).resolve();
+        assert_eq!(
+            outcome.state().objects.get(&host).unwrap().power,
+            Some(7),
+            "pump must raise the equipped creature's power to 7"
+        );
+
+        // Second cast, same turn: the reduction must reflect the NEW power
+        // (7), not the power (4) read during the first cast. {10} - {7} = {3}.
+        // If the engine had snapshotted the reduction instead of reading it
+        // live, the true cost would still be {6} and this {3}-funded cast
+        // would fail to pay rather than resolve cleanly.
+        runner
+            .state_mut()
+            .players
+            .iter_mut()
+            .find(|p| p.id == caster)
+            .unwrap()
+            .mana_pool
+            .clear();
+        for unit in make_pool(3) {
+            runner
+                .state_mut()
+                .players
+                .iter_mut()
+                .find(|p| p.id == caster)
+                .unwrap()
+                .mana_pool
+                .add(unit);
+        }
+        let outcome = runner.cast(spell_b).resolve();
+        assert_eq!(
+            leftover(outcome.state()),
+            0,
+            "second cast must consume exactly the {{3}} reduced cost reflecting the LIVE power (7), \
+             proving the reduction is not snapshotted from the first cast"
+        );
+    }
+
     /// CR 118.9 + CR 107.14: Primal Prayers grants {E} as an alternative cost
     /// for creature spells with MV ≤ 3 that the controller casts.
     #[test]
@@ -19456,6 +19733,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
@@ -19576,6 +19854,7 @@ mod tests {
                 .unwrap()
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
@@ -19648,6 +19927,7 @@ mod tests {
                 .unwrap()
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
@@ -19700,6 +19980,7 @@ mod tests {
                 .unwrap()
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
@@ -19758,6 +20039,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: selected_cost.clone(),
                     cast_transformed: false,
@@ -19777,6 +20059,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::generic(5),
                     cast_transformed: false,
@@ -19827,6 +20110,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
@@ -19894,6 +20178,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: selected_cost.clone(),
                     cast_transformed: false,
@@ -19913,6 +20198,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
@@ -19972,6 +20258,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
@@ -19996,6 +20283,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    source_id: None,
                     cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
@@ -24011,6 +24299,8 @@ its replicate cost was paid.)\nDraw a card.";
                 },
                 constraint: None,
                 granted_to: Some(PlayerId(0)),
+                duration: None,
+                source_id: None,
             });
 
         let ability = ResolvedAbility::new(

@@ -26,7 +26,7 @@
     "autoPass": "Auto-Pass",
     "skipLowUsePriorityWindows": "Skip low-use priority windows (Experimental)",
     "skipLowUsePriorityWindowsDescription": "Automatically pass your own empty-stack upkeep, draw, and end-step priority windows. Phase stops and Full Control still pause.",
-    "logDefault": "Log Default",
+    "logDockSide": "Game Log Position",
     "spellPayment": "Spell Payment",
     "manualManaPayment": "Manual mana payment for spells",
     "spellPaymentOptions": {
@@ -60,9 +60,9 @@
       "medium": "Medium",
       "large": "Large"
     },
-    "logDefaultOptions": {
-      "open": "Open",
-      "closed": "Closed"
+    "logDockSideOptions": {
+      "left": "Left",
+      "right": "Right"
     }
   },
   "visual": {
@@ -176,6 +176,7 @@
     "signedInAs": "Signed in as {{name}}",
     "syncNow": "Sync now",
     "statusSyncing": "Syncing…",
+    "statusPaused": "Cloud sync is paused while you're offline.",
     "statusError": "Sync failed",
     "lastSynced": "Last synced {{time}}",
     "never": "never",
@@ -215,6 +216,7 @@
   "visualPacks": {
     "title": "Offline card images",
     "description": "Choose images to keep on this device. The card catalog is cached from Scryfall; every image is then downloaded directly from Scryfall.",
+    "offlineUnavailable": "Network downloads are unavailable while offline. Reconnect to update the catalog or install, sync, repair, or resume images.",
     "availability": {
       "loading": "Checking offline visual catalog support…",
       "browser": "This browser does not provide the local storage features required for offline image downloads.",
@@ -226,12 +228,13 @@
     "selector": {
       "title": "Download selection",
       "core": "Card back",
-      "printing": "English set printings",
-      "locale": "Localized set printings",
+      "printing": "Set printings",
       "complete": "All current English card images",
       "curated": "One image per card",
+      "deck_library": "Deck library",
       "curatedNote": "One image per card, chosen by your Card Art Preferences on the Visual tab. Change them there and this selection follows.",
       "curatedDefaultNote": "One image per card. You have no card art rules, so this downloads each card's default art — add rules under Card Art Preferences on the Visual tab to pick different printings.",
+      "deckLibraryNote": "One image per card used in the shared deck library, including AI Commander precons. It follows Card Art Preferences. After installation, the app updates additions and removes images no longer needed while it is running; removing this pack stops that synchronization.",
       "driftNone": "Your installed images already match these settings.",
       "driftSummary": "Your installed images are out of date: {{add}} to add, {{remove}} to remove, {{refresh}} to refresh.",
       "setCode": "Set code",
@@ -292,6 +295,7 @@
       "root": "Scryfall snapshot",
       "packs": "Packs: {{current}} of {{total}}",
       "objects": "Images: {{current}} of {{total}}",
+      "objectsUnknown": "Images downloaded: {{current}}",
       "scanNote": "The total grows as the Scryfall snapshot is scanned. Completed images are stored locally and skipped when you resume.",
       "estimateNote": "The total was fixed when this download started. Completed images are stored locally and skipped when you resume.",
       "finalizing": "Finalizing offline image installation"
@@ -332,7 +336,10 @@
         "projection_drift": "Installed lookup records differ from the trusted catalog"
       }
     },
-    "removal": { "committed": "Removal committed at revision {{revision}}." },
+    "removal": {
+      "committed": "Removal committed at revision {{revision}}.",
+      "inProgress": "Removing offline visuals…"
+    },
     "cleanup": {
       "malformed_entry": "A malformed cache entry could not be reclaimed",
       "unsafe_entry": "An unsafe cache entry was left untouched",
@@ -343,6 +350,7 @@
       "core": "Card back",
       "complete": "All current English card images",
       "curated": "One image per card",
+      "deckLibrary": "Deck library",
       "printing": "{{set}} printings",
       "locale": "{{set}} printings ({{language}})"
     },
@@ -396,6 +404,42 @@
       "effects": "Spell casts, zone changes, deaths, life changes, counters, tap/untap.",
       "combat": "Combat damage timing — how long blockers and attackers linger before damage resolves.",
       "banners": "Turn-start banner display."
+    }
+  },
+  "offlinePreparation": {
+    "title": "Offline preparation",
+    "description": "Prepare this desktop for cold-launch local play before enabling Work Offline.",
+    "prepare": "Prepare for Offline",
+    "preparing": "Preparing…",
+    "workOffline": "Work Offline",
+    "checklistLabel": "Offline readiness checklist",
+    "visualWarning": "Installed visual packs need attention. Open Visual Packs to repair them; local play remains available.",
+    "incompleteTitle": "Offline preparation is incomplete",
+    "incompleteMessage": "Missing: {{capabilities}}. Enable Work Offline anyway?",
+    "confirmOffline": "Enable Work Offline",
+    "states": {
+      "needs-preparation": "Prepare this device before working offline.",
+      "preparing": "Preparing local play capabilities…",
+      "ready": "This device is ready for offline local play.",
+      "failed": "Some required local-play capabilities are not ready.",
+      "reconnect-required": "Reconnect before preparing offline local play.",
+      "reload-or-relaunch-required": "Reload the app or relaunch the desktop shell, then prepare again."
+    },
+    "capabilities": {
+      "appShell": "App shell",
+      "browserEngine": "Browser engine and card database",
+      "scryfallSearch": "Card search data",
+      "preconCatalog": "Generated preconstructed decks",
+      "bundledAiCatalog": "Bundled AI deck catalog",
+      "deckLibrary": "Installed Deck Library",
+      "nativeEngine": "Native engine"
+    },
+    "capabilityStates": {
+      "ready": "Ready",
+      "not-ready": "Not ready",
+      "reload-required": "Reload required",
+      "not-applicable": "Not applicable",
+      "not-installed": "Not installed"
     }
   },
   "artChain": {

@@ -122,12 +122,14 @@ function mockView(status: string): DraftPlayerView {
   return {
     status: status as DraftPlayerView["status"],
     kind: "Premier",
+    launch_capability: "None",
     current_pack_number: 1,
     pick_number: 1,
     pass_direction: "Left",
     current_pack: null,
     // Premier (CR 905.1a) with no pending pack.
     required_pick_count: 0,
+    pick_selection_mode: "Direct",
     pool: [],
     draft_effects: [],
     pool_groups: {
@@ -248,6 +250,34 @@ describe("DraftPodHostAdapter", () => {
     expect(statusEvents).toContainEqual({ type: "statusChanged", status: "connecting" });
     expect(statusEvents).toContainEqual({ type: "statusChanged", status: "lobby" });
     expect(events).toContainEqual({ type: "roomCreated", roomCode: "ABCDE" });
+  });
+
+  it("passes the configured backup endpoint to the production P2P host", async () => {
+    await adapter.initialize({
+      poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
+      kind: "Premier",
+      podSize: 8,
+      hostDisplayName: "Host",
+      tournamentFormat: "Swiss",
+      podPolicy: "Competitive",
+      backupEndpoint: "https://phase.example",
+    });
+
+    const { P2PDraftHost } = await import("../p2p-draft-host");
+    expect(P2PDraftHost).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(Function),
+      expect.anything(),
+      "Premier",
+      8,
+      "Host",
+      "Swiss",
+      "Competitive",
+      undefined,
+      undefined,
+      "ABCDE",
+      "https://phase.example",
+    );
   });
 
   it("can suspend without terminating the persisted host draft", async () => {

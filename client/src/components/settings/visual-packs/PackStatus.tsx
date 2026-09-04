@@ -5,6 +5,7 @@ import {
   packId,
   type CatalogSummary,
   type CuratedDrift,
+  type DeckLibraryDrift,
   type InstalledPack,
   type PackId,
   type RemovalResponse,
@@ -12,9 +13,10 @@ import {
 } from "../../../services/visualPacks/types.ts";
 import { formatByteSize } from "../../../utils/byteSize.ts";
 import { packLabel, shortDigest } from "./packLabels.ts";
-import { curatedDriftState, hasPendingVisualPackMutation } from "./useVisualPackManager.ts";
+import { hasPendingVisualPackMutation, localMembershipDriftState } from "./useVisualPackManager.ts";
 
 const CURATED = packId("curated");
+const DECK_LIBRARY = packId("deck_library");
 
 /**
  * Whether an installed pack is behind what the panel could install now.
@@ -37,32 +39,42 @@ const CURATED = packId("curated");
  * everything has changed. `unknown` shows nothing: an unmeasured claim here
  * would be a claim that a multi-gigabyte download is outstanding.
  */
-function upgradeAvailable(entry: InstalledPack, summary: CatalogSummary, drift: CuratedDrift | null): boolean {
-  if (entry.packId !== CURATED) return entry.catalogRoot !== summary.catalogRoot;
-  return curatedDriftState(summary, drift) === "drifted";
+function upgradeAvailable(
+  entry: InstalledPack,
+  summary: CatalogSummary,
+  curatedDrift: CuratedDrift | null,
+  deckLibraryDrift: DeckLibraryDrift | null,
+): boolean {
+  if (entry.packId === CURATED) return localMembershipDriftState(summary, CURATED, curatedDrift) === "drifted";
+  if (entry.packId === DECK_LIBRARY) return localMembershipDriftState(summary, DECK_LIBRARY, deckLibraryDrift) === "drifted";
+  return entry.catalogRoot !== summary.catalogRoot;
 }
 
 interface PackStatusProps {
   summary: CatalogSummary;
   curatedDrift: CuratedDrift | null;
+  deckLibraryDrift: DeckLibraryDrift | null;
   verification: VerificationResponse | null;
   removal: RemovalResponse | null;
   pendingActions: ReadonlySet<string>;
   durableMutationActive: boolean;
+  networkActionsDisabled: boolean;
   onVerify(mode: "metadata" | "full"): void;
   onRepair(ids: PackId[]): void;
-  onRemoveSelected(ids: PackId[]): void;
-  onRemoveComplete(): void;
-  onRemoveAll(): void;
+  onRemoveSelected(ids: PackId[], launcher: HTMLButtonElement): void;
+  onRemoveComplete(launcher: HTMLButtonElement): void;
+  onRemoveAll(launcher: HTMLButtonElement): void;
 }
 
 export function PackStatus({
   summary,
   curatedDrift,
+  deckLibraryDrift,
   verification,
   removal,
   pendingActions,
   durableMutationActive,
+  networkActionsDisabled,
   onVerify,
   onRepair,
   onRemoveSelected,
@@ -118,12 +130,12 @@ export function PackStatus({
             />
             <span className="min-w-0 break-all">
               {packLabel(entry.packId, t)}
-              {upgradeAvailable(entry, summary, curatedDrift) && <span className="ml-2 text-amber-300">{t("visualPacks.status.upgradeAvailable")}</span>}
+              {upgradeAvailable(entry, summary, curatedDrift, deckLibraryDrift) && <span className="ml-2 text-amber-300">{t("visualPacks.status.upgradeAvailable")}</span>}
               <span className="mt-1 block text-slate-500">
                 {/* Curated is stored under its own membership digest, so
                     "installed from snapshot" would name a Scryfall snapshot it
                     was never built from. */}
-                {entry.packId === CURATED
+                {entry.packId === CURATED || entry.packId === DECK_LIBRARY
                   ? t("visualPacks.status.membershipDigest", { digest: shortDigest(entry.catalogRoot) })
                   : t("visualPacks.status.receiptRoot", { root: shortDigest(entry.catalogRoot) })}
               </span>
@@ -134,10 +146,10 @@ export function PackStatus({
       <div className="flex flex-wrap gap-2">
         <button type="button" disabled={pendingActions.has("verify:metadata")} onClick={() => onVerify("metadata")} className="min-h-11 rounded-[12px] border border-white/15 px-3 text-sm text-slate-100 disabled:opacity-40">{t("visualPacks.actions.verifyMetadata")}</button>
         <button type="button" disabled={pendingActions.has("verify:full")} onClick={() => onVerify("full")} className="min-h-11 rounded-[12px] border border-white/15 px-3 text-sm text-slate-100 disabled:opacity-40">{t("visualPacks.actions.verifyFull")}</button>
-        <button type="button" disabled={durableMutationActive || mutationPending || selectedIds.length === 0} onClick={() => onRepair(selectedIds)} className="min-h-11 rounded-[12px] border border-sky-400/40 px-3 text-sm text-sky-100 disabled:opacity-40">{t("visualPacks.actions.repair")}</button>
-        <button type="button" disabled={durableMutationActive || mutationPending || selectedIds.length === 0} onClick={() => onRemoveSelected(selectedIds)} className="min-h-11 rounded-[12px] border border-rose-400/40 px-3 text-sm text-rose-100 disabled:opacity-40">{t("visualPacks.actions.removeSelected")}</button>
-        <button type="button" disabled={durableMutationActive || mutationPending} onClick={onRemoveComplete} className="min-h-11 rounded-[12px] border border-rose-400/40 px-3 text-sm text-rose-100 disabled:opacity-40">{t("visualPacks.actions.removeComplete")}</button>
-        <button type="button" disabled={durableMutationActive || mutationPending} onClick={onRemoveAll} className="min-h-11 rounded-[12px] border border-rose-400/40 px-3 text-sm text-rose-100 disabled:opacity-40">{t("visualPacks.actions.removeAll")}</button>
+        <button type="button" disabled={networkActionsDisabled || durableMutationActive || mutationPending || selectedIds.length === 0} onClick={() => onRepair(selectedIds)} className="min-h-11 rounded-[12px] border border-sky-400/40 px-3 text-sm text-sky-100 disabled:opacity-40">{t("visualPacks.actions.repair")}</button>
+        <button type="button" disabled={durableMutationActive || mutationPending || selectedIds.length === 0} onClick={(event) => onRemoveSelected(selectedIds, event.currentTarget)} className="min-h-11 rounded-[12px] border border-rose-400/40 px-3 text-sm text-rose-100 disabled:opacity-40">{t("visualPacks.actions.removeSelected")}</button>
+        <button type="button" disabled={durableMutationActive || mutationPending} onClick={(event) => onRemoveComplete(event.currentTarget)} className="min-h-11 rounded-[12px] border border-rose-400/40 px-3 text-sm text-rose-100 disabled:opacity-40">{t("visualPacks.actions.removeComplete")}</button>
+        <button type="button" disabled={durableMutationActive || mutationPending} onClick={(event) => onRemoveAll(event.currentTarget)} className="min-h-11 rounded-[12px] border border-rose-400/40 px-3 text-sm text-rose-100 disabled:opacity-40">{t("visualPacks.actions.removeAll")}</button>
       </div>
       {verification && (
         <div aria-live="polite" className="text-xs text-slate-300">
@@ -156,6 +168,9 @@ export function PackStatus({
             {removal.cleanupIssues.map((issue, index) => <li key={`${issue.kind}:${index}`}>{t(`visualPacks.cleanup.${issue.kind}`)}</li>)}
           </ul>
         </div>
+      )}
+      {pendingActions.has("remove") && (
+        <p aria-live="polite" className="text-xs text-slate-300">{t("visualPacks.removal.inProgress")}</p>
       )}
     </section>
   );

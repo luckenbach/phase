@@ -10,10 +10,17 @@
  * are mocked so the suite exercises only the modal render logic and the
  * "Return to setup" navigation.
  */
-import { cleanup, render, screen, act } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter, Route, Routes } from "react-router";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router";
 import { MotionGlobalConfig } from "framer-motion";
 
 import { GamePage } from "../GamePage";
@@ -23,6 +30,7 @@ import type { P2PAdapterEvent } from "../../adapter/p2p-adapter";
 import { P2PHostAdapter } from "../../adapter/p2p-adapter";
 import { WebSocketAdapter } from "../../adapter/ws-adapter";
 import { usePreferencesStore } from "../../stores/preferencesStore";
+import { useUiStore } from "../../stores/uiStore";
 import { gameObjectFactory } from "../../test/factories/gameObjectFactory";
 import {
   buildCommanderFormatConfig,
@@ -36,6 +44,8 @@ let capturedOnNoDeck: ((reason?: string, bracketViolation?: boolean) => void) | 
 let capturedFormatConfig: FormatConfig | undefined;
 let capturedOnWsEvent: ((event: WsAdapterEvent) => void) | undefined;
 let capturedOnP2PEvent: ((event: P2PAdapterEvent) => void) | undefined;
+// The join/spectate origin the route carried, handed down as a provider prop.
+let capturedServerUrl: string | undefined;
 
 const { mockClearPromptOverlayState, mockIsMobile, mockSetGameState, storeOverrides } = vi.hoisted(() => ({
   mockClearPromptOverlayState: vi.fn(),
@@ -97,17 +107,20 @@ vi.mock("../../providers/GameProvider", () => ({
     onWsEvent,
     onP2PEvent,
     formatConfig,
+    serverUrl,
   }: {
     children: React.ReactNode;
     onNoDeck?: (reason?: string, bracketViolation?: boolean) => void;
     onWsEvent?: (event: WsAdapterEvent) => void;
     onP2PEvent?: (event: P2PAdapterEvent) => void;
     formatConfig?: FormatConfig;
+    serverUrl?: string;
   }) => {
     capturedOnNoDeck = onNoDeck;
     capturedOnWsEvent = onWsEvent;
     capturedOnP2PEvent = onP2PEvent;
     capturedFormatConfig = formatConfig;
+    capturedServerUrl = serverUrl;
     return <>{children}</>;
   },
 }));
@@ -168,6 +181,9 @@ vi.mock("../../stores/gameStore", async () => ({
   hasRemoteHumans: (
     await vi.importActual<typeof import("../../stores/gameStore")>("../../stores/gameStore")
   ).hasRemoteHumans,
+  canExportAuthoritativeState: (
+    await vi.importActual<typeof import("../../stores/gameStore")>("../../stores/gameStore")
+  ).canExportAuthoritativeState,
   loadActiveGame: vi.fn(() => null),
   saveActiveGame: vi.fn(),
   clearActiveGame: vi.fn(),
@@ -229,12 +245,14 @@ vi.mock("../../components/hud/HUD", () => ({
 }));
 
 vi.mock("../../components/board/GameBoard", () => ({
-  GameBoard: ({ effectiveMultiplayerBoardLayout }: { effectiveMultiplayerBoardLayout: string }) => (
-    <div
-      data-layout={effectiveMultiplayerBoardLayout}
-      data-testid="game-board-layout"
-    />
-  ),
+  GameBoard: (props: Record<string, unknown>) => {
+    return (
+      <div
+        data-layout={String(props.effectiveMultiplayerBoardLayout)}
+        data-testid="game-board-layout"
+      />
+    );
+  },
 }));
 
 vi.mock("../../components/modal/EngineLostModal", () => ({
@@ -243,6 +261,18 @@ vi.mock("../../components/modal/EngineLostModal", () => ({
 
 vi.mock("../../components/modal/CardDataMissingModal", () => ({
   CardDataMissingModal: () => null,
+}));
+
+// This is the leaf of the production ability-choice path. Keeping the mock at
+// the rendering boundary lets the test exercise GamePage's module-private
+// AbilityChoiceModal and observe the actual labels it supplies without pulling
+// card-art loading into a label-wiring test.
+vi.mock("../../components/modal/ChoiceModal", () => ({
+  ChoiceModal: ({ options }: { options: Array<{ id: string; label: string }> }) => (
+    <div data-testid="ability-choice-options">
+      {options.map((option) => <button key={option.id} type="button">{option.label}</button>)}
+    </div>
+  ),
 }));
 
 vi.mock("../../stores/draftStore", () => ({
@@ -270,7 +300,14 @@ vi.mock("../../adapter/draft-adapter", () => ({
 vi.mock("../../components/chrome/GameMenu", () => ({
   GameMenu: (props: Record<string, unknown>) => {
     capturedGameMenuProps = props;
-    return null;
+    return (
+      <button
+        ref={props.menuTriggerRef as React.Ref<HTMLButtonElement> | undefined}
+        type="button"
+      >
+        Game menu
+      </button>
+    );
   },
 }));
 
@@ -289,19 +326,60 @@ vi.mock("../../hooks/useCardDataMeta", () => ({
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function renderGamePage(
+/** Renders whatever router state the deck-rejected re-entry navigated with,
+ * so a dropped field is visible rather than inferred. */
+function MultiplayerStub() {
+  const { state } = useLocation();
+  return <div data-testid="multiplayer-stub">{JSON.stringify(state)}</div>;
+}
+
+function gamePageTree(
   initialEntry: string | { pathname: string; search: string; state: unknown } =
     "/game/test-game-123?mode=ai",
 ) {
-  return render(
+  return (
     <MemoryRouter initialEntries={[initialEntry as never]}>
       <Routes>
         <Route path="/game/:id" element={<GamePage />} />
         <Route path="/setup" element={<div data-testid="setup-page">Setup</div>} />
+        <Route path="/multiplayer" element={<MultiplayerStub />} />
         <Route path="/" element={<div>Home</div>} />
       </Routes>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+}
+
+function renderGamePage(
+  initialEntry: string | { pathname: string; search: string; state: unknown } =
+    "/game/test-game-123?mode=ai",
+) {
+  return render(gamePageTree(initialEntry));
+}
+
+async function closePreferencesAndExpectGameMenuFocus(): Promise<void> {
+  const dialog = await screen.findByRole("dialog", { name: "Settings" });
+  await closeDialogAndExpectGameMenuFocus(dialog);
+}
+
+async function closeDialogAndExpectGameMenuFocus(
+  dialog: HTMLElement,
+): Promise<void> {
+  await closeDialogAndExpectFocus(
+    dialog,
+    screen.getByRole("button", { name: "Game menu" }),
+  );
+}
+
+async function closeDialogAndExpectFocus(
+  dialog: HTMLElement,
+  returnTarget: HTMLElement,
+): Promise<void> {
+  await waitFor(() => expect(dialog).toHaveFocus());
+  fireEvent.keyDown(dialog, { key: "Escape" });
+  await waitFor(() =>
+    expect(dialog).not.toBeInTheDocument(),
+  );
+  expect(returnTarget).toHaveFocus();
 }
 
 // ── Test suite ────────────────────────────────────────────────────────────────
@@ -311,11 +389,13 @@ beforeEach(() => {
   capturedFormatConfig = undefined;
   capturedOnWsEvent = undefined;
   capturedOnP2PEvent = undefined;
+  capturedServerUrl = undefined;
   capturedGameMenuProps = undefined;
   storeOverrides.adapter = null;
   storeOverrides.gameState = null;
   storeOverrides.gameMode = null;
   storeOverrides.waitingFor = null;
+  useUiStore.setState({ pendingAbilityChoice: null });
   mockIsMobile.mockReturnValue(false);
   usePreferencesStore.setState({
     multiplayerBoardLayout: "focused",
@@ -505,6 +585,47 @@ describe("GamePage — P2P pause resume control", () => {
     act(() => { capturedOnP2PEvent?.({ type: "gamePaused", reason: "Paused by host" }); });
 
     expect(screen.queryByRole("button", { name: "Resume game" })).toBeNull();
+  });
+});
+
+describe("GamePage — Room unlock labels", () => {
+  it("passes copied Room half identities into its private ability-choice consumer", () => {
+    const roomCopy = gameObjectFactory
+      .enchantment()
+      .onBattlefield()
+      .withId(8294)
+      .named("")
+      .build();
+    const gameState = gameStateFactory
+      .withPlayers(0, 1)
+      .withObjects(roomCopy)
+      .priority(0)
+      .build({
+        derived: {
+          room_half_identities: {
+            [String(roomCopy.id)]: {
+              left: { name: "Greenhouse", mana_cost: { type: "Cost", generic: 2, shards: ["Green"] } },
+              right: { name: "Rickety Gazebo", mana_cost: { type: "Cost", generic: 3, shards: ["Green"] } },
+            },
+          },
+        },
+      });
+    storeOverrides.gameState = gameState;
+    storeOverrides.waitingFor = gameState.waiting_for;
+    useUiStore.setState({
+      pendingAbilityChoice: {
+        objectId: roomCopy.id,
+        actions: [
+          { type: "UnlockRoomDoor", data: { object_id: roomCopy.id, door: "Left" } },
+          { type: "UnlockRoomDoor", data: { object_id: roomCopy.id, door: "Right" } },
+        ],
+      },
+    });
+
+    renderGamePage();
+
+    expect(screen.getByRole("button", { name: "Unlock Greenhouse ({2}{G})" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Unlock Rickety Gazebo ({3}{G})" })).toBeInTheDocument();
   });
 });
 
@@ -715,6 +836,161 @@ describe("GamePage — toast surface", () => {
     // so Retry's absence is the omitted prop rather than an unmounted toast.
     expect(screen.getByRole("button", { name: "Settings" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it("returns Settings from a transient toast to the persistent game menu", async () => {
+    seedToast();
+    renderGamePage("/game/test-game-123?mode=ai");
+    const gameMenu = screen.getByRole("button", { name: "Game menu" });
+    const toastSettings = screen.getByRole("button", { name: "Settings" });
+
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.click(toastSettings);
+
+    await closePreferencesAndExpectGameMenuFocus();
+    expect(gameMenu).toHaveFocus();
+  });
+});
+
+describe("GamePage — board settings focus handoff", () => {
+  it("returns Change Background from its transient menu to the game menu", async () => {
+    renderGamePage();
+    fireEvent.contextMenu(screen.getByTestId("game-board-layout"), {
+      clientX: 40,
+      clientY: 60,
+    });
+
+    fireEvent.click(screen.getByRole("menuitem", { name: /Change background/ }));
+
+    await closePreferencesAndExpectGameMenuFocus();
+  });
+});
+
+describe("GamePage — shared modal return targets", () => {
+  it("returns a manually opened zone viewer to its persistent pile", async () => {
+    const card = gameObjectFactory
+      .withId(71)
+      .named("Graveyard Card")
+      .ownedBy(0)
+      .inGraveyard()
+      .build();
+    storeOverrides.gameState = gameStateFactory
+      .withPlayers({ id: 0, graveyard: [card.id] }, 1)
+      .withObjects(card)
+      .build();
+    renderGamePage();
+    const pile = document.querySelector<HTMLButtonElement>(
+      '[data-graveyard-pile="0"]',
+    );
+    expect(pile).not.toBeNull();
+    screen.getByRole("button", { name: "Game menu" }).focus();
+    fireEvent.click(pile!);
+
+    await closeDialogAndExpectFocus(
+      await screen.findByRole("dialog", { name: /Graveyard/ }),
+      pile!,
+    );
+  });
+
+  it("falls back to the game menu when the final card leaves an open zone", async () => {
+    const card = gameObjectFactory
+      .withId(72)
+      .named("Last Graveyard Card")
+      .ownedBy(0)
+      .inGraveyard()
+      .build();
+    storeOverrides.gameState = gameStateFactory
+      .withPlayers({ id: 0, graveyard: [card.id] }, 1)
+      .withObjects(card)
+      .build();
+    const view = renderGamePage();
+    const pile = document.querySelector<HTMLButtonElement>(
+      '[data-graveyard-pile="0"]',
+    );
+    expect(pile).not.toBeNull();
+    fireEvent.click(pile!);
+    const dialog = await screen.findByRole("dialog", { name: /Graveyard/ });
+    await waitFor(() => expect(dialog).toHaveFocus());
+
+    storeOverrides.gameState = gameStateFactory.withPlayers(0, 1).build();
+    view.rerender(gamePageTree());
+    expect(pile).not.toBeInTheDocument();
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Game menu" })).toHaveFocus();
+  });
+
+  it("falls back when a visible library launcher remains mounted but disables", async () => {
+    const visibleTop = gameObjectFactory
+      .withId(73)
+      .named("Visible Library Top")
+      .ownedBy(0)
+      .params({
+        zone: "Library",
+        display_visible_to_viewer: true,
+        entered_battlefield_turn: null,
+      })
+      .build();
+    storeOverrides.gameState = gameStateFactory
+      .withPlayers({ id: 0, library: [visibleTop.id] }, 1)
+      .withObjects(visibleTop)
+      .build();
+    const view = renderGamePage();
+    const pile = document.querySelector<HTMLButtonElement>(
+      '[data-library-pile="0"] > button',
+    );
+    expect(pile).toBeEnabled();
+    fireEvent.click(pile!);
+    const dialog = await screen.findByRole("dialog", { name: /Library/ });
+    await waitFor(() => expect(dialog).toHaveFocus());
+
+    const hiddenTop = { ...visibleTop, display_visible_to_viewer: false };
+    storeOverrides.gameState = gameStateFactory
+      .withPlayers({ id: 0, library: [hiddenTop.id] }, 1)
+      .withObjects(hiddenTop)
+      .build();
+    view.rerender(gamePageTree());
+    expect(pile).toBeInTheDocument();
+    expect(pile).toBeDisabled();
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Game menu" })).toHaveFocus();
+  });
+
+  it("returns a board-context card report to the persistent game menu", async () => {
+    storeOverrides.gameState = gameStateFactory.build();
+    renderGamePage();
+    fireEvent.contextMenu(screen.getByTestId("game-board-layout"), {
+      clientX: 40,
+      clientY: 60,
+    });
+
+    fireEvent.click(screen.getByRole("menuitem", { name: /Report a card/ }));
+
+    await closeDialogAndExpectGameMenuFocus(await screen.findByRole("dialog"));
+  });
+
+  it("closes the higher debug panel before opening its library viewer", async () => {
+    renderGamePage();
+    act(() => useUiStore.getState().openSandboxTools());
+    expect(useUiStore.getState().debugPanelOpen).toBe(true);
+    expect(useUiStore.getState().debugPanelTab).toBe("actions");
+    expect(await screen.findByText("Debug Panel")).toBeInTheDocument();
+    expect(await screen.findByText("Debug Actions")).toBeInTheDocument();
+    const accordionToggle = await screen.findByRole("button", {
+      name: /Browse Library/,
+    });
+    fireEvent.click(accordionToggle);
+    const browseButtons = screen.getAllByRole("button", {
+      name: /Browse Library/,
+    });
+    fireEvent.click(browseButtons[browseButtons.length - 1]);
+
+    expect(screen.queryByText("Debug Panel")).not.toBeInTheDocument();
+
+    await closeDialogAndExpectGameMenuFocus(await screen.findByRole("dialog"));
   });
 });
 
@@ -1050,5 +1326,47 @@ describe("GamePage — rematch preserves the format the game was played with", (
     // `FORMAT_DEFAULTS` is a Proxy in this suite, so a lost hand-over surfaces
     // as `undefined` here rather than as the real 40.
     expect(capturedFormatConfig?.starting_life).toBe(25);
+  });
+});
+
+describe("GamePage — join origin", () => {
+  const ORIGIN = "wss://play.example.com/ws";
+
+  it("passes the route's server to GameProvider and carries it through deck rejection", async () => {
+    renderGamePage(
+      `/game/g1?mode=join&code=ABC123&server=${encodeURIComponent(ORIGIN)}`,
+    );
+
+    expect(capturedServerUrl).toBe(ORIGIN);
+
+    act(() => {
+      capturedOnWsEvent?.({ type: "deckRejected", reason: "bad deck" });
+    });
+
+    const stub = await screen.findByTestId("multiplayer-stub");
+    expect(JSON.parse(stub.textContent ?? "null")).toEqual({
+      deckRejected: true,
+      reason: "bad deck",
+      joinCode: "ABC123",
+      server: ORIGIN,
+    });
+  });
+
+  it("carries no server when the route had none", async () => {
+    renderGamePage("/game/g1?mode=join&code=ABC123");
+
+    expect(capturedServerUrl).toBeUndefined();
+
+    act(() => {
+      capturedOnWsEvent?.({ type: "deckRejected", reason: "bad deck" });
+    });
+
+    const stub = await screen.findByTestId("multiplayer-stub");
+    // Paired with the case above: the field is absent, not stale.
+    expect(JSON.parse(stub.textContent ?? "null")).toEqual({
+      deckRejected: true,
+      reason: "bad deck",
+      joinCode: "ABC123",
+    });
   });
 });

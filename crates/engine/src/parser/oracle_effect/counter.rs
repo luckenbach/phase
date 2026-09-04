@@ -3,12 +3,12 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_until};
 use nom::character::complete::space1;
 use nom::combinator::{all_consuming, eof, opt, peek, value};
-use nom::sequence::terminated;
+use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use crate::types::ability::{
     ChosenCounterCountCondition, Comparator, CounterMoveSelection, CounterTransferMode,
-    DoublePTMode, DoubleTarget, Effect, EventCounterReproductionCount, MultiTargetSpec,
+    DoublePTMode, DoubleTarget, Effect, EventCounterReproductionCount, FilterProp, MultiTargetSpec,
     ObjectScope, QuantityExpr, QuantityRef, TargetFilter,
 };
 use crate::types::counter::{parse_counter_type, CounterType};
@@ -364,8 +364,51 @@ fn resolve_counter_placement_target<'a>(
     // CR 107.3i: Mirror the where-X strip above for the "up to N" branch.
     let target_text =
         strip_where_x_tail_ascii(target_text, &lower[lower.len() - target_text.len()..]);
-    let (target, rem) = parse_target_with_ctx(target_text, ctx);
-    (target, rem, multi)
+    let (target, remainder) = parse_target_with_ctx(target_text, ctx);
+    let (target, remainder) = apply_other_than_that_recipient_suffix(target, remainder, ctx);
+    (target, remainder, multi)
+}
+
+/// Consume an object-anaphoric distinctness rider on a counter recipient.
+///
+/// The shared target parser correctly stops after the recipient phrase, leaving
+/// `other than that creature` for the counter grammar. Keep the restriction on
+/// the typed recipient so ordinary follow-up suffixes (such as `equal to …` or
+/// `for each …`) still receive the remaining text.
+fn apply_other_than_that_recipient_suffix<'a>(
+    target: TargetFilter,
+    remainder: &'a str,
+    ctx: &mut ParseContext,
+) -> (TargetFilter, &'a str) {
+    let TargetFilter::Typed(mut typed) = target else {
+        return (target, remainder);
+    };
+    let lower = remainder.to_lowercase();
+    let Ok((remaining, ())) = parse_other_than_that_recipient_suffix(&lower) else {
+        return (TargetFilter::Typed(typed), remainder);
+    };
+    let consumed = lower.len() - remaining.len();
+    typed.properties.push(FilterProp::DistinctFrom {
+        reference: Box::new(resolve_it_pronoun(ctx)),
+    });
+    (TargetFilter::Typed(typed), &remainder[consumed..])
+}
+
+fn parse_other_than_that_recipient_suffix(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        terminated(
+            preceded(
+                space1,
+                preceded(
+                    tag("other than that "),
+                    alt((tag("creature"), tag("permanent"), tag("token"), tag("card"))),
+                ),
+            ),
+            peek(alt((eof, tag(" "), tag(","), tag(".")))),
+        ),
+    )
+    .parse(input)
 }
 
 /// CR 107.3i: Trim a trailing `, where X is …` or ` where X is …` binding
@@ -1046,6 +1089,53 @@ pub(super) fn try_parse_remove_counter(lower: &str, ctx: &mut ParseContext) -> O
     })
 }
 
+/// CR 115.1d + CR 122.1: Extract the fixed resolution-time selection in
+/// "remove … from each of two creatures you control". The surrounding remove
+/// parser remains the authority for the counter phrase and object filter; this
+/// nom-shaped probe preserves only the untargeted cardinality that `Effect`
+/// cannot represent by itself.
+pub(super) fn remove_counter_exact_selection_count(lower: &str) -> Option<u32> {
+    let descriptor = remove_counter_each_of_descriptor(lower)?;
+    parse_fixed_count_descriptor(descriptor).map(|(count, _)| count)
+}
+
+/// CR 601.2c: Recover the announced target cardinality in the targeted
+/// counterpart, "remove … from each of two target creatures". This stays
+/// distinct from the untargeted exact-selection descriptor above.
+pub(super) fn remove_counter_exact_target_multi_target(lower: &str) -> Option<MultiTargetSpec> {
+    let descriptor = remove_counter_each_of_descriptor(lower)?;
+    let (remainder, count) = super::parse_multi_target_count_expr(descriptor).ok()?;
+    nom_on_lower(remainder, remainder, |input| {
+        value((), preceded(space1, tag("target "))).parse(input)
+    })
+    .map(|_| MultiTargetSpec::exact(count))
+}
+
+/// Extract the descriptor following a remove-counter "from each of" phrase.
+/// Keeping the structural prefix parser shared prevents target and untargeted
+/// exact-count recognition from drifting.
+fn remove_counter_each_of_descriptor(lower: &str) -> Option<&str> {
+    let ((), descriptor) = nom_on_lower(lower, lower, |input| {
+        preceded(
+            take_until(" from each of "),
+            value((), tag(" from each of ")),
+        )
+        .parse(input)
+    })?;
+    Some(descriptor)
+}
+
+/// Parse the non-targeted descriptor after "each of". Targeted fixed-count
+/// wording remains in the ordinary target-selection pipeline (CR 601.2c).
+fn parse_fixed_count_descriptor(input: &str) -> Option<(u32, &str)> {
+    let (count, remainder) = nom_on_lower(input, input, nom_primitives::parse_number)?;
+    let is_targeted = nom_on_lower(remainder, remainder, |i| {
+        value((), preceded(space1, tag("target "))).parse(i)
+    })
+    .is_some();
+    (!is_targeted && count > 0).then_some((count, remainder.trim_start()))
+}
+
 /// Normalize oracle-text counter type strings to canonical engine names.
 ///
 /// - `+1/+1` / `-1/-1` map to the canonical `P1P1` / `M1M1` keys.
@@ -1072,6 +1162,14 @@ fn strip_remove_counter_each_of_any_number(input: &str) -> Option<&str> {
     .map(|((), rest)| rest.trim_start())
 }
 
+/// CR 115.1d + CR 122.1: Strip the fixed-count counterpart of the variable
+/// distribution prefix. The number is carried by the imperative AST; this
+/// helper leaves the object phrase for the normal typed-filter parser.
+fn strip_remove_counter_each_of_fixed_number(input: &str) -> Option<&str> {
+    let ((), after_each_of) = nom_on_lower(input, input, |i| value((), tag("each of ")).parse(i))?;
+    parse_fixed_count_descriptor(after_each_of).map(|(_, remainder)| remainder)
+}
+
 /// CR 122.1 + CR 115.1d: Resolve the "from <objects>" clause of a remove-counter
 /// effect. The optional "each of any number of" prefix denotes a variable-count
 /// non-target distribution — strip it and parse the remainder as a type phrase
@@ -1085,7 +1183,9 @@ fn resolve_remove_counter_from_target(text: &str, ctx: &mut ParseContext) -> Tar
         // CR 608.2k: Bare pronoun — context-dependent
         return resolve_it_pronoun(ctx);
     }
-    if let Some(filter_text) = strip_remove_counter_each_of_any_number(text) {
+    if let Some(filter_text) = strip_remove_counter_each_of_any_number(text)
+        .or_else(|| strip_remove_counter_each_of_fixed_number(text))
+    {
         let (t, _rem) = parse_type_phrase_with_ctx(filter_text, ctx);
         #[cfg(debug_assertions)]
         assert_no_compound_remainder(_rem, filter_text);
@@ -2165,6 +2265,21 @@ mod tests {
             panic!("expected RemoveCounter, got {:?}", clause.effect);
         };
         assert!(matches!(target, TargetFilter::Typed(_)));
+    }
+
+    /// CR 601.2c: Fixed-count wording with `target` still announces its
+    /// targets. It must not be reclassified as the untargeted tracked-set
+    /// selection used by "each of two creatures".
+    #[test]
+    fn remove_counter_each_of_two_target_creatures_keeps_multi_targeting() {
+        let text = "remove a +1/+1 counter from each of two target creatures";
+        assert_eq!(remove_counter_exact_selection_count(text), None);
+        let clause = super::super::parse_effect_clause(text, &mut default_ctx());
+        assert_eq!(
+            clause.multi_target,
+            Some(MultiTargetSpec::exact(QuantityExpr::Fixed { value: 2 }))
+        );
+        assert!(matches!(clause.effect, Effect::RemoveCounter { .. }));
     }
 
     #[test]
@@ -3249,6 +3364,30 @@ mod tests {
             TargetFilter::LastCreated,
             "token in chain → bare it binds the created token"
         );
+    }
+
+    #[test]
+    fn put_counter_other_than_that_creature_excludes_context_object() {
+        let mut ctx = default_ctx();
+        ctx.object_pronoun_ref = Some(TargetFilter::EventTarget);
+        let text = "put a +1/+1 counter on target creature you control other than that creature";
+        let (effect, remainder, _) =
+            try_parse_put_counter(text, text, &mut ctx).expect("counter clause must parse");
+        assert_eq!(remainder, "");
+        let Effect::PutCounter {
+            target: TargetFilter::Typed(target),
+            ..
+        } = effect
+        else {
+            panic!("expected a typed PutCounter target, got {effect:?}");
+        };
+        assert!(target.properties.iter().any(|property| {
+            matches!(
+                property,
+                FilterProp::DistinctFrom { reference }
+                    if **reference == TargetFilter::EventTarget
+            )
+        }));
     }
 
     /// Gap-A + §B2 integration: the real Esper Terra chapter chain parses with zero

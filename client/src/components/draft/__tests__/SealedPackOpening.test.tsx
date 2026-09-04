@@ -11,11 +11,13 @@ vi.mock("../../../hooks/useCardImage", () => ({
 const VIEW: DraftPlayerView = {
   status: "Deckbuilding",
   kind: "Sealed",
+  launch_capability: "None",
   current_pack_number: 0,
   pick_number: 0,
   pass_direction: "Left",
   current_pack: null,
   required_pick_count: 0,
+  pick_selection_mode: "Direct",
   pool: [
     {
       instance_id: "creature",

@@ -5,6 +5,10 @@
     "close": "Fechar",
     "closeNamed": "Fechar {{name}}"
   },
+  "debug": {
+    "exportAuthoritative": "Exportar estado de jogo autoritativo",
+    "exportAuthoritativeTitle": "Baixa o estado controlado pelo mecanismo usado para diagnosticar e restaurar este jogo"
+  },
   "quantityRef": {
     "highestNumber": "o número mais alto",
     "lowestNumber": "o número mais baixo",
@@ -61,7 +65,6 @@
   "comboDetector": {
     "label": "Detector de combos (experimental)",
     "title": "Detectar loops infinitos: encerrar loops obrigatórios automaticamente e mostrar recursos ∞ (desativado por padrão)",
-    "on": "Ligado",
     "off": "Desligado",
     "interactive": "Interativo"
   },
@@ -79,7 +82,8 @@
     "clickModeButton": "Botão de modo de clique",
     "shown": "Visível",
     "hidden": "Oculto",
-    "resume": "Continuar",
+    "openGameLog": "Abrir o registro do jogo",
+    "closeGameLog": "Fechar o registro do jogo",
     "settings": "Configurações",
     "boardLayoutSplit": "Dividido",
     "boardLayoutLegacy": "Legacy",

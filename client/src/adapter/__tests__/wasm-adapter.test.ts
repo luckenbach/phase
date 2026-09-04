@@ -8,7 +8,7 @@ import type {
   SubmitResult,
 } from "../types";
 import { AdapterError, AdapterErrorCode } from "../types";
-import { buildGameState } from "../../test/factories/gameStateFactory";
+import { buildGameState, gameStateFactory } from "../../test/factories/gameStateFactory";
 
 const ensureWasmInit = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const resumeRestoredGameState = vi.hoisted(() => vi.fn());
@@ -33,6 +33,9 @@ const mockWorkerClient = {
   evaluateDeckCompatibility: vi
     .fn()
     .mockResolvedValue({ standard: { compatible: true, reasons: [] } }),
+  evaluateDeckFormatGate: vi.fn().mockResolvedValue({ compatible: true, reasons: [] }),
+  customFormatFromLobbyConfig: vi.fn().mockResolvedValue({ label: "My Format" }),
+  formatConfigForCustomRules: vi.fn().mockResolvedValue({ format: "Custom:0" }),
   getCardFaceData: vi.fn().mockResolvedValue({ name: "Lightning Bolt" }),
   getCardParseDetails: vi.fn().mockResolvedValue([{ category: "ability" }]),
   getCardRulings: vi.fn().mockResolvedValue([{ date: "2020-01-01", text: "Test" }]),
@@ -96,6 +99,8 @@ describe("WasmAdapter", () => {
     mockWorkerClient.getAiScoredCandidates.mockResolvedValue([]);
     mockWorkerClient.getAiActionProposal.mockResolvedValue(null);
     mockWorkerClient.getAiActionProposalWithDiagnostics.mockResolvedValue(null);
+    mockWorkerClient.getAiActionProposalFromScores.mockResolvedValue(null);
+    mockWorkerClient.getAiActionProposalFromScoresWithDiagnostics.mockResolvedValue(null);
     mockWorkerClient.getAiTacticalActionProposal.mockResolvedValue(null);
     mockWorkerClient.getAiTacticalActionProposalWithDiagnostics.mockResolvedValue(null);
     mockWorkerClient.submitAiActionProposal.mockResolvedValue({
@@ -200,6 +205,101 @@ describe("WasmAdapter", () => {
     });
   });
 
+  it.each([false, true])("uses VeryHard pool scores from a state envelope with diagnostics %s", async (diagnostics) => {
+    const proposal: AiActionProposal = {
+      token: "scored-token",
+      semanticOwner: 0,
+      actor: 0,
+      action: { type: "PassPriority" },
+    };
+    const receipt: AiDecisionDiagnosticReceipt = {
+      semanticOwner: 0,
+      authorizedActor: 0,
+      selectedAction: proposal.action,
+      status: "direct",
+      selectionExplanation: "The authoritative worker selected the scored action.",
+      samplingTemperature: null,
+      candidates: [],
+    };
+    const scores = [[proposal.action, 12]];
+    mockWorkerClient.getState.mockResolvedValue({
+      state: gameStateFactory.priority().build(),
+      derived: {},
+    });
+    mockWorkerClient.getAiScoredCandidates.mockResolvedValue(scores);
+    mockWorkerClient.getAiActionProposalFromScores.mockResolvedValue(proposal);
+    mockWorkerClient.getAiActionProposalFromScoresWithDiagnostics.mockResolvedValue({ proposal, receipt });
+    mockWorkerClient.submitAiActionProposal.mockResolvedValue({
+      status: "applied",
+      result: { events: [], log_entries: [] },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await adapter.initialize();
+      adapter.cardDbLoaded = true;
+      adapter.setAiDecisionDiagnosticsEnabled(diagnostics);
+      const listener = vi.fn();
+      adapter.subscribeAiDecisionDiagnostics(listener);
+
+      await expect(adapter.getAiActionProposal("VeryHard", 0)).resolves.toEqual(proposal);
+
+      expect(mockWorkerClient.getAiScoredCandidates).toHaveBeenCalledWith("VeryHard", 0, expect.any(Number));
+      const selectedEndpoint = diagnostics
+        ? mockWorkerClient.getAiActionProposalFromScoresWithDiagnostics
+        : mockWorkerClient.getAiActionProposalFromScores;
+      const unusedEndpoint = diagnostics
+        ? mockWorkerClient.getAiActionProposalFromScores
+        : mockWorkerClient.getAiActionProposalFromScoresWithDiagnostics;
+      expect(selectedEndpoint).toHaveBeenCalledExactlyOnceWith(JSON.stringify(scores), "VeryHard", 0, expect.any(Number));
+      expect(unusedEndpoint).not.toHaveBeenCalled();
+      expect(mockWorkerClient.getAiActionProposal).not.toHaveBeenCalled();
+      expect(mockWorkerClient.getAiActionProposalWithDiagnostics).not.toHaveBeenCalled();
+      expect(mockWorkerClient.getAiTacticalActionProposal).not.toHaveBeenCalled();
+      expect(mockWorkerClient.getAiTacticalActionProposalWithDiagnostics).not.toHaveBeenCalled();
+      expect(warn).not.toHaveBeenCalled();
+      expect(listener).not.toHaveBeenCalled();
+
+      await expect(adapter.submitAiActionProposal(proposal)).resolves.toMatchObject({ status: "applied" });
+      expect(mockWorkerClient.submitAiActionProposal).toHaveBeenCalledExactlyOnceWith(proposal);
+      if (diagnostics) {
+        expect(listener).toHaveBeenCalledExactlyOnceWith(receipt);
+      } else {
+        expect(listener).not.toHaveBeenCalled();
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.each([false, true])("skips VeryHard pool scoring for a non-Priority envelope with diagnostics %s", async (diagnostics) => {
+    mockWorkerClient.getState.mockResolvedValue({
+      state: gameStateFactory.manaPayment().build(),
+      derived: {},
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await adapter.initialize();
+      adapter.cardDbLoaded = true;
+      adapter.setAiDecisionDiagnosticsEnabled(diagnostics);
+
+      await expect(adapter.getAiActionProposal("VeryHard", 0)).resolves.toBeNull();
+
+      const selectedEndpoint = diagnostics
+        ? mockWorkerClient.getAiActionProposalWithDiagnostics
+        : mockWorkerClient.getAiActionProposal;
+      expect(selectedEndpoint).toHaveBeenCalledExactlyOnceWith("VeryHard", 0);
+      expect(mockWorkerClient.exportState).not.toHaveBeenCalled();
+      expect(mockWorkerClient.getAiScoredCandidates).not.toHaveBeenCalled();
+      expect(mockWorkerClient.getAiActionProposalFromScores).not.toHaveBeenCalled();
+      expect(mockWorkerClient.getAiActionProposalFromScoresWithDiagnostics).not.toHaveBeenCalled();
+      expect(mockWorkerClient.getAiTacticalActionProposal).not.toHaveBeenCalled();
+      expect(mockWorkerClient.getAiTacticalActionProposalWithDiagnostics).not.toHaveBeenCalled();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("retires a failed VeryHard pool before the next decision", async () => {
     const proposal: AiActionProposal = {
       token: "authoritative-token",
@@ -207,7 +307,10 @@ describe("WasmAdapter", () => {
       actor: 0,
       action: { type: "PassPriority" },
     };
-    mockWorkerClient.getState.mockResolvedValue({ waiting_for: { type: "Priority" } });
+    mockWorkerClient.getState.mockResolvedValue({
+      state: gameStateFactory.priority().build(),
+      derived: {},
+    });
     mockWorkerClient.getAiScoredCandidates.mockRejectedValue(new Error("pool worker crashed"));
     mockWorkerClient.getAiActionProposal.mockResolvedValue(proposal);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -237,7 +340,10 @@ describe("WasmAdapter", () => {
       actor: 0,
       action: { type: "PassPriority" },
     };
-    mockWorkerClient.getState.mockResolvedValue({ waiting_for: { type: "Priority" } });
+    mockWorkerClient.getState.mockResolvedValue({
+      state: gameStateFactory.priority().build(),
+      derived: {},
+    });
     mockWorkerClient.getAiScoredCandidates.mockReturnValue(new Promise(() => {}));
     mockWorkerClient.getAiActionProposal.mockResolvedValue(proposal);
     mockWorkerClient.getAiTacticalActionProposal.mockResolvedValue(proposal);
@@ -281,7 +387,10 @@ describe("WasmAdapter", () => {
       samplingTemperature: null,
       candidates: [],
     };
-    mockWorkerClient.getState.mockResolvedValue({ waiting_for: { type: "Priority" } });
+    mockWorkerClient.getState.mockResolvedValue({
+      state: gameStateFactory.priority().build(),
+      derived: {},
+    });
     mockWorkerClient.getAiScoredCandidates.mockReturnValue(new Promise(() => {}));
     mockWorkerClient.getAiTacticalActionProposalWithDiagnostics.mockResolvedValue({ proposal, receipt });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -344,7 +453,7 @@ describe("WasmAdapter", () => {
       expect(adapter.getEngineClient()).toBeNull();
     });
 
-    it("does not reactivate after disposal while initialization is pending", async () => {
+    it("rejects initialization canceled by disposal", async () => {
       let finishInitialization!: () => void;
       mockWorkerClient.initialize.mockImplementationOnce(
         () =>
@@ -356,7 +465,10 @@ describe("WasmAdapter", () => {
       const staleInitialization = adapter.initialize();
       adapter.dispose();
       finishInitialization();
-      await staleInitialization;
+      await expect(staleInitialization).rejects.toMatchObject({
+        code: AdapterErrorCode.NOT_INITIALIZED,
+        message: "Adapter initialization was canceled. Please try again.",
+      });
 
       await expect(adapter.ping()).rejects.toMatchObject({
         code: AdapterErrorCode.NOT_INITIALIZED,
@@ -390,6 +502,103 @@ describe("WasmAdapter", () => {
       expect(mockWorkerClient.loadCardDbFromUrl).toHaveBeenCalledOnce();
       expect(mockWorkerClient.evaluateDeckCompatibility).toHaveBeenCalledWith(request);
       expect(result).toEqual({ standard: { compatible: true, reasons: [] } });
+    });
+  });
+
+  // The pool that actually broke the live site was fetched fine and then
+  // rejected by serde, so these pin the distinction the old code lost: a
+  // schema-rejected database must not be reported as an uncalled loader.
+  describe("card database load failure reaches the caller", () => {
+    const SCHEMA_ERROR =
+      "Failed to parse card database: unknown variant `Tap`, expected one of `DealDamage`, `SetTapState`";
+
+    it("reports the underlying cause, not a missing-loader message", async () => {
+      mockWorkerClient.loadCardDbFromUrl.mockRejectedValueOnce(new Error(SCHEMA_ERROR));
+      const err = await adapter
+        .checkDeckCompatibility({ main_deck: ["Forest"] })
+        .then(() => null, (e: Error) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(err!.message).toContain("unknown variant `Tap`");
+      expect(err!.message).not.toContain("Call loadCardDb");
+    });
+
+    it("does not consult the worker once the database is known to be absent", async () => {
+      mockWorkerClient.loadCardDbFromUrl.mockRejectedValueOnce(new Error(SCHEMA_ERROR));
+      await expect(
+        adapter.checkDeckCompatibility({ main_deck: ["Forest"] }),
+      ).rejects.toThrow();
+      expect(mockWorkerClient.evaluateDeckCompatibility).not.toHaveBeenCalled();
+    });
+
+    // The discriminator: without this, every assertion above would still pass
+    // if the strict gate simply rejected unconditionally.
+    it("still delegates normally when the database loads", async () => {
+      const request = { main_deck: ["Forest"] };
+      await expect(adapter.checkDeckCompatibility(request)).resolves.toEqual({
+        standard: { compatible: true, reasons: [] },
+      });
+      expect(mockWorkerClient.evaluateDeckCompatibility).toHaveBeenCalledWith(request);
+    });
+
+    // serde names every variant it rejected, which is thousands of characters.
+    it("trims a very long cause but keeps the diagnostic head", async () => {
+      const longCause = `${SCHEMA_ERROR}${", `Filler`".repeat(400)}`;
+      mockWorkerClient.loadCardDbFromUrl.mockRejectedValueOnce(new Error(longCause));
+      const err = await adapter
+        .checkDeckCompatibility({ main_deck: ["Forest"] })
+        .then(() => null, (e: Error) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(err!.message).toContain("unknown variant `Tap`");
+      expect(err!.message).toMatch(/…$/);
+      expect(err!.message.length).toBeLessThan(longCause.length);
+      // The full text stays reachable for diagnosis even though the message is trimmed.
+      expect((err as Error & { cause?: Error }).cause?.message).toBe(longCause);
+    });
+
+    it("applies to game creation too, not only the compatibility chip", async () => {
+      mockWorkerClient.loadCardDbFromUrl.mockRejectedValueOnce(new Error(SCHEMA_ERROR));
+      await adapter.initialize();
+      await expect(
+        adapter.initializeGame({ main_deck: ["Forest"] }),
+      ).rejects.toThrow("unknown variant `Tap`");
+      expect(mockWorkerClient.initializeGame).not.toHaveBeenCalled();
+    });
+  });
+
+  // Symmetric with the block above, and load-bearing for exactly one reason: a
+  // copy-paste slip inside `evaluateDeckFormatGate`'s real implementation —
+  // calling `evaluateDeckCompatibility` instead of `evaluateDeckFormatGate` —
+  // would silently restore the UI-hint path's "no opinion" answer on the
+  // security gate, and every fully-mocked `p2p-adapter` test would still pass.
+  // This is the only layer that can catch it.
+  describe("evaluateDeckFormatGate", () => {
+    it("ensures the DB is loaded then delegates to the gate worker method", async () => {
+      const request = { main_deck: ["Forest"], sideboard: [], selected_format: "Custom:0" };
+      const result = await adapter.evaluateDeckFormatGate(request);
+      expect(mockWorkerClient.loadCardDbFromUrl).toHaveBeenCalledOnce();
+      expect(mockWorkerClient.evaluateDeckFormatGate).toHaveBeenCalledWith(request);
+      // The UI-hint method must NOT be what a gate call reaches.
+      expect(mockWorkerClient.evaluateDeckCompatibility).not.toHaveBeenCalled();
+      expect(result).toEqual({ compatible: true, reasons: [] });
+    });
+  });
+
+  describe("custom format save/select", () => {
+    it("delegates a lobby-config save to the engine", async () => {
+      const config = { format: "Commander" };
+      const result = await adapter.customFormatFromLobbyConfig("My Format", config);
+      expect(mockWorkerClient.customFormatFromLobbyConfig).toHaveBeenCalledWith(
+        "My Format",
+        config,
+      );
+      expect(result).toEqual({ label: "My Format" });
+    });
+
+    it("delegates custom-rule resolution to the engine's own resolver", async () => {
+      const rules = { id: 0 };
+      const result = await adapter.formatConfigForCustomRules(rules);
+      expect(mockWorkerClient.formatConfigForCustomRules).toHaveBeenCalledWith(rules);
+      expect(result).toEqual({ format: "Custom:0" });
     });
   });
 

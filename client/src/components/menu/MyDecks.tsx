@@ -15,6 +15,7 @@ import {
 } from "../../constants/storage";
 import { PROFILE_REPLACED_EVENT } from "../../stores/cloudSyncStore";
 import { usePreferencesStore } from "../../stores/preferencesStore";
+import { useEffectiveOffline } from "../../stores/connectivityStore";
 import { useDeckFolders } from "../../hooks/useDeckFolders";
 import { DeckActionsMenu } from "./DeckActionsMenu";
 import { FolderActionsMenu } from "./FolderActionsMenu";
@@ -636,6 +637,7 @@ export function MyDecks({
   onActiveDeckCompatChange,
 }: MyDecksProps) {
   const { t } = useTranslation("menu");
+  const effectiveOffline = useEffectiveOffline();
   const [activeTab, setActiveTab] = useState<MyDecksTab>("decks");
   const [deckNames, setDeckNames] = useState<string[]>([]);
   const [showImport, setShowImport] = useState(false);
@@ -710,6 +712,7 @@ export function MyDecks({
   const [sortAsc, setSortAsc] = useState(mode !== "select");
   const [searchQuery, setSearchQuery] = useState("");
   const [folderPrompt, setFolderPrompt] = useState<FolderPromptRequest | null>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   // Folder/star organization (user decks only). The grouping authority +
   // mutators come from useDeckFolders; collapse state lives in preferences so
@@ -775,6 +778,9 @@ export function MyDecks({
   const confirmDeleteFolder = useCallback(() => {
     if (!folderPendingDelete) return;
     const { id } = folderPendingDelete;
+    // The folder header (including its kebab launcher) disappears on delete.
+    // Search is the nearest surviving deck control in both manage/select modes.
+    searchInputRef.current?.focus();
     deleteFolder(id);
     // Drop the now-dead id from the persisted collapse set so it can't leak.
     setCollapsedFolderIds(collapsedFolderIds.filter((existing) => existing !== id));
@@ -1371,6 +1377,7 @@ export function MyDecks({
   };
 
   const handleRefreshAll = async () => {
+    if (effectiveOffline) return;
     setIsRefreshing(true);
     try {
       await refreshAllFeeds();
@@ -1564,10 +1571,15 @@ export function MyDecks({
         )}
         {mode === "manage" && activeTab === "subscriptions" && (
           <div className="flex flex-wrap gap-2 self-start sm:self-auto">
+            {effectiveOffline && (
+              <p className="w-full text-xs text-amber-200 sm:w-auto sm:self-center">
+                {t("feedManager.offlineUnavailable")}
+              </p>
+            )}
             <button
               onClick={handleRefreshAll}
-              disabled={isRefreshing}
-              className={menuButtonClass({ tone: "neutral", size: "sm", disabled: isRefreshing })}
+              disabled={effectiveOffline || isRefreshing}
+              className={menuButtonClass({ tone: "neutral", size: "sm", disabled: effectiveOffline || isRefreshing })}
             >
               {isRefreshing ? t("myDecks.refreshing") : t("myDecks.refreshAll")}
             </button>
@@ -1590,6 +1602,7 @@ export function MyDecks({
             <path fillRule="evenodd" d="M9.965 11.026a5 5 0 1 1 1.06-1.06l2.755 2.754a.75.75 0 1 1-1.06 1.06l-2.755-2.754ZM10.5 7a3.5 3.5 0 1 1-7 0 3.5 3.5 0 0 1 7 0Z" clipRule="evenodd" />
           </svg>
           <input
+            ref={searchInputRef}
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}

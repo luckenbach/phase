@@ -26,7 +26,7 @@
     "autoPass": "Auto-Pass",
     "skipLowUsePriorityWindows": "Salta le finestre di priorità poco usate (sperimentale)",
     "skipLowUsePriorityWindowsDescription": "Passa automaticamente le tue finestre di priorità con la pila vuota durante il mantenimento, la sottofase di acquisizione e la sottofase finale. Le fermate di fase e il Controllo totale continuano a mettere in pausa.",
-    "logDefault": "Registro predefinito",
+    "logDockSide": "Posizione del registro di gioco",
     "spellPayment": "Pagamento magie",
     "manualManaPayment": "Pagamento manuale del mana per le magie",
     "spellPaymentOptions": { "auto": "Automatico", "autoExceptSacrificialMana": "Chiedi prima di sacrificare", "manual": "Manuale" },
@@ -56,9 +56,9 @@
       "medium": "Medio",
       "large": "Grande"
     },
-    "logDefaultOptions": {
-      "open": "Aperto",
-      "closed": "Chiuso"
+    "logDockSideOptions": {
+      "left": "Sinistra",
+      "right": "Destra"
     }
   },
   "visual": {
@@ -172,6 +172,7 @@
     "signedInAs": "Hai effettuato l'accesso come {{name}}",
     "syncNow": "Sincronizza ora",
     "statusSyncing": "Sincronizzazione…",
+    "statusPaused": "La sincronizzazione cloud è in pausa mentre sei offline.",
     "statusError": "Sincronizzazione non riuscita",
     "lastSynced": "Ultima sincronizzazione {{time}}",
     "never": "mai",
@@ -211,6 +212,7 @@
   "visualPacks": {
     "title": "Catalogo visivo offline",
     "description": "Scegli le immagini da conservare su questo dispositivo. Il catalogo delle carte viene memorizzato nella cache da Scryfall, poi ogni immagine viene scaricata direttamente da Scryfall.",
+    "offlineUnavailable": "I download di rete non sono disponibili offline. Riconnettiti per aggiornare il catalogo o installare, sincronizzare, riparare o riprendere le immagini.",
     "availability": {
       "loading": "Verifica del supporto del catalogo visivo offline…",
       "browser": "Questo browser non offre le funzioni di archiviazione locale necessarie per i download di immagini offline.",
@@ -222,12 +224,13 @@
     "selector": {
       "title": "Selezione del catalogo",
       "core": "Retro della carta",
-      "printing": "Stampe inglesi",
-      "locale": "Stampe di set localizzate",
+      "printing": "Stampe del set",
       "complete": "Tutte le immagini attuali delle carte inglesi",
       "curated": "Un'immagine per carta",
+      "deck_library": "Raccolta mazzi",
       "curatedNote": "Un'immagine per carta, scelta dalle tue Preferenze illustrazione carte nella scheda Grafica. Modificale lì e questa selezione le segue.",
       "curatedDefaultNote": "Un'immagine per carta. Non hai regole di illustrazione, quindi viene scaricata l'illustrazione predefinita di ogni carta: aggiungi regole in Preferenze illustrazione carte, scheda Grafica, per scegliere altre stampe.",
+      "deckLibraryNote": "Un'immagine per ogni carta usata nella raccolta condivisa dei mazzi, inclusi i preconfezionati Commander per l'IA. Segue le Preferenze illustrazione carte. Dopo l'installazione, l'app scarica le aggiunte e rimuove le immagini non più necessarie mentre è in esecuzione; rimuovere questo pacchetto interrompe la sincronizzazione.",
       "driftNone": "Le immagini installate corrispondono già a queste impostazioni.",
       "driftSummary": "Le immagini installate non sono aggiornate: {{add}} da aggiungere, {{remove}} da rimuovere, {{refresh}} da aggiornare.",
       "setCode": "Codice del set",
@@ -288,6 +291,7 @@
       "root": "Radice del catalogo",
       "packs": "Pacchetti: {{current}} di {{total}}",
       "objects": "Immagini: {{current}} di {{total}}",
+      "objectsUnknown": "Immagini scaricate: {{current}}",
       "scanNote": "Il totale cresce durante la scansione dell’istantanea Scryfall. Le immagini già scaricate restano locali e vengono ignorate alla ripresa.",
       "estimateNote": "Il totale è stato fissato all’avvio di questo download. Le immagini già scaricate restano locali e vengono ignorate alla ripresa.",
       "finalizing": "Finalizzazione dell'installazione del catalogo"
@@ -329,7 +333,8 @@
       }
     },
     "removal": {
-      "committed": "Rimozione commessa alla revisione {{revision}}."
+      "committed": "Rimozione commessa alla revisione {{revision}}.",
+      "inProgress": "Rimozione degli elementi visivi offline…"
     },
     "cleanup": {
       "malformed_entry": "Non è stato possibile recuperare una voce della cache dal formato errato",
@@ -341,6 +346,7 @@
       "core": "Retro della carta",
       "complete": "Tutte le immagini attuali delle carte inglesi",
       "curated": "Un'immagine per carta",
+      "deckLibrary": "Raccolta mazzi",
       "printing": "Stampe {{set}}",
       "locale": "Stampe {{set}} ({{language}})"
     },
@@ -395,6 +401,21 @@
       "combat": "Tempistica del danno da combattimento: per quanto tempo bloccanti e attaccanti rimangono prima che il danno venga risolto.",
       "banners": "Visualizzazione dello striscione di inizio turno."
     }
+  },
+  "offlinePreparation": {
+    "title": "Preparazione offline",
+    "description": "Prepara questo desktop per il gioco locale offline prima di attivare Lavora offline.",
+    "prepare": "Prepara per offline",
+    "preparing": "Preparazione…",
+    "workOffline": "Lavora offline",
+    "checklistLabel": "Elenco di preparazione offline",
+    "visualWarning": "I pacchetti visivi installati richiedono attenzione. Apri Pacchetti visivi per ripararli; il gioco locale resta disponibile.",
+    "incompleteTitle": "La preparazione offline è incompleta",
+    "incompleteMessage": "Manca: {{capabilities}}. Attivare Lavora offline comunque?",
+    "confirmOffline": "Attiva Lavora offline",
+    "states": { "needs-preparation": "Prepara questo dispositivo prima di lavorare offline.", "preparing": "Preparazione delle capacità di gioco locale…", "ready": "Questo dispositivo è pronto per il gioco locale offline.", "failed": "Alcune capacità richieste non sono pronte.", "reconnect-required": "Riconnettiti prima di preparare il gioco offline.", "reload-or-relaunch-required": "Ricarica l’app o riavvia il desktop, quindi riprova." },
+    "capabilities": { "appShell": "App", "browserEngine": "Motore browser e database carte", "scryfallSearch": "Dati di ricerca", "preconCatalog": "Mazzi precostruiti", "bundledAiCatalog": "Catalogo mazzi IA", "deckLibrary": "Libreria mazzi installata", "nativeEngine": "Motore nativo" },
+    "capabilityStates": { "ready": "Pronto", "not-ready": "Non pronto", "reload-required": "Ricaricamento richiesto", "not-applicable": "Non applicabile", "not-installed": "Non installato" }
   },
   "artChain": {
     "emptyState": "In uso l'illustrazione predefinita di Scryfall. Aggiungi regole qui sotto per personalizzare.",

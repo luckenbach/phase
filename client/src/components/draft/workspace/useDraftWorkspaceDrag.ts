@@ -74,6 +74,8 @@ type CompatibilitySuppression =
     readonly kind: "pointer-sequence";
     readonly pointerId: number;
     readonly pointerType: "mouse" | "pen" | "touch";
+    readonly surface: "pack" | "workspace";
+    readonly sourceInstanceId: string;
     readonly phase: "awaiting-click" | "awaiting-double-click";
   };
 
@@ -89,6 +91,19 @@ interface PointerSession {
   captureOwned: boolean;
   released: boolean;
   expectedLostCapture: boolean;
+}
+
+function pointerSequenceSuppression(session: PointerSession): Exclude<CompatibilitySuppression, { readonly kind: "none" }> {
+  return {
+    kind: "pointer-sequence",
+    pointerId: session.pointerId,
+    pointerType: session.pointerType,
+    surface: session.source.kind === "workspace" ? "workspace" : "pack",
+    sourceInstanceId: session.source.kind === "workspace"
+      ? session.source.instanceIds[0]
+      : session.source.sourceInstanceId,
+    phase: "awaiting-click",
+  };
 }
 
 type Admission =
@@ -451,12 +466,9 @@ export function useDraftWorkspaceDrag(options: UseDraftWorkspaceDragOptions): Dr
       const dy = event.clientY - session.startY;
       if (dx * dx + dy * dy <= MOVE_THRESHOLD_SQUARED) return;
       session.phase = "dragging";
-      suppressionRef.current = {
-        kind: "pointer-sequence",
-        pointerId: session.pointerId,
-        pointerType: session.pointerType,
-        phase: "awaiting-click",
-      };
+      if (session.source.kind === "workspace" || session.pointerType === "touch") {
+        suppressionRef.current = pointerSequenceSuppression(session);
+      }
       setAnnouncement(t("workspace.drag.started", { card: session.source.cards.map((card) => card.name).join(", ") }));
     }
     setDragPreview({ source: session.source, clientX: event.clientX, clientY: event.clientY });
@@ -486,6 +498,9 @@ export function useDraftWorkspaceDrag(options: UseDraftWorkspaceDragOptions): Dr
     if (target === null) {
       retirePointer(true);
       return;
+    }
+    if (session.source.kind !== "workspace" && session.pointerType !== "touch") {
+      suppressionRef.current = pointerSequenceSuppression(session);
     }
     if (session.source.kind === "workspace") {
       flushSync(() => setDragPreview(null));
@@ -611,7 +626,25 @@ export function useDraftWorkspaceDrag(options: UseDraftWorkspaceDragOptions): Dr
   const consumeCompatibilityActivation = useCallback((activation: PackCompatibilityActivation) => {
     const suppression = suppressionRef.current;
     if (suppression.kind === "none") return false;
-    if (activation.detail === 0 || (activation.pointerType !== undefined && activation.pointerType !== suppression.pointerType)) {
+    if (
+      suppression.phase === "awaiting-double-click"
+      && activation.kind === "double-click"
+      && activation.detail !== 0
+      && activation.pointerId === null
+      && activation.surface === suppression.surface
+      && activation.sourceInstanceId === suppression.sourceInstanceId
+    ) {
+      suppressionRef.current = { kind: "none" };
+      return true;
+    }
+    if (
+      activation.detail === 0
+      || activation.pointerId === null
+      || activation.pointerId !== suppression.pointerId
+      || activation.pointerType !== suppression.pointerType
+      || activation.surface !== suppression.surface
+      || activation.sourceInstanceId !== suppression.sourceInstanceId
+    ) {
       suppressionRef.current = { kind: "none" };
       return false;
     }

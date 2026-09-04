@@ -20,8 +20,8 @@ use crate::types::ability::{
     CastManaSpentMetric, ContinuousModification, ControllerRef, CountScope, DamageChannel,
     FilterProp, ObjectProperty, ObjectScope, PlayerFilter, PlayerScope, PossessionAxis,
     QuantityExpr, QuantityRef, ResolvedAbility, RoundingMode, StaticCondition, SubtypeExclusion,
-    TargetFilter, TargetRef, ThisWayCause, TrackedAnaphorSource, TurnJournalKind, TypeFilter,
-    TypedFilter, ZoneRef,
+    TargetDamageSourceBinding, TargetFilter, TargetRef, ThisWayCause, TrackedAnaphorSource,
+    TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::{positive_counter_types, CounterType};
@@ -2456,8 +2456,8 @@ pub(crate) fn triggering_event_player(state: &GameState) -> Option<PlayerId> {
         .and_then(|e| crate::game::targeting::extract_player_from_event(&e, state))
 }
 
-/// CR 603.2 + CR 120.1: Resolve the *object that received the damage* referenced
-/// by the current triggering event, preferring the resolution-time
+/// Engine contract: resolve the object targeted or receiving the current trigger
+/// event, preferring the resolution-time
 /// `current_trigger_event` and falling back to the detection-time thread-local
 /// override (the same dual-path `triggering_event_player` uses).
 ///
@@ -5734,9 +5734,9 @@ fn object_for_scope<'a>(
             .or_else(detection_trigger_event)
             .and_then(|e| crate::game::targeting::extract_source_from_event(&e))
             .and_then(|id| state.objects.get(&id)),
-        // CR 603.2 + CR 603.4: the object that received the triggering damage
-        // ("that creature"). Same dual-time (detection + resolution) fallback as
-        // `EventSource`, calling the recipient extractor.
+        // Engine contract: the object targeted or receiving the triggering
+        // event. Same dual-time (detection + resolution) fallback as
+        // `EventSource`, calling the generic event-target extractor.
         ObjectScope::EventTarget => state
             .current_trigger_event
             .as_ref()
@@ -5813,9 +5813,9 @@ pub(crate) fn object_id_for_scope(
             .cloned()
             .or_else(detection_trigger_event)
             .and_then(|e| crate::game::targeting::extract_source_from_event(&e)),
-        // CR 603.2 + CR 603.4: the object that received the triggering damage
-        // ("that creature"). Same dual-time (detection + resolution) fallback as
-        // `EventSource`, calling the recipient extractor.
+        // Engine contract: the object targeted or receiving the triggering
+        // event. Same dual-time (detection + resolution) fallback as
+        // `EventSource`, calling the generic event-target extractor.
         ObjectScope::EventTarget => state
             .current_trigger_event
             .as_ref()
@@ -6412,14 +6412,31 @@ where
         // 3. Prefer live battlefield state over a stale same-step LKI snapshot;
         // otherwise use LKI, then fall back to live state for non-battlefield
         // target-card reads that never had a battlefield LKI.
-        ObjectScope::Target => targets
-            .iter()
-            .find_map(|t| match t {
-                TargetRef::Object(id) => Some(*id),
-                _ => None,
-            })
-            .and_then(|id| read_object_pt_by_id(state, id, &obj_extract, &lki_extract))
-            .unwrap_or(0),
+        //
+        // CR 120.1 + CR 608.2b: for a one-sided-fight clause ("its power"), the
+        // subject is named by a PARENT node and the binding stamped during chain
+        // descent is authoritative over the positional scan — the parent's list
+        // may have been pruned, in which case scanning `targets` here would
+        // silently read the RECIPIENT's power instead. An illegal subject yields
+        // no information at all: "If part of the effect requires information
+        // about an illegal target, it fails to determine any such information."
+        ObjectScope::Target => match ability.and_then(|a| a.context.target_damage_source) {
+            Some(TargetDamageSourceBinding::Illegal) => 0,
+            Some(TargetDamageSourceBinding::Bound) => match targets.first() {
+                Some(TargetRef::Object(id)) => {
+                    read_object_pt_by_id(state, *id, &obj_extract, &lki_extract).unwrap_or(0)
+                }
+                _ => 0,
+            },
+            None => targets
+                .iter()
+                .find_map(|t| match t {
+                    TargetRef::Object(id) => Some(*id),
+                    _ => None,
+                })
+                .and_then(|id| read_object_pt_by_id(state, id, &obj_extract, &lki_extract))
+                .unwrap_or(0),
+        },
         // CR 608.2h: the recipient ("that creature") may have left the
         // battlefield before resolution; prefer its buffed LKI over a base-only
         // live read via the shared guarded read.
@@ -6464,9 +6481,16 @@ where
         // chosen-target anaphor ("that creature's power" on a targeted grant —
         // Xenagos, God of Revels) is rebound to `ObjectScope::Target` at the
         // parser/lowering seam (`apply_where_x_continuous_modification`), so it
-        // never reaches this arm. `CostPaidObject` stays the specific
-        // cost/trigger/effect-context object (Greater Good, sacrifice-cost and
-        // trigger-event power refs depend on this).
+        // never reaches this arm. Likewise, "that creature's power" anaphoring
+        // a PARENT effect's own object target rather than a cost/trigger
+        // referent (Azog, Moria's Ruin's "its controller amasses Goblins X,
+        // where X is that creature's power" — "that creature" is the "destroy
+        // up to one other target creature" clause's own target, which may
+        // still be alive if the destroy was replaced or prevented) is rebound
+        // the same way, via `try_parse_amass`'s
+        // `rebind_cost_paid_object_pt_to_target` call. `CostPaidObject` stays
+        // the specific cost/trigger/effect-context object (Greater Good,
+        // sacrifice-cost and trigger-event power refs depend on this).
         ObjectScope::CostPaidObject => ability
             .and_then(|a| a.cost_paid_object.as_ref())
             .and_then(|snapshot| lki_extract(&snapshot.lki))

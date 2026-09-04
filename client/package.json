@@ -1,8 +1,9 @@
 {
   "name": "phase-rs-client",
   "private": true,
-  "version": "0.68.0",
+  "version": "0.72.0",
   "type": "module",
+  "packageManager": "pnpm@9.15.9",
   "scripts": {
     "dev": "vite",
     "build": "pnpm run protocol:check && tsc -b && vite build",

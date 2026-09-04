@@ -1,16 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { MyDecks } from "../MyDecks";
 import {
   RANDOM_DECK_SELECTION,
+  createFolder,
+  saveFeedSubscriptions,
   saveDeckOrigins,
+  setDeckFolder,
   STORAGE_KEY_PREFIX,
 } from "../../../constants/storage";
 import type { ParsedDeck } from "../../../services/deckParser";
 import { evaluateDeckCompatibilityBatch } from "../../../services/deckCompatibility";
+import { setCachedFeed } from "../../../services/feedPersistence";
 import { loadPreconDeckMap } from "../../../hooks/useDecks";
+import { useConnectivityStore } from "../../../stores/connectivityStore";
+import * as feedService from "../../../services/feedService";
 
 const { useCardImage, useSetSymbol, advanceSetSource } = vi.hoisted(() => ({
   useCardImage: vi.fn(),
@@ -50,6 +56,7 @@ describe("MyDecks", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    useConnectivityStore.setState({ forcedOffline: false, browserOnline: true });
     useCardImage.mockReturnValue({ src: null, isLoading: false });
     useSetSymbol.mockImplementation((setCode: string | undefined) => ({
       src: setCode ? `visual-pack://set/${setCode.toLowerCase()}` : null,
@@ -76,7 +83,70 @@ describe("MyDecks", () => {
 
   afterEach(() => {
     cleanup();
+    useConnectivityStore.setState({ forcedOffline: false, browserOnline: true });
     vi.unstubAllGlobals();
+  });
+
+  it("keeps cached subscriptions usable while offline and re-enables refresh on reconnect", async () => {
+    const feedDeck = {
+      name: "Offline Feed Deck",
+      colors: ["U"],
+      main: [{ name: "Island", count: 60 }],
+      sideboard: [],
+    };
+    saveDeck("Offline Feed Deck", { main: feedDeck.main, sideboard: [] });
+    saveDeckOrigins({ "Offline Feed Deck": "offline-feed" });
+    await setCachedFeed("offline-feed", {
+      id: "offline-feed",
+      name: "Offline Feed",
+      version: 1,
+      updated: "2026-01-01T00:00:00Z",
+      decks: [feedDeck],
+    });
+    saveFeedSubscriptions([{
+      sourceId: "offline-feed",
+      url: "https://example.com/offline-feed.json",
+      type: "remote",
+      subscribedAt: 1,
+      lastRefreshedAt: 1,
+      lastVersion: 1,
+    }]);
+    const refreshAllFeeds = vi.spyOn(feedService, "refreshAllFeeds");
+    const onEditDeck = vi.fn();
+    vi.mocked(evaluateDeckCompatibilityBatch).mockResolvedValue({});
+    const user = userEvent.setup();
+    render(
+      <MyDecks
+        mode="manage"
+        activeDeckName={null}
+        onCreateDeck={vi.fn()}
+        onEditDeck={onEditDeck}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Subscriptions" }));
+    expect(await screen.findByText("Offline Feed")).toBeInTheDocument();
+    expect(screen.getByText("Offline Feed Deck")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh All" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Manage Feeds" })).toBeEnabled();
+
+    act(() => useConnectivityStore.getState().setForcedOffline(true));
+
+    expect(screen.getByText(/Feed updates are unavailable while offline/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh All" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Manage Feeds" })).toBeEnabled();
+    await user.click(screen.getByText("Offline Feed Deck"));
+    expect(onEditDeck).toHaveBeenCalledWith("Offline Feed Deck");
+    vi.stubGlobal("prompt", vi.fn(() => "Offline Feed Copy"));
+    await user.click(screen.getByRole("button", { name: "Copy to My Decks" }));
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Offline Feed Copy")).not.toBeNull();
+    expect(feedService.getDeckFeedOrigin("Offline Feed Copy")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Refresh All" }));
+    expect(refreshAllFeeds).not.toHaveBeenCalled();
+
+    act(() => useConnectivityStore.getState().setForcedOffline(false));
+
+    expect(screen.getByRole("button", { name: "Refresh All" })).toBeEnabled();
   });
 
   it("checks commander selection context and can reveal incompatible decks on demand", async () => {
@@ -285,6 +355,41 @@ describe("MyDecks", () => {
     await user.click(screen.getByRole("option", { name: "Pioneer" }));
 
     expect(await screen.findByRole("button", { name: "Import Deck" })).toBeInTheDocument();
+  });
+
+  it("moves focus to deck search after deleting a folder in selection mode", async () => {
+    saveDeck("Filed Deck", {
+      main: [{ name: "Island", count: 60 }],
+      sideboard: [],
+    });
+    const folder = createFolder("Archive");
+    expect(folder).not.toBeNull();
+    setDeckFolder("Filed Deck", folder!.id);
+    vi.mocked(evaluateDeckCompatibilityBatch).mockResolvedValue({});
+
+    render(
+      <MyDecks
+        mode="select"
+        activeDeckName={null}
+        onSelectDeck={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("Archive")).toBeInTheDocument();
+    const folderTrigger = screen.getByRole("button", { name: "Folder options" });
+    fireEvent.click(folderTrigger);
+    const deleteItem = screen.getByRole("menuitem", { name: "Delete" });
+    deleteItem.focus();
+    fireEvent.click(deleteItem);
+
+    const confirmation = await screen.findByRole("alertdialog", {
+      name: "Delete",
+    });
+    fireEvent.click(within(confirmation).getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => expect(confirmation).not.toBeInTheDocument());
+    expect(screen.queryByText("Archive")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox")).toHaveFocus();
   });
 
   it("uses trusted feed format metadata before background coverage filters unknown saved decks", async () => {

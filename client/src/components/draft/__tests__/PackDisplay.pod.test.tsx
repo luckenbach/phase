@@ -16,7 +16,13 @@ vi.mock("../../menu/MenuShell", () => ({ MenuShell: ({ children }: { children: R
 vi.mock("../DraftIntro", () => ({ DraftIntro: ({ onContinue }: { onContinue(): void }) => <button type="button" onClick={onContinue}>Continue</button> }));
 vi.mock("../DraftPodLobby", () => ({ DraftPodLobby: () => null }));
 vi.mock("../DraftProgress", () => ({ DraftProgress: () => null }));
-vi.mock("../HostControls", () => ({ HostControls: () => null }));
+vi.mock("../HostControls", () => {
+  const emptyTopActions: readonly [] = [];
+  return {
+    HostControls: () => null,
+    useHostDraftTopActions: (_options: { enabled: boolean }) => emptyTopActions,
+  };
+});
 vi.mock("../HoverCardPreview", () => ({ HoverCardPreview: () => null }));
 vi.mock("../PickTimer", () => ({ PickTimer: () => null }));
 vi.mock("../PoolPanel", () => ({ PoolPanel: () => null }));
@@ -25,11 +31,13 @@ vi.mock("../SeatStatusRing", () => ({ SeatStatusRing: () => null }));
 const view: DraftPlayerView = {
   status: "Drafting",
   kind: "Premier",
+  launch_capability: "None",
   current_pack_number: 0,
   pick_number: 0,
   pass_direction: "Left",
   // Premier (CR 905.1a): one card per pick step.
   required_pick_count: 1,
+  pick_selection_mode: "Direct",
   current_pack: [
     {
       instance_id: "card-1",
@@ -117,8 +125,15 @@ describe("PackDisplay pod controller", () => {
 
     rerender(<PackDisplay controller={podController({ selectedCard: "card-1", confirmPick })} presentation={presentation} onCardHover={vi.fn()} />);
     const selected = screen.getByRole("button", { name: "Lightning Bolt" }).closest('[data-instance-id="card-1"]')!;
-    expect(selected).toHaveClass("ring-2", "ring-[rgb(3,139,6)]", "shadow-[0_0_4px_2px_rgb(3,139,6)]");
-    expect(selected).not.toHaveClass("scale-105");
+    expect(selected).toHaveClass(
+      "transition-transform",
+      "duration-150",
+      "ring-2",
+      "ring-arcane",
+      "shadow-[0_0_7px_3px_#38bdf8]",
+    );
+    expect(selected).not.toHaveClass("motion-safe:animate-[draft-pack-selected-glow_4.8s_ease-in-out_infinite]");
+    expect(selected).not.toHaveClass("!duration-0", "transition-all", "scale-105");
     expect(screen.queryByRole("button", { name: "Confirm Pick" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Auto-pick" })).not.toBeInTheDocument();
     expect(confirmPick).not.toHaveBeenCalled();
@@ -139,7 +154,7 @@ describe("PackDisplay pod controller", () => {
 
   it("submits_the_engine_defined_two_card_commander_pick_step", () => {
     const second = { ...card, instance_id: "card-2", name: "Island" };
-    const commanderView = { ...view, kind: "CommanderDraft" as const, required_pick_count: 2, current_pack: [card, second] };
+    const commanderView = { ...view, kind: "CommanderDraft" as const, required_pick_count: 2, pick_selection_mode: "Ordered" as const, current_pack: [card, second] };
     const pickCardStep = vi.fn(async () => ({ status: "acknowledged" as const }));
     render(
       <PackDisplay controller={workspaceController({ view: commanderView, selectedCard: "card-1", pickCardStep })} presentation={presentation} onCardHover={vi.fn()} />,
