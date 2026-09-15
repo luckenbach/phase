@@ -369,13 +369,17 @@ pub fn active_static_definitions<'a>(
 /// [`active_static_definitions`], which applies the condition gate on the
 /// caller's behalf.
 ///
-/// The one production caller is `combat::attacker_can_attack_target`'s
-/// CR 508.1c per-pairing door (and the two combat helpers that must agree with
-/// it about which definitions exist): it must evaluate the condition ITSELF,
-/// against the proposed attack pairing, because a defender-anchored gate reads
-/// `false` when evaluated without one — which would drop the definition before
-/// the pairing is known, and silently invert the bare-`DefendingPlayerControls`
-/// ("can't attack **if** …") polarity into "never restricted".
+/// The one production caller is
+/// `combat::carries_defender_sensitive_local_cant_attack`, the predicate that
+/// ROUTES a CR 508.1c "can't attack" definition off the target-agnostic door and
+/// onto the per-pairing one (`combat::attacker_can_attack_target`, which
+/// evaluates the gate against the proposed pairing via
+/// `static_abilities::check_static_ability`). Classification must see the
+/// definition whether or not its gate currently holds: a defender-anchored gate
+/// reads `false` when evaluated without a pairing, so the CR 604.1 condition
+/// filter would drop the definition before it could be classified, and the
+/// bare-`DefendingPlayerControls` ("can't attack **if** …") polarity would
+/// silently invert into "never restricted".
 ///
 /// Unlike its battlefield sibling this per-object form KEEPS the CR 113.6g
 /// branch: that omission is battlefield-moot (a battlefield object is never on
@@ -1432,12 +1436,12 @@ mod tests {
     /// R3b: the per-object sibling of
     /// `battlefield_functioning_statics_does_not_filter_condition`, and the pin
     /// that keeps the `can't attack IF defending player controls …` polarity
-    /// alive. `combat::attacker_can_attack_target` must SEE a definition whose
-    /// gate is currently false, because it re-evaluates that gate itself
-    /// against the proposed attack pairing. If this iterator ever acquired the
-    /// CR 604.1 condition filter, every bare `DefendingPlayerControls` static
-    /// would be dropped on every board and the restriction would silently never
-    /// apply.
+    /// alive. `combat::carries_defender_sensitive_local_cant_attack` must SEE a
+    /// definition whose gate is currently false, because its job is to route
+    /// that definition to the door that re-evaluates the gate against the
+    /// proposed attack pairing. If this iterator ever acquired the CR 604.1
+    /// condition filter, every bare `DefendingPlayerControls` static would be
+    /// dropped on every board and the restriction would silently never apply.
     #[test]
     fn functioning_static_definitions_does_not_filter_condition() {
         let mut state = new_state();

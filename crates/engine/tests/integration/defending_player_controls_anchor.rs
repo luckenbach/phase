@@ -32,13 +32,24 @@
 //! * `layers::evaluate_condition_with_attack_pairing` — the wrapper that
 //!   carries a proposed pairing, with the CR 109.4 / CR 725.5 designation
 //!   guard the other two wrappers carry.
-//! * `combat::attacker_can_attack_target` — the per-pairing CR 508.1c door,
-//!   iterating `functioning_abilities::functioning_static_definitions` so the
-//!   bare-`DefendingPlayerControls` polarity is not dropped before the pairing
-//!   is known.
+//! * `combat::attacker_can_attack_target` — the per-pairing CR 508.1c door. It
+//!   supplies `attack_target` to `static_abilities::check_static_ability`, whose
+//!   `static_ability_match_applies` both SKIPS a defender-anchored gate when no
+//!   pairing is in context and evaluates it against the pairing when one is, so
+//!   the bare-`DefendingPlayerControls` polarity is not dropped before the
+//!   pairing is known. There is deliberately no second, per-attacker clause in
+//!   that function: the whole-game sweep already reaches the attacker's own
+//!   `affected: SelfRef` definitions.
+//! * `combat::carries_defender_sensitive_local_cant_attack` — the routing
+//!   predicate for the target-agnostic door, iterating
+//!   `functioning_abilities::functioning_static_definitions` (the
+//!   condition-SKIPPING sibling) so a bare `DefendingPlayerControls` gate is not
+//!   filtered out before it can be classified.
 //! * `combat::creature_cant_attack_on_any_target` — the existential form, for
-//!   eligibility (CR 508.1a), the must-attack override (CR 508.1c beats
-//!   CR 508.1d) and the display badge.
+//!   narrowing the CR 508.1a candidate set by CR 508.1c, the must-attack
+//!   override (CR 508.1c beats CR 508.1d) and the display badge. The
+//!   restriction itself is CR 508.1c at BOTH doors; CR 508.1a is only the step
+//!   that chooses which creatures will attack.
 //!
 //! # FIXTURE CONTRACT
 //!
@@ -979,13 +990,20 @@ fn arctic_foxes_power_scoped_block_gate() {
 /// | no Island — the shark's gate refuses everyone | `Ok` |
 /// | an Island — the shark CAN attack | `Err` (the paired positive: the requirement machinery is live) |
 ///
-/// The `active_team` parameter threaded into
-/// `creature_must_attack_with_attackable_targets_gated` is OBSERVED, not merely
-/// compiled: passing the wrong team would make the active player's own goaded
-/// shark unrequired and flip the Island arm from `Err` to `Ok`. A second goaded,
-/// defender-gated creature under a NON-attacking-team controller sits on the
-/// board in both arms and must never appear in the active player's constraint
-/// map.
+/// A second goaded, defender-gated creature under the DEFENDING player sits on
+/// the board in both arms and must never appear in the active player's
+/// constraint map (CR 506.2).
+///
+/// That off-team row does NOT observe the `active_team` parameter threaded into
+/// `creature_must_attack_with_attackable_targets_gated`, and this doc does not
+/// claim it does. `attacker_constraints_for_active_player` already filters
+/// `!active_team.contains(&obj.controller)` before calling the function under
+/// test, so the row holds for any team argument; and every production caller of
+/// the `_gated` form passes `active_attacking_team(state)`, so the parameter is
+/// a pure hoist that no integration fixture can discriminate. It is observed
+/// directly instead, by the unit row
+/// `combat::tests::must_attack_gate_reads_the_supplied_active_team`, which calls
+/// the private `_gated` form twice with two different team arguments.
 ///
 /// The goad designation is stamped on `GameObject::goaded_by` directly — that
 /// field IS the CR 701.15b designation the engine reads
@@ -1037,9 +1055,9 @@ fn a_goaded_defender_gated_creature_is_not_forced_to_attack() {
         );
         assert!(
             !constraints.contains_key(&off_team),
-            "CR 805.10a: a creature controlled by a DEFENDING player is not on \
-             the attacking team and must carry no attacker constraint; got \
-             {constraints:?}"
+            "CR 506.2: in a two-player game the nonactive player is the \
+             defending player, so their creature is not on the attacking team \
+             and must carry no attacker constraint; got {constraints:?}"
         );
         assert_eq!(
             valid.contains(&shark),
@@ -1095,9 +1113,12 @@ fn attacker_badge_matches_enforcement_for_a_defender_gated_creature() {
         // The carrier is a SYNTHESIZED remote `CantAttack` scoped to one object —
         // the same shape `combat.rs`'s own
         // `cant_attack_sources_collects_two_sorted_remote_carriers` uses. An
-        // Aura would need real CR 303.4 enchant wiring (CR 704.5p unattaches a
-        // hand-attached one on the next state-based-action check), which is an
-        // unrelated failure surface for a row about carrier attribution.
+        // Aura would need real CR 303.4 enchant wiring (CR 704.5m puts an Aura
+        // attached to an illegal object — or to nothing — into its owner's
+        // GRAVEYARD on the next state-based-action check, destroying the carrier
+        // outright rather than merely unattaching it; CR 704.5p, which
+        // unattaches, explicitly excludes Auras), which is an unrelated failure
+        // surface for a row about carrier attribution.
         let restricted = scenario.add_creature(P0, "Restrained Bear", 2, 2).id();
         let restrainer = scenario
             .add_enchantment_from_oracle(P0, "Restraining Bolt", "")
@@ -1132,7 +1153,7 @@ fn attacker_badge_matches_enforcement_for_a_defender_gated_creature() {
                 restricted_badge,
                 Some(CombatRequirement::CantAttack { sources }) if sources.contains(&restrainer)
             ),
-            "CR 508.1c + CR 611.2c: the remotely-restricted creature must carry \
+            "CR 508.1c + CR 611.3a: the remotely-restricted creature must carry \
              a CantAttack badge naming the RESTRAINING PERMANENT as its \
              carrier, so the shark's self-carried badge below is a distinct \
              attribution and not a shared constant; got {restricted_badge:?}"
@@ -1184,9 +1205,11 @@ fn attacker_badge_matches_enforcement_for_a_defender_gated_creature() {
 /// to lose.
 ///
 /// No other row catches that substitution: R1/R3/R4 exercise
-/// `declare_attackers`, which routes through
-/// `attacker_can_attack_target`'s own (already correct) iterator, and R10 and
-/// R12 both use `unless`-polarity gates, which survive the condition filter.
+/// `declare_attackers`, which routes through `attacker_can_attack_target` and so
+/// through `check_static_ability`'s whole-game `game_functioning_statics` sweep
+/// — a different (and already correct) iterator that this helper's substitution
+/// does not touch — and R10 and R12 both use `unless`-polarity gates, which
+/// survive the condition filter.
 #[test]
 fn veteran_brawlers_badge_and_eligibility_follow_the_defenders_untapped_land() {
     for land_tapped in [false, true] {

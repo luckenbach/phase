@@ -1490,6 +1490,27 @@ fn condition_uses_recipient_context(condition: &StaticCondition) -> bool {
         // The filter itself never mentions the recipient, so the shared
         // `filter_uses_recipient` arm above would report `false` and route this
         // through the source-only evaluator, losing the anchor.
+        //
+        // THE FULL CONSUMER LIST, because this arm reaches outside combat and
+        // the two kinds of consumer want opposite things from it:
+        //  * RETAIN-for-exact-per-recipient-evaluation (the flip makes these
+        //    strictly MORE correct): `gather_transient_continuous_effects`,
+        //    `collect_transient_combat_assignment_rule_effects` (both
+        //    `condition.clone()` retention), `transient_duration_holds`'s
+        //    `(affected, uses_recipient)` dispatch, and
+        //    `apply_continuous_effect_filtered`'s `non_recipient_condition_passes`
+        //    pre-pass, which defers to the downstream per-recipient check.
+        //  * ESCALATION over-approximations, safe in the `true` direction:
+        //    `any_active_static_condition_perturbed_by_entry` and
+        //    `refresh_static_gate_truth`.
+        //  * GATES — `source_condition_gate_passes`, which has two callers that
+        //    never re-check per recipient (`entry_replacement_for_grant_static`'s
+        //    as-enters grant derivation, and `transient_effect_is_live`, whose
+        //    answer leaks to `end_continuous_effect` and `derived_views`). For
+        //    THOSE a `true` here would be fail-OPEN, which is why that function
+        //    does not consult this predicate for the decision: it asks
+        //    `condition_answerable_from_source_alone` instead, and this leaf
+        //    answers exactly there. Do not "simplify" the two back together.
         StaticCondition::DefendingPlayerControls { .. } => true,
         StaticCondition::QuantityComparison { lhs, rhs, .. } => {
             quantity_expr_uses_recipient(lhs) || quantity_expr_uses_recipient(rhs)
@@ -1945,13 +1966,54 @@ fn entered_perturbs_static_quantity(
     })
 }
 
+/// CR 508.5: does `evaluate_condition` — which is handed a source but no
+/// recipient — still return this tree's EXACT truth value?
+///
+/// [`condition_uses_recipient_context`] is the wrong question for
+/// [`source_condition_gate_passes`], because it answers "would a recipient
+/// sharpen this?", and for `DefendingPlayerControls` the answer is yes (the
+/// ANCHOR is recipient-sensitive, see that function's own arm) while the
+/// source-only evaluation is nonetheless total: `defending_player_for_static_gate`
+/// falls back to the SOURCE's own live `combat.attackers` entry, which is the
+/// CR 508.5 first-clause reading and is exactly what this leaf evaluated to
+/// before it began reporting recipient sensitivity.
+///
+/// Without this distinction a `DefendingPlayerControls` gate falls to
+/// `source_condition_gate_passes`'s `_ => true`, and two of that function's
+/// callers never re-check per recipient — `entry_replacement_for_grant_static`'s
+/// as-enters grant derivation and `transient_effect_is_live` (whose answer
+/// leaks to `end_continuous_effect.rs` and `derived_views.rs`). For them
+/// `_ => true` is fail-OPEN. Answering the leaf exactly is fail-closed and is
+/// bit-identical to the pre-existing behaviour at every one of those sites.
+///
+/// Recurses the Boolean combinators so a mixed tree is classified by its worst
+/// leaf: `And { DPC, RecipientHasCounters }` is NOT source-answerable and still
+/// falls to the per-leaf over-approximation below.
+fn condition_answerable_from_source_alone(condition: &StaticCondition) -> bool {
+    match condition {
+        // CR 508.5: exact from the source's own attacker entry.
+        StaticCondition::DefendingPlayerControls { .. } => true,
+        StaticCondition::And { conditions } | StaticCondition::Or { conditions } => conditions
+            .iter()
+            .all(condition_answerable_from_source_alone),
+        StaticCondition::Not { condition } => condition_answerable_from_source_alone(condition),
+        other => !condition_uses_recipient_context(other),
+    }
+}
+
+/// CR 604.1: "might this static's gate be satisfied?", answered with a source
+/// but no recipient. An OVER-approximation by construction — a leaf whose truth
+/// genuinely varies per recipient answers `true` so the exact per-recipient
+/// check downstream stays authoritative — EXCEPT where
+/// [`condition_answerable_from_source_alone`] says the tree has an exact
+/// source-only answer, which is then returned verbatim.
 fn source_condition_gate_passes(
     state: &GameState,
     condition: &StaticCondition,
     controller: PlayerId,
     source_id: ObjectId,
 ) -> bool {
-    if !condition_uses_recipient_context(condition) {
+    if condition_answerable_from_source_alone(condition) {
         return evaluate_condition(state, condition, controller, source_id);
     }
 
@@ -1959,9 +2021,20 @@ fn source_condition_gate_passes(
         StaticCondition::And { conditions } => conditions
             .iter()
             .all(|condition| source_condition_gate_passes(state, condition, controller, source_id)),
-        StaticCondition::Not { condition } if !condition_uses_recipient_context(condition) => {
-            !evaluate_condition(state, condition, controller, source_id)
-        }
+        // CR 604.1: the disjunctive dual of the `And` arm. Without it an `Or`
+        // carrying ANY recipient-context leaf short-circuits to the `_ => true`
+        // wildcard, discarding the disjuncts that ARE decidable here — the
+        // asymmetry `And` never had. `any` over an over-approximation is itself
+        // an over-approximation, so the safety direction is preserved.
+        StaticCondition::Or { conditions } => conditions
+            .iter()
+            .any(|condition| source_condition_gate_passes(state, condition, controller, source_id)),
+        // No `Not` arm: negating an over-approximation yields an
+        // UNDER-approximation, so `Not` is only ever safe over an inner that
+        // evaluates EXACTLY — and every such inner is already answered by the
+        // early return above, which recurses `Not` in
+        // `condition_answerable_from_source_alone`. A `Not` reaching here wraps
+        // a genuinely recipient-varying inner and must fall through to `true`.
         _ => true,
     }
 }

@@ -82,6 +82,20 @@ impl CombatStaticGates {
             ),
         }
     }
+
+    /// CR 508.1c: can ANY arm of `creature_cant_attack_on_any_target` fire?
+    ///
+    /// Every one of them — the local `local_cant_attack_def_applies` scan, the
+    /// two remote `check_static_ability` scans, and the defender-anchored
+    /// existential, whose `local_cant_attack_shape_matches` conjunct is a mode
+    /// test — requires a FUNCTIONING `CantAttack` or `CantAttackOrBlock` static
+    /// to exist somewhere. When neither discriminant is present the whole
+    /// predicate is `false` for every creature, so callers may skip both it and
+    /// the defender-universe sweep it needs. Same index, same precision
+    /// contract, as the two remote arms already gate on.
+    fn any_cant_attack(&self) -> bool {
+        self.has_cant_attack || self.has_cant_attack_or_block
+    }
 }
 
 /// CR 702.19: Which trample variant applies to combat damage assignment.
@@ -3429,6 +3443,15 @@ fn static_target_ctx(obj_id: ObjectId) -> crate::game::static_abilities::StaticC
 /// existential to this mechanism. It is not an optimisation: without it,
 /// `AttackOnlyNeighbor`'s pre-existing "zero legal targets but still offered"
 /// behaviour would change as a rider on this fix.
+///
+/// KNOWN EDGE, deliberately not guarded: `.all()` is vacuously true on an empty
+/// `attackable`, so on a board with NO legal defender at all a creature carrying
+/// a defender-anchored gate is badged `CantAttack` while every other creature is
+/// badged nothing. Adding `!attackable.is_empty() &&` would make the badge
+/// uniform but would also make `has_potential_attackers` answer `true` for a
+/// creature that demonstrably cannot attack, which is the worse of the two. The
+/// asymmetry is cosmetic (a badge on a board where no declaration is possible)
+/// and is left in the safer direction.
 fn defender_gate_refuses_every_target(
     state: &GameState,
     obj_id: ObjectId,
@@ -3448,9 +3471,10 @@ fn defender_gate_refuses_every_target(
 ///
 /// This is what the eligibility and display sites need once a defender-anchored
 /// restriction is no longer a blanket bool: `creature_cant_attack_gated` answers
-/// the target-agnostic question and stays the right answer for the CR 508.1a
-/// sweep, but a creature whose every pairing is illegal must not be offered, not
-/// be badged eligible, and not be forced to attack (CR 508.1c beats CR 508.1d).
+/// the target-agnostic form of the CR 508.1c question and stays the right answer
+/// wherever no defender has been announced, but a creature whose every pairing is
+/// illegal must not be offered into the CR 508.1a candidate set, not be badged
+/// eligible, and not be forced to attack (CR 508.1c beats CR 508.1d).
 fn creature_cant_attack_on_any_target(
     state: &GameState,
     obj_id: ObjectId,
@@ -3468,10 +3492,14 @@ fn creature_cant_attack_on_any_target(
 /// definition's `condition`.
 ///
 /// The ONE definition of the shape, shared by the target-agnostic door
-/// (`local_cant_attack_def_applies`), the per-pairing CR 508.1c door
-/// (`attacker_can_attack_target`), and the routing predicate
-/// (`carries_defender_sensitive_local_cant_attack`) — so the three cannot drift
-/// on the `affected`-filter treatment.
+/// (`local_cant_attack_def_applies`) and the routing predicate
+/// (`carries_defender_sensitive_local_cant_attack`) — so the two cannot drift on
+/// the `affected`-filter treatment. The per-pairing CR 508.1c door does NOT use
+/// it: `attacker_can_attack_target` reaches the same definitions through
+/// `static_abilities::check_static_ability`, whose `static_ability_match_applies`
+/// predicate is the single authority there (it additionally honours
+/// `attack_defended` and `per_player_condition`, which this shape test does not
+/// model).
 fn local_cant_attack_shape_matches(
     state: &GameState,
     obj_id: ObjectId,
@@ -3509,8 +3537,10 @@ fn local_cant_attack_def_applies(
     // PLAYER has no answer until a defender is announced, so it is not a
     // blanket "can't attack" and must not be decided here. It moves to the
     // per-pairing door in `attacker_can_attack_target`, which is the only place
-    // that holds a proposed (attacker, defender) pairing. Removing it here is
-    // not permissiveness: the two edits are one change.
+    // that holds a proposed (attacker, defender) pairing and which reaches these
+    // same definitions through `check_static_ability` with an `attack_target` in
+    // context. Removing it here is not permissiveness: the two edits are one
+    // change.
     if sd
         .condition
         .as_ref()
@@ -3532,6 +3562,26 @@ fn local_cant_attack_def_applies(
 /// predicate would answer `false` unconditionally for the whole `if`
 /// population — Veteran Brawlers and Orgg would keep both the eligibility and
 /// the badge they are supposed to lose.
+///
+/// DECLARED SCOPE CUT — "LOCAL" is literal, and this is narrower than the class
+/// the per-pairing door enforces. Only the attacker's OWN static definitions are
+/// scanned. A REMOTE defender-anchored `CantAttack` (one whose carrier is some
+/// other permanent and whose `affected` filter selects this creature) is dropped
+/// from `creature_cant_attack_gated` by `local_cant_attack_def_applies`'s
+/// abstention and is NOT recovered by this existential, so such a creature would
+/// be offered in the prompt payload and carry no badge while
+/// `attacker_can_attack_target` correctly rejects every declaration it makes.
+///
+/// That incoherence affects ZERO printed cards: every carrier in the
+/// `DefendingPlayerControls` population is self-referential (`affected` is
+/// `SelfRef` or absent, the definition living on the restricted creature). The
+/// cut is taken rather than closed because recovering the remote case means a
+/// whole-battlefield static scan PER CREATURE inside an eligibility sweep that
+/// already runs per creature — O(N^2) on every board carrying any `CantAttack`
+/// static, to change the display of a card shape that does not exist. If such a
+/// card is ever printed, the fix is to widen this predicate (not the per-pairing
+/// door, which is already correct for it) and to hoist the widened scan onto
+/// `CombatStaticGates`.
 fn carries_defender_sensitive_local_cant_attack(state: &GameState, obj_id: ObjectId) -> bool {
     let Some(obj) = state.objects.get(&obj_id) else {
         return false;
@@ -3993,10 +4043,22 @@ fn creature_must_attack_with_attackable_targets_gated(
     }
     // CR 508.1c beats CR 508.1d: a "can't attack" restriction overrides an
     // "attacks if able" requirement — a creature under Pacifism is not forced to
-    // attack even while goaded. Enforcement must agree with display. The
-    // EXISTENTIAL form is required: a creature whose defender-anchored gate
-    // refuses every attackable defender cannot legally attack anyone, so it must
-    // not be forced to.
+    // attack even while goaded. Enforcement must agree with display.
+    //
+    // The EXISTENTIAL form is used here for AGREEMENT, not because this is the
+    // goad door: a creature whose defender-anchored gate refuses every
+    // attackable defender cannot legally attack anyone, so it must not be forced
+    // to — but the only production caller of this function
+    // (`attacker_constraints_for_active_player`) is already inside a
+    // `valid.contains(&obj_id)` branch, and `valid` was filtered by this very
+    // predicate, so the defender-anchored half of this check cannot fire there.
+    // Goad protection for a defender-gated creature is delivered by the
+    // `legal_targets` narrowing and by the payload filter in
+    // `build_declare_attackers_waiting_for`, not by this line. It is kept
+    // DEFENSIVELY, so the two public entry points
+    // (`creature_must_attack{,_with_attackable_targets}`, which phase-ai calls
+    // with no such pre-filter) cannot answer "must attack" for a creature that
+    // has no legal declaration.
     if creature_cant_attack_on_any_target(state, obj_id, gates, active_team, attackable) {
         return false;
     }
@@ -4398,7 +4460,25 @@ fn attacker_can_attack_target(
         }
     }
 
-    // CR 508.1d: scoped remote CantAttack / CantAttackOrBlock (Eriette-class).
+    // CR 508.1c + CR 508.1d: the PER-PAIRING "can't attack" door. Supplying
+    // `attack_target` is what makes it one: `static_ability_match_applies`
+    // scopes an `attack_defended` static to the announced defender (CR 508.1d,
+    // Eriette-class), and `static_condition_matches_context` routes the whole
+    // gate through `evaluate_condition_with_attack_pairing` so a condition that
+    // names the DEFENDING PLAYER binds its CR 508.5 anchor to the proposed
+    // pairing (CR 508.1b announces the defender before CR 508.1c checks
+    // restrictions).
+    //
+    // This single call covers BOTH carriers. `check_static_ability` sweeps
+    // `game_functioning_statics` — every functioning static in the game, the
+    // attacker's own `affected: SelfRef` definitions included — so a source-local
+    // defender-anchored restriction that `local_cant_attack_def_applies` routed
+    // OUT of the target-agnostic door arrives here, and a separate per-attacker
+    // `functioning_static_definitions` clause would only be a narrower duplicate
+    // of it: it would ignore `def.per_player_condition` and pass no
+    // `recipient_id`, so a definition carrying either could be refused here and
+    // permitted by `check_static_ability`. The shared predicate is the single
+    // authority; do not re-add a parallel local clause.
     if (gates.has_cant_attack
         && crate::game::static_abilities::check_static_ability(
             state,
@@ -4421,38 +4501,6 @@ fn attacker_can_attack_target(
             ))
     {
         return false;
-    }
-
-    // CR 508.1c + CR 508.5: source-local "can't attack" restrictions whose gate
-    // names the DEFENDING PLAYER. They are routed out of the target-agnostic
-    // door (`local_cant_attack_def_applies`) because their answer depends on
-    // WHICH defender is announced, and CR 508.1b announces that before
-    // CR 508.1c checks restrictions — so the pairing under validation is the
-    // anchor.
-    //
-    // The iterator is `functioning_static_definitions`, NOT
-    // `active_static_definitions`: the latter's CR 604.1 condition filter
-    // evaluates the gate with no pairing, which reads `false` for a bare
-    // `DefendingPlayerControls` leaf and would drop the definition here before
-    // the pairing could be applied.
-    if let Some(attacker) = state.objects.get(&attacker_id) {
-        let controller = attacker.controller;
-        if super::functioning_abilities::functioning_static_definitions(state, attacker).any(|sd| {
-            local_cant_attack_shape_matches(state, attacker_id, sd)
-                && sd.condition.as_ref().is_some_and(|cond| {
-                    cond.mentions_defending_player()
-                        && crate::game::layers::evaluate_condition_with_attack_pairing(
-                            state,
-                            cond,
-                            controller,
-                            attacker_id,
-                            None,
-                            target,
-                        )
-                })
-        }) {
-            return false;
-        }
     }
 
     // CR 508.1c + CR 109.5 + CR 607.2d: directional AttackOnlyNeighbor.
@@ -6268,6 +6316,20 @@ pub fn has_summoning_sickness(obj: &GameObject) -> bool {
 
 /// CR 508.1a / CR 302.6: Untapped creature controlled since turn started, without Defender.
 /// CR 702.26b: Phased-out creatures can't attack.
+///
+/// TARGET-AGNOSTIC BY CONTRACT, with one stated consequence. This is the
+/// CR 508.1a candidate set; it is NOT narrowed by the CR 508.1c defender-anchored
+/// existential the way the prompt payload is (`build_declare_attackers_waiting_for`
+/// applies `creature_cant_attack_on_any_target` to `candidates` there, and
+/// `AttackDeclarationConstraints::build` needs the unnarrowed set for its
+/// `legal_targets` computation). Its one production consumer outside this module
+/// is `phase-ai`'s crew-timing heuristic
+/// (`phase-ai/src/policies/crew_timing.rs`), which therefore still treats a
+/// DPC-gated Vehicle with no qualifying defender as "attackable" when deciding
+/// whether crewing now is worthwhile. That is an AI valuation heuristic, not a
+/// legality answer — `attacker_can_attack_target` still refuses every such
+/// declaration — so the effect is a slightly over-eager crew, never an illegal
+/// attack. Tightening the heuristic belongs in `phase-ai`, not here.
 pub fn get_valid_attacker_ids(state: &GameState) -> Vec<ObjectId> {
     // CR 508.1a + CR 805.10a: the eligible-attacker set is the whole attacking
     // team (active player ∪ teammates), not only the literal active player. All
@@ -6508,13 +6570,12 @@ pub fn build_declare_attackers_waiting_for(
     state: &GameState,
 ) -> crate::types::game_state::WaitingFor {
     let constraints = AttackDeclarationConstraints::build(state);
+    // CR 604.1: six O(1) reads of the `StaticModePresence` index — not a scan.
+    // The recompute here rather than a thread-through from
+    // `AttackDeclarationConstraints::build` is deliberate: this is a
+    // once-per-prompt payload builder, and the index read is cheaper than
+    // widening that constructor's return type.
     let gates = CombatStaticGates::compute(state);
-    let active_team = active_attacking_team(state);
-    // CR 506.3: the whole live defender universe. The UNCOUNTED accessor —
-    // `AttackDeclarationConstraints::build` above already took the one counted
-    // enumeration sweep, and `attackable_player_sweeps` is a persisted
-    // perf-baseline key that a payload-shaping read must not inflate.
-    let attackable = get_valid_attack_targets(state);
     // CR 508.1a: the eligibility sweep stays target-agnostic inside
     // `team_eligible_attacker_ids`, so `AttackDeclarationConstraints::build`
     // keeps every candidate its `legal_targets` computation needs to narrow.
@@ -6523,14 +6584,29 @@ pub fn build_declare_attackers_waiting_for(
     // not offer it. The payload's `valid_attacker_ids` is therefore a subset of
     // `constraints.candidates`; the two are coherent, not contradictory — the
     // model says "no legal target", the payload says "not offerable".
-    let valid_attacker_ids: Vec<ObjectId> = constraints
-        .candidates
-        .iter()
-        .copied()
-        .filter(|&id| {
-            !creature_cant_attack_on_any_target(state, id, &gates, &active_team, &attackable)
-        })
-        .collect();
+    //
+    // Gated on `any_cant_attack` so a board with no attack prohibition at all
+    // pays neither the extra defender sweep nor the per-candidate scan, and the
+    // payload is the byte-identical `candidates.clone()` it was before.
+    let valid_attacker_ids: Vec<ObjectId> = if gates.any_cant_attack() {
+        let active_team = active_attacking_team(state);
+        // CR 506.3: the whole live defender universe. The UNCOUNTED accessor —
+        // `AttackDeclarationConstraints::build` above already took the one
+        // counted enumeration sweep, and `attackable_player_sweeps` is a
+        // persisted perf-baseline key that a payload-shaping read must not
+        // inflate.
+        let attackable = get_valid_attack_targets(state);
+        constraints
+            .candidates
+            .iter()
+            .copied()
+            .filter(|&id| {
+                !creature_cant_attack_on_any_target(state, id, &gates, &active_team, &attackable)
+            })
+            .collect()
+    } else {
+        constraints.candidates.clone()
+    };
     let attacker_constraints = attacker_constraints_for_active_player(state, &valid_attacker_ids);
     let valid_attack_targets_by_attacker = constraints.selectable_targets_by_attacker(state);
     let mut valid_attack_targets: Vec<AttackTarget> = valid_attack_targets_by_attacker
@@ -7370,10 +7446,19 @@ pub(crate) fn defending_player_cr508_5(
 ///     controller and a battle with its protector (CR 310.9d). (In a plain
 ///     two-player game CR 508.1b does not run and CR 506.2 already fixes the
 ///     seat; this precedence step is what makes multiplayer, planeswalker and
-///     battle attacks correct.) The historical `PlayerId(0)` bookkeeping
-///     fallback inside that helper is unreachable from the one production
-///     caller: `attacker_can_attack_target` validates `target` against live
-///     state (CR 508.1b) before the gate clause runs.
+///     battle attacks correct.) `defending_player_for_target`'s historical
+///     `PlayerId(0)` bookkeeping fallback is NOT unreachable here, and the
+///     hole is pre-existing rather than introduced by this helper:
+///     `attacker_can_attack_target` validates `target` against live state
+///     (CR 508.1b) first, which does close the `Player` and `Planeswalker`
+///     arms, but its battle check is
+///     `protector().is_some_and(|p| active_team.contains(&p))` — FALSE when the
+///     battle has no protector at all (CR 310.9d). A protectorless
+///     `AttackTarget::Battle` therefore passes validation and resolves to
+///     `PlayerId(0)`, exactly as the rest of the attack-declaration bookkeeping
+///     already does for it. Fixing that means giving `defending_player_for_target`
+///     an `Option` return across every bookkeeping caller; it is out of scope
+///     here and is NOT a regression of this change.
 ///  2. CR 508.5 applied to the RECIPIENT: the defending player is the one the
 ///     ATTACKING CREATURE THE GATE IS ABOUT is attacking. For a remote
 ///     `affected` grant (Tanglewalker) that creature is the recipient, not the
@@ -7711,8 +7796,21 @@ pub fn has_potential_attackers(state: &GameState) -> bool {
     // both, and neither varies per creature. The UNCOUNTED accessor: this is a
     // hot per-priority AI query, not the one hoisted enumeration sweep
     // `attackable_defender_targets`'s perf counter is the contract for.
-    let active_team = active_attacking_team(state);
-    let attackable = get_valid_attack_targets(state);
+    //
+    // Both are skipped entirely when `any_cant_attack` is false, which is every
+    // vanilla board: this query runs once per priority window, so an
+    // unconditional defender sweep here would be a real per-priority tax paid to
+    // answer a question that is `false` for every creature on such a board. The
+    // empty slices below are then never READ — `creature_cant_attack_on_any_target`
+    // is not called at all — rather than read as "no defenders".
+    let (active_team, attackable) = if gates.any_cant_attack() {
+        (
+            active_attacking_team(state),
+            get_valid_attack_targets(state),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     state.battlefield.iter().any(|id| {
         state
@@ -7740,13 +7838,14 @@ pub fn has_potential_attackers(state: &GameState) -> bool {
                     // propose a declaration the validator will reject: a
                     // creature whose defender-anchored gate refuses every
                     // attackable defender is not a potential attacker.
-                    && !creature_cant_attack_on_any_target(
-                        state,
-                        *id,
-                        &gates,
-                        &active_team,
-                        &attackable,
-                    )
+                    && (!gates.any_cant_attack()
+                        || !creature_cant_attack_on_any_target(
+                            state,
+                            *id,
+                            &gates,
+                            &active_team,
+                            &attackable,
+                        ))
                     && (obj.has_keyword(&Keyword::Haste)
                         || obj.entered_battlefield_turn.is_some_and(|etb| etb < turn))
             })
@@ -16270,6 +16369,69 @@ mod tests {
         assert_ne!(
             restrictor, creature,
             "the source is a distinct object — this is the remote-attribution case"
+        );
+    }
+
+    /// CR 805.10a: `creature_must_attack_with_attackable_targets_gated` reads
+    /// the `active_team` it is HANDED, not one it recomputes.
+    ///
+    /// This row exists because no integration fixture can observe that
+    /// parameter. All three production callers pass
+    /// `active_attacking_team(state)`, so the hoist is behaviour-preserving by
+    /// construction; and `attacker_constraints_for_active_player` filters
+    /// `!active_team.contains(&obj.controller)` BEFORE calling this function, so
+    /// an "off-team creature carries no constraint" assertion at the payload
+    /// level holds for any team argument and observes nothing. The only honest
+    /// observation is to call the private gated form twice with two different
+    /// team arguments and watch the verdict flip.
+    ///
+    /// REVERT-FAIL: restoring the in-function `active_attacking_team(state)`
+    /// recompute makes the second call answer `true` alongside the first.
+    #[test]
+    fn must_attack_gate_reads_the_supplied_active_team() {
+        let mut state = setup();
+        state.phase = crate::types::phase::Phase::DeclareAttackers;
+        // CR 508.1d: an intrinsic "attacks each combat if able" (Juggernaut-class).
+        let juggernaut = create_creature(&mut state, PlayerId(0), "Juggernaut", 5, 3);
+        state
+            .objects
+            .get_mut(&juggernaut)
+            .unwrap()
+            .static_definitions
+            .push(StaticDefinition::new(StaticMode::MustAttack));
+
+        let gates = CombatStaticGates::compute(&state);
+        let attackable = attackable_defender_targets(&state);
+        // Reach-guard: the requirement is live and has somewhere to point, so
+        // the `false` below cannot be an artefact of an empty defender universe.
+        assert!(
+            !attackable.is_empty(),
+            "reach-guard: P1 must be an attackable defender; got {attackable:?}"
+        );
+        assert!(
+            creature_must_attack_with_attackable_targets_gated(
+                &state,
+                juggernaut,
+                &attackable,
+                &gates,
+                &active_attacking_team(&state),
+            ),
+            "the requirement applies when the creature's controller IS on the \
+             supplied attacking team"
+        );
+        // CR 506.2: the same creature, the same state — only the team argument
+        // differs. P1 is the defending player here, so a team of {P1} must not
+        // impose the active player's requirement on P0's creature.
+        assert!(
+            !creature_must_attack_with_attackable_targets_gated(
+                &state,
+                juggernaut,
+                &attackable,
+                &gates,
+                &[PlayerId(1)],
+            ),
+            "the requirement must NOT apply when the supplied attacking team \
+             excludes the creature's controller — proving the parameter is read"
         );
     }
 

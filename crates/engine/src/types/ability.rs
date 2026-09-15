@@ -11118,9 +11118,13 @@ impl StaticCondition {
     ///
     /// This is a ROUTING predicate, not an evaluation: `game::combat` uses it to
     /// decide whether a source-local `CantAttack` restriction belongs on the
-    /// target-agnostic CR 508.1a door (`creature_cant_attack_gated`) or on the
-    /// per-pairing CR 508.1c door (`attacker_can_attack_target`), which is the
-    /// only door that has a proposed (attacker, defender) pairing in hand.
+    /// target-agnostic door (`creature_cant_attack_gated`) or on the per-pairing
+    /// door (`attacker_can_attack_target`), which is the only door that has a
+    /// proposed (attacker, defender) pairing in hand. BOTH doors enforce
+    /// CR 508.1c — a "can't attack" restriction is a CR 508.1c restriction
+    /// wherever it is checked, not CR 508.1a (which is only the step that
+    /// CHOOSES which creatures will attack). They differ solely in whether the
+    /// CR 508.1b announcement has supplied a defender yet.
     /// Recursing through the Boolean combinators is load-bearing rather than
     /// tidy: the printed `can't attack unless defending player controls …`
     /// majority lowers to `Not { DefendingPlayerControls { .. } }`, so a
@@ -11154,8 +11158,19 @@ impl StaticCondition {
                 .any(|expr| expr.any_ref(&mut QuantityRef::reads_defending_player)),
             // CR 508.5 + CR 725.5: a scoped DESIGNATION leaf ("unless defending
             // player is the monarch") anchored on the same anaphor. Derived from
-            // the exhaustive `designation_player_anchor`, so a future
-            // `PlayerScope`-carrying leaf cannot escape this view.
+            // the exhaustive `designation_player_anchor`, so a future leaf that
+            // carries a [`PlayerScope`] cannot escape this view.
+            //
+            // That totality is over `PlayerScope` ONLY. A leaf whose player axis
+            // is a [`ControllerRef`] is invisible here, because
+            // `designation_player_anchor` returns `None` for it — today
+            // `WasStartingPlayer { controller: ControllerRef }`, and
+            // `ControllerRef` does have a `DefendingPlayer` variant, so the gap
+            // is representable rather than merely theoretical. The miss
+            // direction is safe: an unseen defender-anchored leaf is NOT routed
+            // to the per-pairing door and keeps the target-agnostic,
+            // source-anchored treatment it has today — the status quo, not a new
+            // fail-open.
             other => matches!(
                 other.designation_player_anchor(),
                 Some(PlayerScope::DefendingPlayer)

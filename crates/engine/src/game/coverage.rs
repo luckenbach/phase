@@ -9887,7 +9887,11 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         // the CR 509.1b block check.
         // Runtime proof, both printed polarities and both combat doors:
         // tests/integration/defending_player_controls_anchor.rs and
-        // tests/integration/issue_8183_static_gate_fail_open.rs §4.
+        // tests/integration/issue_8183_static_gate_fail_open.rs §4 — §4 ONLY.
+        // That file's §1 (Graxiplon) and §5 (Ayesha) print the same English
+        // "defending player controls …" but parse to
+        // `StaticCondition::QuantityComparison`, not to this variant, so they
+        // prove nothing about this arm; do not widen the citation to §4-§5.
         StaticCondition::DefendingPlayerControls { .. } => ("DefendingPlayerControls", Handled),
         // CR 508.1k / 509.1g / 509.1h: runtime-evaluated against the live combat
         // attacker/blocker sets (conditions.rs:81 / layers.rs:1118 / layers.rs:1123).

@@ -990,10 +990,20 @@ fn dandan_parses_a_condition_gated_cant_attack_static() {
 /// Octopus, Veteran Brawlers, Orgg and the rest, plus Tanglewalker's remote
 /// block form, which was inert — and TAG-CORRECTED — Scrapdiver Serpent and the
 /// other intrinsic `CantBeBlocked` cards, whose block door was already correct
-/// and whose coverage tag alone was wrong. The exact split is whatever the
-/// coverage report measures; do not hard-code a count here, and see
-/// `coverage.rs`'s `ControlsCommander` arm for why the two kinds must be
-/// reported separately rather than summed into one "cards fixed" number.
+/// and whose coverage tag alone was wrong.
+///
+/// THE NUMERIC SPLIT IS DELIBERATELY ABSENT, and its absence is a refusal, not
+/// an oversight. The implementation plan mandated the literal figures
+/// "38 engine-fixed / 6 tag-corrected / 44 total" be written here verbatim.
+/// They are not written here because they could not be MEASURED: generating
+/// `client/public/card-data.json` is not possible in the environment this
+/// change was made in, so `cargo coverage` never ran and those figures would
+/// have entered the tree as an unverified assertion wearing the authority of a
+/// count. CI's coverage job is the authority for the gained/lost delta and for
+/// the engine-fixed / tag-corrected split. Do not hard-code a count here once
+/// CI reports one either: see `coverage.rs`'s `ControlsCommander` arm for why
+/// the two kinds must be reported separately rather than summed into one
+/// "cards fixed" number.
 ///
 /// It does NOT re-open the six cards an earlier version of this comment named.
 /// Verified against Scryfall: none of them is a `DefendingPlayerControls` card.
