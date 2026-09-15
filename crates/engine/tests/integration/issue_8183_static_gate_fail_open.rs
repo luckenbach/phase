@@ -52,14 +52,16 @@
 //!     continuous effect from a static ability applies at any given moment to
 //!     whatever its text indicates; CR 508.1k — an attacking creature).
 //!
-//!  4. **Dandân — the defending-player anchor that cannot bind.**
+//!  4. **Dandân — the defending-player anchor, now BOUND.**
 //!     "Can't attack unless defending player controls an Island" is the same
-//!     printed grammar as section 5's on the OTHER side of combat, and it is a
-//!     RUNTIME ANCHOR gap rather than a parser gap. Its gate types correctly,
+//!     printed grammar as section 5's on the OTHER side of combat, and it was a
+//!     RUNTIME ANCHOR gap rather than a parser gap: the gate typed correctly,
 //!     but attack legality is checked before the candidate is recorded as an
-//!     attacker, so the anchor resolves to nothing and the gate reads UNMET on
-//!     every board. That test pins the gap deliberately; read its doc comment
-//!     before changing it.
+//!     attacker, so the anchor resolved to nothing and the gate read UNMET on
+//!     every board. `combat::defending_player_for_static_gate` now answers from
+//!     the PROPOSED CR 508.1b pairing at the CR 508.1c restriction check, so
+//!     section 4 is a CORRECTNESS pin rather than a gap pin: Dandân attacks iff
+//!     the defender controls an Island.
 //!
 //!  5. **Ayesha Tanaka, Armorer — the defending-player count that never typed.**
 //!     "Can't be blocked as long as defending player controls three or more
@@ -889,12 +891,12 @@ fn ancestral_katana_granted_first_strike_binds_to_equipped_creature() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Dandân — the defending-player anchor that cannot bind (V0 pre-flight)
+// 4. Dandân — the defending-player anchor, bound at the CR 508.1c check
 // ---------------------------------------------------------------------------
 
-/// REACH-GUARD for `dandan_attack_legality_ignores_the_defending_players_board`.
+/// REACH-GUARD for `dandan_attack_legality_follows_the_defending_players_board`.
 ///
-/// That test asserts Dandân is an ILLEGAL attacker in BOTH arms. That is
+/// That test asserts Dandân is an ILLEGAL attacker in the no-Island arm. That is
 /// satisfied for the wrong reason if Dandân's gate mis-parsed into something
 /// that can never be satisfied. Destructuring the exact two-node tree
 /// `Not(DefendingPlayerControls{Island})` pins that the gate typed correctly
@@ -946,20 +948,25 @@ fn dandan_parses_a_condition_gated_cant_attack_static() {
     );
 }
 
-/// **This test pins a KNOWN ENGINE GAP, not correct behaviour.**
+/// **This test pins CORRECT BEHAVIOUR. It replaces the gap pin that stood here.**
 ///
 /// Dandân prints "This creature can't attack unless defending player controls
-/// an Island." The gate types correctly (see the reach-guard above), but the
-/// `DefendingPlayerControls` anchor cannot bind during the attack-legality
-/// check: `combat::creature_cant_attack_gated` evaluates the static's condition
-/// through `functioning_abilities::active_static_definitions` →
+/// an Island." The gate types correctly (see the reach-guard above). It used to
+/// be inert because the `DefendingPlayerControls` anchor could not bind during
+/// the attack-legality check: the condition was evaluated through
+/// `functioning_abilities::active_static_definitions` →
 /// `layers::evaluate_condition` with no combat context, and both
-/// `validate_attack_declaration` and `get_valid_attacker_ids` run BEFORE the
-/// candidate is recorded in `state.combat.attackers`. The anchor resolves to
+/// `validate_attack_declaration` and the eligibility sweep run BEFORE the
+/// candidate is recorded in `state.combat.attackers`. The anchor resolved to
 /// `None`, which the filter door renders as "no matching permanent", so the
-/// `unless` gate reads UNMET on every board and the restriction always applies.
+/// `unless` gate read UNMET on every board and the restriction always applied.
 ///
-/// CR 506.2 + CR 508.1c: this is an ENGINE gap, not a rules gap. In this
+/// It binds now: `combat::attacker_can_attack_target` evaluates the gate
+/// against the PROPOSED (attacker, defender) pairing through
+/// `layers::evaluate_condition_with_attack_pairing`, whose anchor comes from
+/// `combat::defending_player_for_static_gate`.
+///
+/// CR 506.2 + CR 508.1c: this was an ENGINE gap, not a rules gap. In this
 /// two-player fixture the nonactive player is the defending player for the
 /// whole combat phase (CR 506.2), so the defender is already determined when
 /// CR 508.1c's restriction check runs. **CR 508.1b does not run here** — its
@@ -971,24 +978,42 @@ fn dandan_parses_a_condition_gated_cant_attack_static() {
 ///
 /// | (island arm, no-island arm) | meaning |
 /// |---|---|
-/// | **(Err, Err)** — what this test asserts | the anchor never binds; the gap is real |
-/// | (Ok, Err) | the anchor DOES bind — the gap is closed |
+/// | **(Ok, Err)** — what this test asserts | the anchor binds; the printed card |
+/// | (Err, Err) | the anchor never binds — the original gap, regressed |
 /// | (Ok, Ok) | the restriction never applies at all — a different defect |
 /// | (Err, Ok) | inverted — escalate |
 ///
-/// **If this test ever fails because the Island arm became `Ok`, do not relax
-/// it — the engine gap was fixed.** Flip the Island arm to `is_ok()` and re-open
-/// the `CantAttack` cards that are scoped out on this mechanism (Chained
-/// Throatseeker, Crown-Hunter Hireling, Goblin Goon, Mogg Toady, Monstrous
-/// Hound, Vantress Gargoyle, and the other 32 statics gated on
-/// `DefendingPlayerControls`).
+/// **What this mechanism re-opened, and what it did NOT.** The anchor fix
+/// covers the cards carrying
+/// `ResolverFeature:static_condition:DefendingPlayerControls`, in two kinds:
+/// ENGINE-FIXED — the attack door for Dandân, Hammerhead Shark, Godhunter
+/// Octopus, Veteran Brawlers, Orgg and the rest, plus Tanglewalker's remote
+/// block form, which was inert — and TAG-CORRECTED — Scrapdiver Serpent and the
+/// other intrinsic `CantBeBlocked` cards, whose block door was already correct
+/// and whose coverage tag alone was wrong. The exact split is whatever the
+/// coverage report measures; do not hard-code a count here, and see
+/// `coverage.rs`'s `ControlsCommander` arm for why the two kinds must be
+/// reported separately rather than summed into one "cards fixed" number.
+///
+/// It does NOT re-open the six cards an earlier version of this comment named.
+/// Verified against Scryfall: none of them is a `DefendingPlayerControls` card.
+/// Goblin Goon, Mogg Toady, Monstrous Hound and Vantress Gargoyle print
+/// defending-player QUANTITY comparisons ("unless you control more creatures
+/// than defending player", "unless defending player has seven or more cards in
+/// their graveyard"); Chained Throatseeker and Crown-Hunter Hireling print
+/// defending-player PREDICATES ("is poisoned", "is the monarch"). All six
+/// currently lower to `Not { Unrecognized { .. } }`, and even once they type,
+/// their anchor resolves through `combat::defending_player_cr508_5`, which has
+/// no proposed-pairing axis and is unchanged by this work. Pinned by
+/// `defending_player_controls_anchor.rs`'s
+/// `defending_player_quantity_gate_is_unchanged_by_the_pairing_route`.
 ///
 /// Paired positive control, in BOTH arms: an unrestricted Grizzly Bears is
 /// listed in `valid_attacker_ids` and is a legal attacker. That excludes
 /// summoning sickness, an illegal attack target, a Dandân sacrificed by its own
 /// second line, and a harness artifact as causes of the `Err`.
 #[test]
-fn dandan_attack_legality_ignores_the_defending_players_board() {
+fn dandan_attack_legality_follows_the_defending_players_board() {
     for defender_island in [true, false] {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
@@ -1036,23 +1061,44 @@ fn dandan_attack_legality_ignores_the_defending_players_board() {
              (defender_island = {defender_island}); got {valid_attacker_ids:?}"
         );
 
-        assert!(
-            runner
-                .declare_attackers(&[(dandan, AttackTarget::Player(P1))])
-                .is_err(),
-            "ENGINE GAP (CR 506.2 + CR 508.1c): Dandân's attack legality is \
-             insensitive to the defending player's board — it is refused even \
-             with defender_island = {defender_island}. If this arm is now Ok, \
-             the anchor binds and this test's premise is obsolete; read the \
-             doc comment before changing it"
-        );
-        assert!(
-            runner
-                .declare_attackers(&[(bear, AttackTarget::Player(P1))])
-                .is_ok(),
-            "positive control: the unrestricted bear must be a legal attacker \
-             (defender_island = {defender_island})"
-        );
+        // CR 506.2 + CR 508.1c + CR 508.5: the `unless` gate is MET exactly when
+        // the defending player controls an Island, so the declaration is legal
+        // in the Island arm and illegal in the no-Island arm.
+        //
+        // The positive control rides in the SAME call when the declaration is
+        // expected to succeed: an accepted declaration ends the step
+        // (CR 508.1), so a follow-up call could only fail. A REJECTED
+        // declaration leaves the step open (CR 508.1c: the whole declaration is
+        // illegal and is not applied), so there the control is declared after.
+        if defender_island {
+            let declared = runner.declare_attackers(&[
+                (dandan, AttackTarget::Player(P1)),
+                (bear, AttackTarget::Player(P1)),
+            ]);
+            assert!(
+                declared.is_ok(),
+                "CR 506.2 + CR 508.1c: with an Island on the DEFENDING player's \
+                 board Dandân is a legal attacker, alongside the unrestricted \
+                 bear. An `Err` here is the original anchor gap regressed; read \
+                 the doc comment before changing this. Got {declared:?}"
+            );
+        } else {
+            let declared = runner.declare_attackers(&[(dandan, AttackTarget::Player(P1))]);
+            assert!(
+                declared.is_err(),
+                "CR 506.2 + CR 508.1c: with no Island on the DEFENDING player's \
+                 board the printed `unless` restriction applies. An `Ok` here \
+                 means the restriction never applies at all — a different \
+                 defect. Got {declared:?}"
+            );
+            assert!(
+                runner
+                    .declare_attackers(&[(bear, AttackTarget::Player(P1))])
+                    .is_ok(),
+                "positive control: the unrestricted bear must be a legal attacker \
+                 (defender_island = {defender_island})"
+            );
+        }
     }
 }
 

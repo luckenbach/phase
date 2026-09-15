@@ -9112,6 +9112,22 @@ pub enum QuantityRef {
 }
 
 impl QuantityRef {
+    /// CR 508.5: does this reference count from the DEFENDING PLAYER's seat?
+    ///
+    /// Read-only projection of [`Self::player_scope_mut`]. It goes through a
+    /// clone rather than duplicating that accessor's ~90-arm match so the
+    /// exhaustive, wildcard-free listing that makes a future
+    /// [`PlayerScope`]-carrying variant a COMPILE ERROR lives in exactly one
+    /// place and the two views cannot drift. The clone is a parse-time AST node
+    /// on the rare `QuantityComparison`-gated static path, not a per-object
+    /// combat loop.
+    pub(crate) fn reads_defending_player(&self) -> bool {
+        matches!(
+            self.clone().player_scope_mut(),
+            Some(PlayerScope::DefendingPlayer)
+        )
+    }
+
     /// CR 109.4: mutable access to this reference's single player-relativity
     /// axis, when it has one.
     ///
@@ -11092,6 +11108,58 @@ impl StaticCondition {
         self.any_leaf(|leaf| {
             leaf.designation_player_anchor()
                 .is_some_and(|scope| !matches!(scope, PlayerScope::Controller))
+        })
+    }
+
+    /// CR 508.5: true when this condition tree — at ANY nesting depth under
+    /// `And` / `Or` / `Not` — reads the COMBAT DEFENDER anchor, i.e. asks a
+    /// question whose answer depends on which player the attacking creature is
+    /// attacking.
+    ///
+    /// This is a ROUTING predicate, not an evaluation: `game::combat` uses it to
+    /// decide whether a source-local `CantAttack` restriction belongs on the
+    /// target-agnostic CR 508.1a door (`creature_cant_attack_gated`) or on the
+    /// per-pairing CR 508.1c door (`attacker_can_attack_target`), which is the
+    /// only door that has a proposed (attacker, defender) pairing in hand.
+    /// Recursing through the Boolean combinators is load-bearing rather than
+    /// tidy: the printed `can't attack unless defending player controls …`
+    /// majority lowers to `Not { DefendingPlayerControls { .. } }`, so a
+    /// top-level-only check would route none of them.
+    ///
+    /// Deliberately BROADER than the fix that motivates it. The
+    /// defending-player QUANTITY shapes ("unless you control more creatures
+    /// than defending player") are matched too, because the honest answer to
+    /// "does this tree read the combat defender anchor?" for a
+    /// `PlayerScope::DefendingPlayer`-scoped count is yes — even though their
+    /// anchor still resolves through `combat::defending_player_cr508_5`, which
+    /// has no proposed-pairing axis and is unchanged. Routing them through the
+    /// per-pairing door is behaviour-preserving in both polarities (the leaf
+    /// reads the same value for every candidate defender), and narrowing the
+    /// predicate to the `DefendingPlayerControls` leaf would make it a lie about
+    /// the tree and silently mis-route the moment that door is fixed.
+    ///
+    /// Residual, stated rather than implied: a `ControllerRef::DefendingPlayer`
+    /// nested inside a quantity's population `TargetFilter` is NOT matched. No
+    /// parser route produces that shape inside a `StaticCondition` today — the
+    /// printed "more X than defending player" cards all lower to
+    /// `Not { Unrecognized { .. } }` — so covering it would add an exhaustive
+    /// filter walk that matches nothing.
+    pub(crate) fn mentions_defending_player(&self) -> bool {
+        self.any_leaf(|leaf| match leaf {
+            // CR 508.5: the anaphor itself.
+            StaticCondition::DefendingPlayerControls { .. } => true,
+            // CR 508.5a: a count taken from the defending player's seat.
+            StaticCondition::QuantityComparison { lhs, rhs, .. } => [lhs, rhs]
+                .into_iter()
+                .any(|expr| expr.any_ref(&mut QuantityRef::reads_defending_player)),
+            // CR 508.5 + CR 725.5: a scoped DESIGNATION leaf ("unless defending
+            // player is the monarch") anchored on the same anaphor. Derived from
+            // the exhaustive `designation_player_anchor`, so a future
+            // `PlayerScope`-carrying leaf cannot escape this view.
+            other => matches!(
+                other.designation_player_anchor(),
+                Some(PlayerScope::DefendingPlayer)
+            ),
         })
     }
 

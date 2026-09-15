@@ -7,10 +7,12 @@ use crate::game::functioning_abilities::{
     battlefield_active_statics, game_active_statics, game_functioning_statics, static_kind_present,
 };
 use crate::game::game_object::GameObject;
-use crate::game::layers::{evaluate_condition, evaluate_condition_with_recipient};
+use crate::game::layers::{
+    evaluate_condition, evaluate_condition_with_attack_pairing, evaluate_condition_with_recipient,
+};
 use crate::types::ability::{
-    ContinuousModification, ControllerRef, CostCategory, StaticDefinition, TargetFilter,
-    TypedFilter,
+    ContinuousModification, ControllerRef, CostCategory, StaticCondition, StaticDefinition,
+    TargetFilter, TypedFilter,
 };
 use crate::types::game_state::GameState;
 use crate::types::identifiers::ObjectId;
@@ -813,6 +815,29 @@ fn static_ability_match_applies(
     }
 
     if !static_condition_matches_context(state, obj.id, obj.controller, def, context) {
+        return false;
+    }
+
+    // CR 508.1b + CR 508.1c: an attack restriction whose GATE names the
+    // defending player has no answer until a defender is announced. With no
+    // `attack_target` in context this call is a target-agnostic eligibility
+    // query, not a pairing check, so the definition is SKIPPED here exactly as a
+    // scoped `attack_defended` static is skipped just below — and decided at the
+    // per-pairing door instead (`combat::attacker_can_attack_target`, which does
+    // supply an `attack_target`, and `combat::creature_cant_attack_on_any_target`,
+    // which asks the existential over every attackable defender).
+    //
+    // Without this skip the anaphor reads `false` for want of an anchor and the
+    // two printed polarities fail in OPPOSITE directions: `Not { .. }`
+    // ("can't attack unless…") applies the restriction on every board, and the
+    // bare form ("can't attack if…") applies it on none.
+    if matches!(mode, StaticMode::CantAttack | StaticMode::CantAttackOrBlock)
+        && context.attack_target.is_none()
+        && def
+            .condition
+            .as_ref()
+            .is_some_and(StaticCondition::mentions_defending_player)
+    {
         return false;
     }
 
@@ -1892,7 +1917,22 @@ fn static_condition_matches_context(
     context: &StaticCheckContext,
 ) -> bool {
     def.condition.as_ref().is_none_or(|condition| {
-        if let Some(recipient_id) = context.target_id {
+        // CR 508.1b + CR 508.5: an attack-legality caller that has announced a
+        // defender supplies it here (the ONLY producers of `attack_target` are
+        // `combat::attacker_can_attack_target`'s two `check_static_ability`
+        // calls). A defender-anchored gate is answerable at that point and
+        // nowhere else on the attack side, because CR 508.1c's restriction check
+        // runs before the creature is recorded in `state.combat.attackers`.
+        if let Some(attack_target) = context.attack_target {
+            evaluate_condition_with_attack_pairing(
+                state,
+                condition,
+                controller,
+                source_id,
+                context.target_id,
+                attack_target,
+            )
+        } else if let Some(recipient_id) = context.target_id {
             evaluate_condition_with_recipient(state, condition, controller, source_id, recipient_id)
         } else {
             evaluate_condition(state, condition, controller, source_id)

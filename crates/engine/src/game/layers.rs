@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::database::synthesis::KeywordTriggerInstaller;
 use crate::game::arithmetic::saturating_pt_add;
+use crate::game::combat::AttackTarget;
 use crate::game::conditions::{
     counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_has_city_blessing,
     eval_has_enduring_story, eval_is_initiative, eval_is_monarch, eval_no_monarch,
@@ -1341,7 +1342,7 @@ pub(crate) fn evaluate_condition(
     if static_condition_has_unresolvable_designation_anchor(condition) {
         return false;
     }
-    evaluate_condition_with_context(state, condition, controller, source_id, None)
+    evaluate_condition_with_context(state, condition, controller, source_id, None, None)
 }
 
 pub(crate) fn evaluate_condition_with_recipient(
@@ -1354,7 +1355,53 @@ pub(crate) fn evaluate_condition_with_recipient(
     if static_condition_has_unresolvable_designation_anchor(condition) {
         return false;
     }
-    evaluate_condition_with_context(state, condition, controller, source_id, Some(recipient_id))
+    evaluate_condition_with_context(
+        state,
+        condition,
+        controller,
+        source_id,
+        Some(recipient_id),
+        None,
+    )
+}
+
+/// CR 508.1b + CR 508.1c: evaluate a static's gate against a PROPOSED attack
+/// pairing — the announced (attacker, defender) pair the active player is
+/// asking the engine to accept, which is not yet in `state.combat.attackers`.
+///
+/// The CR 508.1c restriction check runs AFTER the CR 508.1b announcement and
+/// BEFORE the declaration is committed, so a defender-anchored gate is
+/// answerable there even though no attacker entry exists yet. Without the
+/// pairing, `StaticCondition::DefendingPlayerControls` has no anchor, reads
+/// `false`, and the two printed polarities fail in OPPOSITE directions —
+/// `Not { .. }` ("can't attack unless…") applies the restriction on every
+/// board, bare (`if …` / `as long as …`) never applies it at all.
+///
+/// Carries the same CR 109.4 / CR 725.5 designation guard as
+/// [`evaluate_condition`] and [`evaluate_condition_with_recipient`]: this is
+/// the one condition path that deliberately does NOT run through
+/// `functioning_abilities::active_static_definitions`'s condition filter, so
+/// nothing upstream would otherwise reject an unanswerable scoped-designation
+/// leaf.
+pub(crate) fn evaluate_condition_with_attack_pairing(
+    state: &GameState,
+    condition: &StaticCondition,
+    controller: PlayerId,
+    source_id: ObjectId,
+    recipient_id: Option<ObjectId>,
+    proposed_attack: AttackTarget,
+) -> bool {
+    if static_condition_has_unresolvable_designation_anchor(condition) {
+        return false;
+    }
+    evaluate_condition_with_context(
+        state,
+        condition,
+        controller,
+        source_id,
+        recipient_id,
+        Some(proposed_attack),
+    )
 }
 
 /// CR 109.4 + CR 725.5 (static analogue of the trigger-side CR 603.4 gate):
@@ -1432,8 +1479,18 @@ fn condition_uses_recipient_context(condition: &StaticCondition) -> bool {
         StaticCondition::IsPresent {
             filter: Some(filter),
         }
-        | StaticCondition::DefendingPlayerControls { filter }
         | StaticCondition::SourceMatchesFilter { filter } => filter_uses_recipient(filter),
+        // CR 508.5: the recipient sensitivity of a defending-player gate is in
+        // its ANCHOR, not in its filter. `defending_player_for_static_gate`
+        // resolves "which player is defending" from the RECIPIENT's live
+        // attacker entry before falling back to the source's, so a remote
+        // `affected` grant (Tanglewalker's "Each creature you control can't be
+        // blocked as long as defending player controls an artifact land")
+        // answers per attacking creature, not once per granting permanent.
+        // The filter itself never mentions the recipient, so the shared
+        // `filter_uses_recipient` arm above would report `false` and route this
+        // through the source-only evaluator, losing the anchor.
+        StaticCondition::DefendingPlayerControls { .. } => true,
         StaticCondition::QuantityComparison { lhs, rhs, .. } => {
             quantity_expr_uses_recipient(lhs) || quantity_expr_uses_recipient(rhs)
         }
@@ -1915,6 +1972,7 @@ fn evaluate_condition_with_context(
     controller: PlayerId,
     source_id: ObjectId,
     recipient_id: Option<ObjectId>,
+    proposed_attack: Option<AttackTarget>,
 ) -> bool {
     match condition {
         StaticCondition::DevotionGE { colors, threshold } => {
@@ -1967,14 +2025,33 @@ fn evaluate_condition_with_context(
         StaticCondition::HasMaxSpeed => has_max_speed(state, controller),
         StaticCondition::SpeedGE { threshold } => effective_speed(state, controller) >= *threshold,
         StaticCondition::And { conditions } => conditions.iter().all(|c| {
-            evaluate_condition_with_context(state, c, controller, source_id, recipient_id)
+            evaluate_condition_with_context(
+                state,
+                c,
+                controller,
+                source_id,
+                recipient_id,
+                proposed_attack,
+            )
         }),
         StaticCondition::Or { conditions } => conditions.iter().any(|c| {
-            evaluate_condition_with_context(state, c, controller, source_id, recipient_id)
+            evaluate_condition_with_context(
+                state,
+                c,
+                controller,
+                source_id,
+                recipient_id,
+                proposed_attack,
+            )
         }),
-        StaticCondition::Not { condition } => {
-            !evaluate_condition_with_context(state, condition, controller, source_id, recipient_id)
-        }
+        StaticCondition::Not { condition } => !evaluate_condition_with_context(
+            state,
+            condition,
+            controller,
+            source_id,
+            recipient_id,
+            proposed_attack,
+        ),
         // CR 731.1: True when the game has the requested day/night designation.
         StaticCondition::DayNightIs {
             state: DayNight::Day,
@@ -2244,26 +2321,29 @@ fn evaluate_condition_with_context(
             .objects
             .get(&source_id)
             .is_some_and(|obj| obj.paired_with.is_some()),
-        // CR 509.1b: True when the defending player controls a permanent matching the filter.
-        // Only meaningful during combat — finds the defending player from the source's
-        // attacker info in the CombatState.
-        StaticCondition::DefendingPlayerControls { filter } => state
-            .combat
-            .as_ref()
-            .and_then(|combat| {
-                combat
-                    .attackers
-                    .iter()
-                    .find(|a| a.object_id == source_id)
-                    .map(|a| a.defending_player)
-            })
+        // CR 508.5 + CR 509.1b: True when THE DEFENDING PLAYER controls a
+        // permanent matching the filter. The anchor — which player that is —
+        // is resolved by the single combat-side authority
+        // `combat::defending_player_for_static_gate`, which answers from the
+        // proposed CR 508.1b pairing at the CR 508.1c attack check, else from
+        // the recipient's or the source's live `combat.attackers` entry at the
+        // CR 509.1b block check. `None` means NO ANSWER (no combat, or no
+        // pairing to bind), never "no defender".
+        StaticCondition::DefendingPlayerControls { filter } => {
+            crate::game::combat::defending_player_for_static_gate(
+                state,
+                source_id,
+                recipient_id,
+                proposed_attack,
+            )
             .is_some_and(|defending| {
                 let ctx = FilterContext::from_source(state, source_id);
                 state.objects.values().any(|obj| {
                     obj.controller == defending
                         && matches_target_filter(state, obj.id, filter, &ctx)
                 })
-            }),
+            })
+        }
         // CR 506.5: True when the source creature is the only attacking creature.
         StaticCondition::SourceAttackingAlone => state.combat.as_ref().is_some_and(|combat| {
             combat.attackers.len() == 1

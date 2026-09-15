@@ -9878,8 +9878,17 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::And { .. } => ("And", Handled),
         StaticCondition::Or { .. } => ("Or", Handled),
         StaticCondition::Not { .. } => ("Not", Handled),
-        StaticCondition::DefendingPlayerControls { .. } => ("DefendingPlayerControls", Unhandled),
         StaticCondition::SourceAttackingAlone => ("SourceAttackingAlone", Unhandled),
+        // CR 508.1c + CR 508.5 + CR 509.1b: runtime-evaluated through
+        // `layers::evaluate_condition_with_context`, whose anchor is resolved by
+        // `combat::defending_player_for_static_gate` — the PROPOSED pairing at
+        // the CR 508.1b/508.1c attack check (CR 506.2 already fixes the seat in
+        // a two-player game), the recipient's or source's live attacker entry at
+        // the CR 509.1b block check.
+        // Runtime proof, both printed polarities and both combat doors:
+        // tests/integration/defending_player_controls_anchor.rs and
+        // tests/integration/issue_8183_static_gate_fail_open.rs §4.
+        StaticCondition::DefendingPlayerControls { .. } => ("DefendingPlayerControls", Handled),
         // CR 508.1k / 509.1g / 509.1h: runtime-evaluated against the live combat
         // attacker/blocker sets (conditions.rs:81 / layers.rs:1118 / layers.rs:1123).
         StaticCondition::SourceIsAttacking => ("SourceIsAttacking", Handled),
@@ -18373,6 +18382,69 @@ mod tests {
                 "StaticCondition::{expected_name} is resolved by layers::evaluate_condition",
             );
         }
+    }
+
+    /// R11. CR 508.1c + CR 508.5 + CR 509.1b: `DefendingPlayerControls` is
+    /// runtime-evaluated at BOTH combat doors — the proposed CR 508.1b pairing
+    /// at the attack check, the recipient's or source's live attacker entry at
+    /// the CR 509.1b block check — with the anchor resolved by
+    /// `combat::defending_player_for_static_gate`.
+    ///
+    /// The `Not` sibling is the fail-open guard this file's `ControlsCommander`
+    /// precedent demands: the printed majority is
+    /// `can't attack UNLESS defending player controls …`, which lowers to
+    /// `Not { DefendingPlayerControls }`, so the leaf must still reach the
+    /// classifier through the combinator. The `And` sibling pins that flipping
+    /// this one arm does not SWALLOW an unhandled leaf standing beside it.
+    #[test]
+    fn defending_player_controls_is_classified_handled() {
+        let leaf = StaticCondition::DefendingPlayerControls {
+            filter: TargetFilter::Any,
+        };
+        let (name, support) = static_condition_feature(&leaf);
+        assert_eq!(name, "DefendingPlayerControls");
+        assert_eq!(
+            support,
+            FeatureSupport::Handled,
+            "StaticCondition::DefendingPlayerControls is resolved at runtime by \
+             layers::evaluate_condition_with_context, anchored by \
+             combat::defending_player_for_static_gate",
+        );
+
+        let mut negated = HashMap::new();
+        extract_static_condition_features(
+            &StaticCondition::Not {
+                condition: Box::new(leaf.clone()),
+            },
+            &mut negated,
+        );
+        assert_eq!(
+            negated.get("static_condition:DefendingPlayerControls"),
+            Some(&FeatureSupport::Handled),
+            "the `unless` polarity's leaf must reach the classifier through `Not`"
+        );
+
+        let mut mixed = HashMap::new();
+        extract_static_condition_features(
+            &StaticCondition::And {
+                conditions: vec![
+                    leaf,
+                    StaticCondition::IsMonarch {
+                        player: PlayerScope::ScopedPlayer,
+                    },
+                ],
+            },
+            &mut mixed,
+        );
+        assert_eq!(
+            mixed.get("static_condition:DefendingPlayerControls"),
+            Some(&FeatureSupport::Handled)
+        );
+        assert_eq!(
+            mixed.get("static_condition:IsMonarch"),
+            Some(&FeatureSupport::Unhandled),
+            "flipping one arm must not swallow an unhandled sibling leaf"
+        );
     }
 
     /// `extract_static_condition_features` must recurse

@@ -342,12 +342,56 @@ pub fn active_static_definitions<'a>(
     state: &'a GameState,
     obj: &'a GameObject,
 ) -> Box<dyn Iterator<Item = &'a StaticDefinition> + 'a> {
+    let source_id = obj.id;
+    let controller = obj.controller;
+    // CR 604.1 / CR 613.1: a static's `condition` must hold for the effect to
+    // apply continuously — re-evaluated every time the layers pipeline (or any
+    // reader of statics) runs. Composed on top of the functioning gate rather
+    // than repeating it, so the CR 702.26b / CR 113.6 / CR 114.4 gate stack
+    // lives in exactly one place and the two iterators cannot drift.
+    Box::new(
+        functioning_static_definitions(state, obj).filter(move |def| {
+            def.condition
+                .as_ref()
+                .is_none_or(|cond| evaluate_condition(state, cond, controller, source_id))
+        }),
+    )
+}
+
+/// Iterate `StaticDefinition`s on `obj` that are currently FUNCTIONING — the
+/// CR 702.26b phasing gate, the CR 113.6g self-referential stack-zone branch,
+/// and the CR 113.6 / CR 114.4 zone-of-function gate — but WITHOUT the
+/// CR 604.1 / CR 613.1 `condition` filter.
+///
+/// Per-object analogue of [`battlefield_functioning_statics`], whose
+/// relationship to [`battlefield_active_statics`] is identical. For any read
+/// site that does not itself evaluate the condition, prefer
+/// [`active_static_definitions`], which applies the condition gate on the
+/// caller's behalf.
+///
+/// The one production caller is `combat::attacker_can_attack_target`'s
+/// CR 508.1c per-pairing door (and the two combat helpers that must agree with
+/// it about which definitions exist): it must evaluate the condition ITSELF,
+/// against the proposed attack pairing, because a defender-anchored gate reads
+/// `false` when evaluated without one — which would drop the definition before
+/// the pairing is known, and silently invert the bare-`DefendingPlayerControls`
+/// ("can't attack **if** …") polarity into "never restricted".
+///
+/// Unlike its battlefield sibling this per-object form KEEPS the CR 113.6g
+/// branch: that omission is battlefield-moot (a battlefield object is never on
+/// the stack) and is not a licence to drop it here.
+/// `_state` is unread today — every CR 113.6 / CR 702.26b functioning gate is
+/// answerable from the object alone — but it is part of the signature so this
+/// and [`active_static_definitions`] stay interchangeable at a call site, which
+/// is the whole point of the pair.
+pub(crate) fn functioning_static_definitions<'a>(
+    _state: &'a GameState,
+    obj: &'a GameObject,
+) -> Box<dyn Iterator<Item = &'a StaticDefinition> + 'a> {
     // CR 702.26b: phased-out permanents' abilities never function.
     if obj.is_phased_out() {
         return Box::new(std::iter::empty());
     }
-    let source_id = obj.id;
-    let controller = obj.controller;
     Box::new(obj.static_definitions.iter_all().filter(move |def| {
         // CR 113.6g: An object's ability that states IT can't be countered
         // or can't be copied functions on the stack — a self-referential
@@ -359,18 +403,10 @@ pub fn active_static_definitions<'a>(
         // so it keeps functioning from the battlefield like any other
         // static. Fixes #1033.
         if def.active_zones.is_empty() && is_self_referential_prohibition(def) {
-            if obj.zone != Zone::Stack {
-                return false;
-            }
-        } else if !static_functions_in_zone(obj, def) {
-            return false;
+            obj.zone == Zone::Stack
+        } else {
+            static_functions_in_zone(obj, def)
         }
-        // CR 604.1 / CR 613.1: a static's `condition` must hold for the
-        // effect to apply continuously — re-evaluated every time the layers
-        // pipeline (or any reader of statics) runs.
-        def.condition
-            .as_ref()
-            .is_none_or(|cond| evaluate_condition(state, cond, controller, source_id))
     }))
 }
 
@@ -1390,6 +1426,101 @@ mod tests {
         assert!(
             pairs[0].1.active_zones.is_empty(),
             "the surviving static must be the battlefield-default one"
+        );
+    }
+
+    /// R3b: the per-object sibling of
+    /// `battlefield_functioning_statics_does_not_filter_condition`, and the pin
+    /// that keeps the `can't attack IF defending player controls …` polarity
+    /// alive. `combat::attacker_can_attack_target` must SEE a definition whose
+    /// gate is currently false, because it re-evaluates that gate itself
+    /// against the proposed attack pairing. If this iterator ever acquired the
+    /// CR 604.1 condition filter, every bare `DefendingPlayerControls` static
+    /// would be dropped on every board and the restriction would silently never
+    /// apply.
+    #[test]
+    fn functioning_static_definitions_does_not_filter_condition() {
+        let mut state = new_state();
+        assert!(state.monarch.is_none());
+        let mut obj = make_obj(1, Zone::Battlefield);
+        obj.static_definitions = vec![StaticDefinition::new(StaticMode::Continuous).condition(
+            StaticCondition::IsMonarch {
+                player: PlayerScope::Controller,
+            },
+        )]
+        .into();
+        put_on_battlefield(&mut state, obj);
+        let obj = state
+            .objects
+            .get(&ObjectId(1))
+            .expect("object on battlefield");
+
+        assert_eq!(
+            functioning_static_definitions(&state, obj).count(),
+            1,
+            "functioning-only iterator must yield the false-condition static"
+        );
+        assert_eq!(
+            active_static_definitions(&state, obj).count(),
+            0,
+            "condition-gated iterator must drop the false-condition static"
+        );
+    }
+
+    /// CR 113.6 + CR 113.6b: the per-object functioning iterator applies the
+    /// shared zone-of-function gate per definition. The battlefield-default
+    /// sibling is the positive reach-guard that keeps the negative from being
+    /// vacuous.
+    #[test]
+    fn functioning_static_definitions_respects_active_zones() {
+        let mut state = new_state();
+        let mut obj = make_obj(1, Zone::Battlefield);
+        let graveyard_only =
+            StaticDefinition::new(StaticMode::Continuous).active_zones(vec![Zone::Graveyard]);
+        let battlefield_default = StaticDefinition::new(StaticMode::Continuous);
+        obj.static_definitions = vec![graveyard_only, battlefield_default].into();
+        put_on_battlefield(&mut state, obj);
+        let obj = state
+            .objects
+            .get(&ObjectId(1))
+            .expect("object on battlefield");
+
+        let defs: Vec<_> = functioning_static_definitions(&state, obj).collect();
+        assert_eq!(
+            defs.len(),
+            1,
+            "graveyard-only static must be excluded from a battlefield object"
+        );
+        assert!(
+            defs[0].active_zones.is_empty(),
+            "the surviving static must be the battlefield-default one"
+        );
+    }
+
+    /// CR 702.26b: a phased-out permanent's abilities never function, condition
+    /// filter or not.
+    #[test]
+    fn functioning_static_definitions_still_filters_phased_out() {
+        let mut state = new_state();
+        let mut obj = make_obj(1, Zone::Battlefield);
+        obj.static_definitions = vec![StaticDefinition::new(StaticMode::Continuous)].into();
+        obj.phase_status = crate::game::game_object::PhaseStatus::PhasedOut {
+            cause: crate::game::game_object::PhaseOutCause::Directly,
+        };
+        put_on_battlefield(&mut state, obj);
+        let obj = state
+            .objects
+            .get(&ObjectId(1))
+            .expect("object on battlefield");
+        assert_eq!(functioning_static_definitions(&state, obj).count(), 0);
+        // Positive reach-guard: the same definition IS yielded once the object
+        // is phased in, so the zero above is the phasing gate and not an empty
+        // definition list.
+        let mut phased_in = obj.clone();
+        phased_in.phase_status = crate::game::game_object::PhaseStatus::PhasedIn;
+        assert_eq!(
+            functioning_static_definitions(&state, &phased_in).count(),
+            1
         );
     }
 
