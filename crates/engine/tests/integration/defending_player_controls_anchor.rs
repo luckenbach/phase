@@ -76,27 +76,44 @@
 //! A probe run whose "artifact land" was `types=[Land], subtypes=[]` proved
 //! nothing in either arm.
 //!
+//! **F4 — a row that concludes "the restriction does NOT apply" must first
+//! prove the carrier HAS the restriction.** The zone / phasing rows (R13–R15)
+//! assert a NEGATIVE about a gate on the carrier, so each one reads the
+//! carrier's ungated definition list through
+//! `assert_carries_one_cant_attack_static` before drawing any conclusion, and
+//! each pairs its suppressed arm with an unsuppressed arm in the SAME fixture.
+//! Without both, a fixture that simply failed to build the carrier passes
+//! vacuously.
+//!
 //! Every card is built from VERBATIM Oracle text through
 //! `GameScenario`/`GameRunner`, so the production route runs end to end: Oracle
 //! text → static parser → `StaticDefinition.condition` → `evaluate_condition*`
-//! → combat legality. The one synthesized `StaticDefinition` in this file is
-//! the bare-polarity half of the quantity-door pin, and is labelled as such.
+//! → combat legality. Three `StaticDefinition`s in this file are SYNTHESIZED
+//! rather than parsed, each labelled as such at its construction site: the
+//! bare-polarity half of the quantity-door pin (R12), the unrelated remote
+//! carrier that makes R10's `sources` assertions distinguish carriers, and
+//! R15's remote defender-anchored carrier (a shape no printed card has).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use engine::game::combat::{AttackTarget, CombatRequirement};
+use engine::game::game_object::{PhaseOutCause, PhaseStatus};
+use engine::game::phasing::phase_out_object;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
     Comparator, PlayerScope, QuantityExpr, QuantityRef, StaticCondition, StaticDefinition,
     TargetFilter,
 };
 use engine::types::card_type::{CoreType, Supertype};
+use engine::types::events::GameEvent;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaColor;
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::statics::StaticMode;
+use engine::types::zones::Zone;
 
 const P2: PlayerId = PlayerId(2);
 
@@ -363,6 +380,99 @@ fn assert_type_line(
             obj.card_types.subtypes
         );
     }
+}
+
+/// FIXTURE PROPERTY F4 — the carrier reach-guard.
+///
+/// Read the carrier's static definitions UNGATED (`iter_unchecked` applies no
+/// CR gate at all) and assert exactly one `CantAttack` / `CantAttackOrBlock`
+/// definition is present. Every row that concludes "the restriction does NOT
+/// apply" runs this FIRST, in EVERY arm, so a fixture whose carrier silently
+/// failed to carry the restriction — the card's line not parsing, a synthesized
+/// definition not attached — cannot pass for the wrong reason.
+///
+/// The count is pinned at exactly one so the off-zone retune below cannot
+/// silently miss a second carrier of the same mode.
+fn assert_carries_one_cant_attack_static(runner: &GameRunner, carrier: ObjectId, label: &str) {
+    let obj = &runner.state().objects[&carrier];
+    let modes: Vec<StaticMode> = obj
+        .static_definitions
+        .iter_unchecked()
+        .map(|def| def.mode.clone())
+        .collect();
+    let count = modes
+        .iter()
+        .filter(|mode| matches!(mode, StaticMode::CantAttack | StaticMode::CantAttackOrBlock))
+        .count();
+    assert_eq!(
+        count, 1,
+        "FIXTURE PROPERTY F4: {} must carry exactly ONE attack restriction for \
+         the row to say anything about whether it applies ({label}); got modes \
+         {modes:?}",
+        obj.name
+    );
+}
+
+/// CR 113.6b: "An ability that states which zones it functions in functions
+/// only from those zones." Retune the carrier's one attack restriction so it
+/// declares the GRAVEYARD — i.e. the carrier's current zone (the battlefield)
+/// is NOT a zone that definition functions in, so the restriction must not
+/// apply to a battlefield carrier.
+///
+/// This is fixture STATE, not a game action, exactly like `tap` and
+/// `make_snow_land`: it is the integration-level analogue of the unit test
+/// `functioning_abilities::functioning_static_definitions_respects_active_zones`,
+/// which builds the same off-zone definition directly and never reaches combat.
+/// Retuning the REAL parsed definition rather than synthesizing one keeps the
+/// production route (Oracle text → parser → `StaticDefinition`) intact on both
+/// sides of the arm.
+///
+/// Written to BOTH `static_definitions` and `base_static_definitions` because
+/// `layers.rs` re-seeds the live list from the base list on every full pass —
+/// the same reason `make_artifact_land` writes both type-line fields.
+fn make_cant_attack_graveyard_only(runner: &mut GameRunner, carrier: ObjectId, label: &str) {
+    assert_carries_one_cant_attack_static(runner, carrier, label);
+    {
+        let obj = runner.state_mut().objects.get_mut(&carrier).unwrap();
+        let mut defs: Vec<StaticDefinition> = obj.static_definitions.as_slice().to_vec();
+        for def in defs.iter_mut() {
+            if matches!(
+                def.mode,
+                StaticMode::CantAttack | StaticMode::CantAttackOrBlock
+            ) {
+                def.active_zones = vec![Zone::Graveyard];
+            }
+        }
+        obj.static_definitions = defs.clone().into();
+        obj.base_static_definitions = Arc::new(defs);
+    }
+    runner.state_mut().layers_dirty.mark_full();
+}
+
+/// CR 702.26b: phase the carrier out, through the production phasing authority
+/// (`phasing::phase_out_object`) rather than by hand-writing `phase_status`, so
+/// the row measures the state the game actually produces — including the
+/// CR 702.26g indirect phase-out of anything attached.
+fn phase_carrier_out(runner: &mut GameRunner, carrier: ObjectId, label: &str) {
+    let mut events: Vec<GameEvent> = Vec::new();
+    phase_out_object(
+        runner.state_mut(),
+        carrier,
+        PhaseOutCause::Directly,
+        &mut events,
+    );
+    assert!(
+        matches!(
+            runner.state().objects[&carrier].phase_status,
+            PhaseStatus::PhasedOut {
+                cause: PhaseOutCause::Directly
+            }
+        ),
+        "CR 702.26b: the carrier must really be phased out before the row reads \
+         any legality outcome from it ({label}); got {:?}",
+        runner.state().objects[&carrier].phase_status
+    );
+    runner.state_mut().layers_dirty.mark_full();
 }
 
 // ---------------------------------------------------------------------------
@@ -652,9 +762,9 @@ fn hammerhead_shark_binds_per_defender_in_multiplayer() {
     );
     assert!(
         !shark_targets.contains(&AttackTarget::Planeswalker(p2_walker)),
-        "CR 310.9d / CR 508.5: a planeswalker answers with its CONTROLLER, so \
-         attacking P2's planeswalker reads P2's board and must also be \
-         refused; got {shark_targets:?}"
+        "CR 508.5: a planeswalker answers with its CONTROLLER, so attacking \
+         P2's planeswalker reads P2's board and must also be refused; got \
+         {shark_targets:?}"
     );
     let bear_targets: HashSet<AttackTarget> = by_attacker
         .get(&bear)
@@ -684,7 +794,8 @@ fn hammerhead_shark_binds_per_defender_in_multiplayer() {
         runner
             .declare_attackers(&[(shark, AttackTarget::Planeswalker(p2_walker))])
             .is_err(),
-        "CR 310.9d: attacking P2's planeswalker resolves the anchor to P2"
+        "CR 508.5: attacking P2's planeswalker resolves the anchor to P2 (the \
+         controller of the planeswalker that creature is attacking)"
     );
     // FIXTURE PROPERTY F1: the unrestricted bear attacks P2 in the SAME call,
     // proving the two rejections above are about the shark's gate and not about
@@ -1429,6 +1540,414 @@ fn defending_player_quantity_gate_is_unchanged_by_the_pairing_route() {
                 .is_ok(),
             !negated,
             "enforcement must agree with the badge (negated = {negated})"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R13 / R14 — the carrier's ZONE-OF-FUNCTION and PHASING gates, through combat
+// ---------------------------------------------------------------------------
+//
+// Why these rows exist, and why the unit tests they mirror are not enough.
+//
+// `combat::carries_defender_sensitive_local_cant_attack` — the routing
+// predicate that feeds BOTH the prompt's `valid_attacker_ids` and its
+// `attacker_constraints` badge — iterates
+// `functioning_abilities::functioning_static_definitions`, which applies two
+// gates and only two: the CR 702.26b phased-out early return, and the per-
+// definition CR 113.6 / CR 113.6b `static_functions_in_zone` filter.
+//
+// `functioning_abilities`' own unit tests
+// (`functioning_static_definitions_respects_active_zones`,
+// `functioning_static_definitions_still_filters_phased_out`) call that private
+// iterator DIRECTLY on a hand-built object. They cannot see the combat
+// pipeline, so a regression that reached the same definitions by some other
+// route — a caller swapped to `iter_unchecked`, a hoisted cache built without
+// the gates — leaves them green while the prompt is wrong. R13 and R14 read the
+// gates back out of the live `WaitingFor::DeclareAttackers` payload instead.
+//
+// WHAT THESE ROWS PIN, MEASURED RATHER THAN ASSUMED. They pin the payload's
+// observable behaviour, NOT any single call site, and the difference was
+// established by injecting the regressions:
+//
+//  * Bypassing `static_functions_in_zone` in the SHARED CR 113.6 authority
+//    (both statics gathers) turns R13 red.
+//  * Bypassing it in `functioning_static_definitions` ALONE leaves R13 green:
+//    the per-pairing door (`attacker_can_attack_target` →
+//    `static_abilities::check_static_ability` → `game_functioning_statics`)
+//    re-applies the same gate, so a spurious `true` out of the routing
+//    predicate is caught one step later and the payload is unchanged. The two
+//    gates are redundant for every outcome combat can observe; the rows cannot
+//    separate them and do not claim to.
+//  * R14 is likewise redundantly protected — CR 702.26b is enforced at the
+//    candidate sweep (`GameState::battlefield_phased_in_ids`), at both statics
+//    gathers, and inside filter evaluation — so it is a behaviour pin, not a
+//    one-line revert detector. It is NOT vacuous: leaving the carrier phased in
+//    while the arm still expects a phased-out carrier makes the badge appear
+//    and the row fail.
+//
+// These are NOT the false-condition row. R3/R10b already pin the case where the
+// definition FUNCTIONS and its `condition` is false. Here the condition is TRUE
+// in every arm (the defender's land is untapped throughout) and what varies is
+// whether the CARRIER's state lets the definition function at all.
+
+/// CR 113.6b + CR 508.1c. Veteran Brawlers' printed
+/// `can't attack if defending player controls an untapped land` retuned to
+/// declare `active_zones = [Graveyard]`, so the definition does not function
+/// from the battlefield the carrier is standing on.
+///
+/// | carrier's definition | expected |
+/// |---|---|
+/// | graveyard-only (CR 113.6b) | offered, NO badge, declaration `Ok` |
+/// | battlefield default (CR 113.6) — the positive control | not offered, `CantAttack` badge carried by itself, declaration `Err` |
+///
+/// The two arms are the same board, the same card and the same (satisfied)
+/// gate; the ONLY difference is the definition's zone-of-function list, so a
+/// combat pipeline that stops honouring CR 113.6b cannot keep both arms. Stop
+/// the shared `functioning_abilities::static_functions_in_zone` authority from
+/// gating and the off-zone arm goes red on its first assertion — the creature
+/// stops being offered. (See the section banner: bypassing that gate in
+/// `functioning_static_definitions` alone is masked by the per-pairing door,
+/// which applies it again.)
+///
+/// FIXTURE PROPERTY F4: `make_cant_attack_graveyard_only` and the control arm
+/// both assert the carrier really carries exactly one attack restriction first,
+/// so "no badge" cannot mean "no definition".
+#[test]
+fn defender_gated_cant_attack_ignores_an_off_zone_carrier() {
+    // (label, definition retuned off the battlefield?, attack legal?)
+    for (label, off_zone, attack_legal) in [
+        ("battlefield-default definition (control)", false, false),
+        ("graveyard-only definition", true, true),
+    ] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let brawlers = scenario
+            .add_creature_from_oracle(P0, "Veteran Brawlers", 3, 3, VETERAN_BRAWLERS)
+            .id();
+        let bear = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+        let land = scenario.add_basic_land(P1, ManaColor::Green);
+        let mut runner = scenario.build();
+
+        // FIXTURE PROPERTY F3 + the shared premise of both arms: the gate is
+        // MET in each of them, so the arms differ only in zone-of-function.
+        assert_type_line(&runner, land, &[CoreType::Land], &[], &["Forest"]);
+        assert!(
+            !runner.state().objects[&land].tapped,
+            "both arms require the defender's land to be UNTAPPED, or the \
+             condition is false and the row degenerates into R3 ({label})"
+        );
+        assert_carries_one_cant_attack_static(&runner, brawlers, label);
+        if off_zone {
+            make_cant_attack_graveyard_only(&mut runner, brawlers, label);
+        }
+
+        advance_to_declare_attackers(&mut runner);
+        let AttackersPayload {
+            valid, constraints, ..
+        } = attackers_payload(&runner);
+        assert!(
+            valid.contains(&bear) && !constraints.contains_key(&bear),
+            "FIXTURE PROPERTY F1: the unrestricted bear must be offered and \
+             badge-free in both arms ({label}); got valid={valid:?} \
+             constraints={constraints:?}"
+        );
+        assert_eq!(
+            valid.contains(&brawlers),
+            off_zone,
+            "CR 113.6b + CR 508.1a: a restriction that functions only from the \
+             GRAVEYARD does not restrict its battlefield carrier, so the prompt \
+             must offer Veteran Brawlers exactly when the definition is off-zone \
+             ({label}); got {valid:?}"
+        );
+        let badge = constraints.get(&brawlers);
+        if off_zone {
+            assert!(
+                badge.is_none(),
+                "CR 113.6b: an off-zone definition is not a functioning \
+                 restriction, so no badge may be emitted for it ({label}); got \
+                 {badge:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    badge,
+                    Some(CombatRequirement::CantAttack { sources }) if sources == &vec![brawlers]
+                ),
+                "POSITIVE CONTROL (CR 508.1c): with the SAME card, the SAME \
+                 satisfied gate and the definition left at the CR 113.6 \
+                 battlefield default, the restriction DOES apply and Veteran \
+                 Brawlers is badged with itself as carrier — without this the \
+                 off-zone arm proves nothing ({label}); got {badge:?}"
+            );
+        }
+
+        assert_declaration_with_control(
+            &mut runner,
+            brawlers,
+            bear,
+            AttackTarget::Player(P1),
+            attack_legal,
+            label,
+        );
+    }
+}
+
+/// CR 702.26b + CR 508.1c. The same card, the same satisfied gate, with the
+/// CARRIER phased out.
+///
+/// CR 702.26b: "a phased-out permanent is treated as though it does not exist.
+/// It can't affect or be affected by anything else in the game." So its
+/// `CantAttack` must not be a functioning restriction, and the prompt must not
+/// badge it as one.
+///
+/// | carrier | expected |
+/// |---|---|
+/// | phased out (CR 702.26b) | NO badge — the restriction does not apply |
+/// | phased in — the positive control | `CantAttack` badge carried by itself, declaration `Err` |
+///
+/// SCOPE NOTE, so the row is not read as claiming more than it does: a
+/// phased-out creature is never OFFERED either, but that is CR 702.26b acting
+/// one step earlier — `combat::team_eligible_attacker_ids` draws its candidates
+/// from `GameState::battlefield_phased_in_ids`, before any restriction
+/// predicate runs. The unrestricted `ghost` bear is in the fixture precisely to
+/// attribute that absence: it is phased out alongside Veteran Brawlers, carries
+/// no restriction at all, and disappears from `valid_attacker_ids` too. The
+/// BADGE is therefore the discriminating assertion here, and
+/// `attacker_constraints_for_active_player` does reach a phased-out creature —
+/// it iterates `state.battlefield`, which CR 702.26d keeps a phased-out
+/// permanent in.
+///
+/// The badge assertion is what carries the row: leave the carrier phased IN
+/// while the arm still expects a phased-out carrier and
+/// `CantAttack { sources: [brawlers] }` appears where the row demands none. See
+/// the section banner for what this does and does not detect — CR 702.26b is
+/// enforced redundantly along this path, so the row pins the payload's
+/// behaviour rather than any one gate's call site.
+#[test]
+fn defender_gated_cant_attack_ignores_a_phased_out_carrier() {
+    for (label, phased_out) in [("phased in (control)", false), ("phased out", true)] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let brawlers = scenario
+            .add_creature_from_oracle(P0, "Veteran Brawlers", 3, 3, VETERAN_BRAWLERS)
+            .id();
+        let bear = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+        // The attribution control: unrestricted, and phased out in lockstep
+        // with the carrier.
+        let ghost = scenario.add_creature(P0, "Ghostly Bear", 2, 2).id();
+        let land = scenario.add_basic_land(P1, ManaColor::Green);
+        let mut runner = scenario.build();
+
+        assert_type_line(&runner, land, &[CoreType::Land], &[], &["Forest"]);
+        assert!(
+            !runner.state().objects[&land].tapped,
+            "both arms require the defender's land to be UNTAPPED, so the gate \
+             is satisfied and only the carrier's phase status varies ({label})"
+        );
+        assert_carries_one_cant_attack_static(&runner, brawlers, label);
+        if phased_out {
+            phase_carrier_out(&mut runner, brawlers, label);
+            phase_carrier_out(&mut runner, ghost, label);
+        }
+
+        advance_to_declare_attackers(&mut runner);
+        let AttackersPayload {
+            valid, constraints, ..
+        } = attackers_payload(&runner);
+        assert!(
+            valid.contains(&bear) && !constraints.contains_key(&bear),
+            "FIXTURE PROPERTY F1: the phased-IN unrestricted bear must be \
+             offered and badge-free in both arms ({label}); got valid={valid:?} \
+             constraints={constraints:?}"
+        );
+        assert_eq!(
+            valid.contains(&ghost),
+            !phased_out,
+            "CR 702.26b + CR 508.1a: the UNRESTRICTED ghost drops out of the \
+             candidate set purely by phasing out, which is what attributes \
+             Veteran Brawlers' own absence below to CR 702.26b rather than to \
+             its restriction ({label}); got {valid:?}"
+        );
+        assert!(
+            !constraints.contains_key(&ghost),
+            "a creature with no attack restriction is never badged, phased out \
+             or not ({label}); got {constraints:?}"
+        );
+        assert!(
+            !valid.contains(&brawlers),
+            "Veteran Brawlers is absent from the candidate set in BOTH arms — \
+             restricted when phased in (CR 508.1c), nonexistent when phased out \
+             (CR 702.26b) ({label}); got {valid:?}"
+        );
+
+        let badge = constraints.get(&brawlers);
+        if phased_out {
+            assert!(
+                badge.is_none(),
+                "CR 702.26b: a phased-out permanent's abilities do not \
+                 function, so its `CantAttack` is not a functioning \
+                 restriction and the payload must carry NO badge for it \
+                 ({label}); got {badge:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    badge,
+                    Some(CombatRequirement::CantAttack { sources }) if sources == &vec![brawlers]
+                ),
+                "POSITIVE CONTROL (CR 508.1c): phased IN, on the same board \
+                 with the same satisfied gate, the restriction DOES apply and \
+                 the badge IS emitted — without this the phased-out arm passes \
+                 whether or not the engine honours CR 702.26b ({label}); got \
+                 {badge:?}"
+            );
+        }
+
+        // CR 508.1c: the declaration is refused in both arms (restricted, then
+        // nonexistent), and FIXTURE PROPERTY F1's control proves the board
+        // still admits an attack in each of them.
+        assert_declaration_with_control(
+            &mut runner,
+            brawlers,
+            bear,
+            AttackTarget::Player(P1),
+            false,
+            label,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R15 — a REMOTE carrier's zone and phasing, at the per-pairing door
+// ---------------------------------------------------------------------------
+
+/// CR 113.6 + CR 702.26b + CR 508.1c. The carrier is a DIFFERENT object from
+/// the restricted creature, so the creature stays on the battlefield and
+/// attacks (or fails to) while the carrier moves zone or phases out.
+///
+/// | carrier | expected declaration |
+/// |---|---|
+/// | on the battlefield, phased in — the positive control | `Err` |
+/// | in the GRAVEYARD | `Ok` |
+/// | on the battlefield, PHASED OUT | `Ok` |
+///
+/// The definition is SYNTHESIZED, and labelled as such at its construction site
+/// below: `combat::carries_defender_sensitive_local_cant_attack` records that
+/// every carrier in the printed `DefendingPlayerControls` population is
+/// self-referential, so no Oracle text produces this shape. It is built here
+/// because the per-pairing door (`attacker_can_attack_target` →
+/// `static_abilities::check_static_ability` →
+/// `functioning_abilities::game_functioning_statics`) is a SECOND, separately
+/// implemented functioning gate, and that sweep's own CR 702.26b filter is
+/// reached by no other row in this file: deleting it leaves R13 and R14 green
+/// (measured) because the phased-out carrier they use is ALSO the restricted
+/// creature, and CR 702.26b has already removed that creature from the
+/// candidate set one step earlier.
+///
+/// The two suppressions are not the same gate: the graveyard arm is refused by
+/// `game_functioning_statics`' battlefield+command-zone SCOPE (a graveyard
+/// object is never swept, whatever its `active_zones` say), the phased-out arm
+/// by that sweep's explicit CR 702.26b `is_phased_out` filter. Measured:
+/// deleting that filter turns the phased-out arm red, and the graveyard arm is
+/// correspondingly unaffected by a zone-gate regression — this is the only row
+/// in the file that pins either of those two properties of the sweep.
+///
+/// DECLARED SCOPE CUT, asserted rather than assumed: a REMOTE defender-anchored
+/// `CantAttack` is not recovered by the target-agnostic door, so the restricted
+/// creature is OFFERED and BADGE-FREE in every arm including the control —
+/// `combat::carries_defender_sensitive_local_cant_attack` documents this and
+/// why it is taken. Only the declaration discriminates. If that cut is ever
+/// closed, this row is the one that says so.
+#[test]
+fn remote_defender_gated_cant_attack_follows_its_carriers_zone_and_phasing() {
+    // (label, carrier in the graveyard?, carrier phased out?, attack legal?)
+    for (label, in_graveyard, phased_out, attack_legal) in [
+        (
+            "carrier on the battlefield, phased in (control)",
+            false,
+            false,
+            false,
+        ),
+        ("carrier in the graveyard", true, false, true),
+        ("carrier phased out", false, true, true),
+    ] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let restricted = scenario.add_creature(P0, "Restrained Bear", 2, 2).id();
+        let bear = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+        let land = scenario.add_basic_land(P1, ManaColor::Green);
+        // SYNTHESIZED (see the doc comment): a remote `CantAttack` scoped to one
+        // creature, gated on the defending player controlling one specific
+        // permanent. `SpecificObject` is used for both the affected filter and
+        // the gate's filter so the row turns on the carrier's functioning state
+        // alone and not on any filter-evaluation subtlety — the gate is TRUE in
+        // every arm, because P1 controls that land in every arm.
+        let remote_gate = StaticDefinition::new(StaticMode::CantAttack)
+            .affected(TargetFilter::SpecificObject { id: restricted })
+            .condition(StaticCondition::DefendingPlayerControls {
+                filter: TargetFilter::SpecificObject { id: land },
+            });
+        let carrier = if in_graveyard {
+            scenario
+                .add_creature_to_graveyard(P0, "Watchful Sentry", 1, 1)
+                .with_static_definition(remote_gate)
+                .id()
+        } else {
+            scenario
+                .add_creature(P0, "Watchful Sentry", 1, 1)
+                .with_static_definition(remote_gate)
+                .id()
+        };
+        let mut runner = scenario.build();
+
+        assert_carries_one_cant_attack_static(&runner, carrier, label);
+        assert_eq!(
+            runner.state().objects[&carrier].zone,
+            if in_graveyard {
+                Zone::Graveyard
+            } else {
+                Zone::Battlefield
+            },
+            "the arm's premise is the carrier's ZONE, so assert it before \
+             reading any legality outcome ({label})"
+        );
+        assert_eq!(
+            runner.state().objects[&land].controller,
+            P1,
+            "the synthesized gate reads `defending player controls <land>`, so \
+             the defending player must control it in every arm ({label})"
+        );
+        if phased_out {
+            phase_carrier_out(&mut runner, carrier, label);
+        }
+
+        advance_to_declare_attackers(&mut runner);
+        let AttackersPayload {
+            valid, constraints, ..
+        } = attackers_payload(&runner);
+        assert!(
+            valid.contains(&bear) && !constraints.contains_key(&bear),
+            "FIXTURE PROPERTY F1: the unrestricted bear must be offered and \
+             badge-free in every arm ({label}); got valid={valid:?} \
+             constraints={constraints:?}"
+        );
+        assert!(
+            valid.contains(&restricted) && !constraints.contains_key(&restricted),
+            "DECLARED SCOPE CUT: a remote defender-anchored restriction is not \
+             recovered by the target-agnostic door, so the creature is offered \
+             and badge-free in EVERY arm and only the declaration below \
+             discriminates ({label}); got valid={valid:?} \
+             constraints={constraints:?}"
+        );
+
+        assert_declaration_with_control(
+            &mut runner,
+            restricted,
+            bear,
+            AttackTarget::Player(P1),
+            attack_legal,
+            label,
         );
     }
 }
