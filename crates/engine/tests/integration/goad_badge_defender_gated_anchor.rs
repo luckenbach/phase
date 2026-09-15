@@ -13,9 +13,10 @@
 //! creature, and that bool was the whole CR 508.1d "if able" gate inside
 //! `creature_must_attack_with_attackable_targets_gated`. Requirement/display and
 //! legality were therefore two predicates that could disagree; they now share one
-//! pairability authority (`combat::legal_attack_targets_for_attacker`), whose
-//! LIST view is the payload's per-attacker map and whose EMPTY view is the
-//! "if able" gate.
+//! pairability authority (`combat::legal_attack_targets_iter`), whose LIST view
+//! (`legal_attack_targets_for_attacker`) is the payload's per-attacker map and
+//! whose short-circuiting EXISTENTIAL view
+//! (`attacker_has_legal_attack_target`) is the "if able" gate.
 //!
 //! ROW 1 (`goaded_defender_gated_creature_badge_agrees_with_enforcement`) is the
 //! regression pin for the resulting display/enforcement split. ROWS 2-4 are
@@ -38,6 +39,7 @@ use std::collections::HashSet;
 
 use engine::game::combat::{AttackTarget, CombatRequirement};
 use engine::game::game_object::{PhaseOutCause, PhaseStatus};
+use engine::game::perf_counters;
 use engine::game::phasing::phase_out_object;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{StaticCondition, StaticDefinition, TargetFilter};
@@ -773,6 +775,158 @@ fn remote_defender_gated_cant_attack_follows_its_carriers_zone_and_phasing() {
             "CR 113.6b + CR 702.26b + CR 508.1c ({label}): the declaration must be \
              legal exactly when the carrier's restriction is NOT functioning; got \
              {declared:?}"
+        );
+    }
+}
+
+// ===========================================================================
+// ROW 5 — the "if able" gate is EXISTENTIAL: it must short-circuit, not sweep.
+// ===========================================================================
+
+/// The CR 508.1d "if able" gate (ROW 1's fix) asks the shared pairability
+/// authority whether ANY legal pairing exists. That question is answered by
+/// `combat::attacker_has_legal_attack_target`, the short-circuiting view of
+/// `combat::legal_attack_targets_iter` — NOT by collecting and sorting the
+/// creature's whole legal-target list and testing it for emptiness.
+///
+/// The distinction is not cosmetic. `attacker_constraints_for_active_player`
+/// reaches this gate once per must-attack creature and the AI's
+/// mandatory-attacker filter reaches it once per candidate, on every combat,
+/// with NO list consumer on either path. A collecting existential spends one
+/// `attacker_can_attack_target` evaluation per defender in the universe — plus
+/// an allocation and a sort — to learn one bit.
+///
+/// MEASUREMENT, not inspection: `pairability_evaluations` counts every
+/// per-(attacker, defender) evaluation of `combat::attacker_can_attack_target`,
+/// the one predicate both views of the sweep share. It is bumped inside that
+/// function, so the cost cannot be hidden by moving it to another caller.
+///
+/// The row is revert-failing: restore the collecting
+/// `legal_attack_targets_for_attacker(..).is_empty()` form of the gate and both
+/// arms rise from `goaded` to `goaded * universe` (4 and 8 against the asserted
+/// universe of 4), because every creature here is legal against the FIRST
+/// defender the sweep reaches and every pairing after it is wasted.
+///
+/// The two arms are each other's control. One goaded creature costing 1 is
+/// equally compatible with a dead counter that only fires once, or with a
+/// universe of size 1; two goaded creatures costing exactly 2 on the SAME board
+/// is not. The cost scales with the number of creatures asking the question and
+/// is independent of the universe — which is what "short-circuits" means.
+#[test]
+fn must_attack_gate_short_circuits_on_the_first_legal_pairing() {
+    for goaded in [1usize, 2] {
+        let label = format!("existential if-able gate, {goaded} goaded");
+
+        // Three players and a planeswalker apiece, so the defender universe is
+        // strictly larger than the number of askers and a short-circuit is
+        // distinguishable from a sweep. Nothing on this board restricts
+        // attacking: every pairing is legal, so the FIRST one the sweep reaches
+        // settles the existential question.
+        let mut scenario = GameScenario::new_n_player(3, 7);
+        scenario.at_phase(Phase::PreCombatMain);
+        let bears: Vec<ObjectId> = (0..goaded)
+            .map(|i| {
+                scenario
+                    .add_creature(P0, &format!("Grizzly Bears {i}"), 2, 2)
+                    .id()
+            })
+            .collect();
+        scenario.add_planeswalker_from_oracle(P1, "Jace Beleren", "Jace", 3, "");
+        scenario.add_planeswalker_from_oracle(P2, "Chandra Nalaar", "Chandra", 6, "");
+        let mut runner = scenario.build();
+
+        // CR 701.15b: goad every bear — they are the only creatures on the
+        // attacking team, so they are the only creatures that reach the gate.
+        for &bear in &bears {
+            runner
+                .state_mut()
+                .objects
+                .get_mut(&bear)
+                .unwrap()
+                .goaded_by
+                .insert(P1);
+        }
+
+        advance_to_declare_attackers(&mut runner, &label);
+
+        // REACH-GUARD: the defender universe really is bigger than the number of
+        // askers, so the counts below are short-circuits rather than restatements
+        // of a tiny board.
+        let universe = engine::game::combat::get_valid_attack_targets(runner.state());
+        assert_eq!(
+            universe.len(),
+            4,
+            "REACH-GUARD ({label}): CR 506.3 — two opponents and two planeswalkers \
+             must all be attackable; got {universe:?}"
+        );
+
+        // REACH-GUARD: the gate is actually REACHED. A creature carrying no
+        // requirement returns early, long before the existential gate, and would
+        // also spend 0 evaluations — so a passing count would prove nothing.
+        let payload = attackers_payload(&runner);
+        for &bear in &bears {
+            assert!(
+                matches!(
+                    payload.constraints.get(&bear),
+                    Some(CombatRequirement::MustAttack { .. })
+                ),
+                "REACH-GUARD ({label}): CR 701.15b — every goaded bear must carry a \
+                 MustAttack requirement, or the gate under measurement is never \
+                 reached; got {:?}",
+                payload.constraints.get(&bear)
+            );
+            // REACH-GUARD: the bear really can attack SOMETHING, so "1
+            // evaluation" below is the sweep stopping at a LEGAL first pairing
+            // rather than a board on which nothing is legal.
+            //
+            // This map is deliberately NOT used as the list view's control: the
+            // payload publishes the CR 508.1d SOLVER's requirement-aware
+            // selectable set, which is narrower than the raw pairability list
+            // (goad is satisfied only by attacking a PLAYER other than P1, so
+            // the two planeswalkers are dropped here even though every one of
+            // the four pairings is legal under CR 508.1b). The two arms of this
+            // row are each other's control instead.
+            assert!(
+                payload
+                    .legal_targets
+                    .get(&bear)
+                    .is_some_and(|t| !t.is_empty()),
+                "REACH-GUARD ({label}): the goaded bear must have at least one \
+                 selectable defender; got {:?}",
+                payload.legal_targets.get(&bear)
+            );
+        }
+        assert_eq!(
+            payload.valid.len(),
+            goaded,
+            "REACH-GUARD ({label}): the goaded bears must be the ONLY eligible \
+             attackers, so every counted evaluation below is attributable to them; \
+             got {:?}",
+            payload.valid
+        );
+
+        // PRIMARY: the display/requirement path, which has no list consumer at
+        // all — every evaluation it spends is spent answering "if able".
+        let valid_attacker_ids = engine::game::combat::get_valid_attacker_ids(runner.state());
+        perf_counters::reset();
+        let constraints = engine::game::combat::attacker_constraints_for_active_player(
+            runner.state(),
+            &valid_attacker_ids,
+        );
+        let measured = perf_counters::attack_declaration_solver_snapshot();
+        assert_eq!(
+            constraints.len(),
+            goaded,
+            "REACH-GUARD ({label}): the measured call must have produced one badge \
+             per goaded bear; got {constraints:?}"
+        );
+        assert_eq!(
+            measured.pairability_evaluations,
+            goaded as u64,
+            "CR 508.1d ({label}): the \"if able\" gate asks whether ANY legal \
+             pairing exists, so each asker must stop at the first one — {goaded} \
+             evaluation(s) total, NOT one per defender in a universe of {}",
+            universe.len()
         );
     }
 }
