@@ -37528,6 +37528,79 @@ fn attached_subject_rules_bearing_remainder_composes_or_declines() {
     );
 }
 
+/// The unparsed-`as long as` gate policy has ONE authority, and these routes use it.
+///
+/// `unparsed_gate_condition` documents the asymmetry the engine deliberately keeps —
+/// `Positive` (`"as long as"` / `"if"`) yields a bare `Unrecognized` that reads TRUE, so
+/// a static whose gate the parser cannot type still applies, exactly as it always has;
+/// `Negative` (`"unless"`) yields the inert marker. Its doc says that asymmetry is
+/// "preserved ONLY here".
+///
+/// It was not. Ten sites across `anthem.rs`, `type_change.rs`, `dispatch.rs` and
+/// `loyalty.rs` open-coded `parse_static_condition(..).unwrap_or(Unrecognized { .. })`,
+/// reproducing the `Positive` branch by hand. Behaviourally identical, but it meant the
+/// policy lived in eleven places and a future change to it would silently miss ten.
+///
+/// This row pins the CONSOLIDATION, not a behaviour change: each production still
+/// applies its static when the gate is unparseable. The paired negative control is the
+/// `Negative` polarity, which must stay inert — if someone "simplifies" the helper by
+/// collapsing the two branches, that assertion reds.
+///
+/// **Why the positive branch is not simply a bug to fix:** measured over the corpus,
+/// flipping it to inert moves 69 cards and strips working behaviour — Manor Gargoyle's
+/// "indestructible as long as it has defender" is true whenever the card is on the
+/// battlefield, and inert would remove indestructible outright. The real repair is to
+/// TYPE those conditions (`"is renowned"`, `"it has defender"`), not to change the
+/// fallback's polarity. See #9264.
+#[test]
+fn unparsed_as_long_as_gate_policy_has_one_authority() {
+    // POSITIVE: reads TRUE, so the static applies. This is the inherited behaviour the
+    // ten consolidated sites must keep.
+    let positive = unparsed_gate_condition("some clause we cannot type", ConditionGatePolarity::Positive);
+    assert_eq!(
+        positive,
+        StaticCondition::Unrecognized {
+            text: "some clause we cannot type".to_string()
+        },
+        "the positive branch must stay a BARE Unrecognized — it reads true, and statics \
+         whose gate we cannot type still apply"
+    );
+
+    // PAIRED NEGATIVE CONTROL: the other polarity must stay inert. Without this, a
+    // helper that returned a bare `Unrecognized` for BOTH polarities would satisfy the
+    // assertion above while silently turning every `"unless"` restriction permanently on.
+    let negative = unparsed_gate_condition("some clause we cannot type", ConditionGatePolarity::Negative);
+    assert_eq!(
+        negative,
+        StaticCondition::Not {
+            condition: Box::new(StaticCondition::Unrecognized {
+                text: "some clause we cannot type".to_string()
+            })
+        },
+        "the negative branch must stay the inert marker"
+    );
+    assert_ne!(
+        positive, negative,
+        "the two polarities are deliberately asymmetric; collapsing them reds here"
+    );
+
+    // END-TO-END on a real corpus line whose gate this parser cannot type. Manor
+    // Gargoyle prints Defender, so "as long as it has defender" holds on the
+    // battlefield — the static applying is the behaviour-correct outcome here, and the
+    // row that would red if the fallback were narrowed to inert.
+    let gargoyle = parse_static_line("This creature has indestructible as long as it has defender.")
+        .expect("the gated static still parses");
+    assert!(
+        matches!(
+            gargoyle.condition,
+            Some(StaticCondition::Unrecognized { .. })
+        ),
+        "an untypeable positive gate stays a bare Unrecognized so the static applies; \
+         got {:?}",
+        gargoyle.condition
+    );
+}
+
 #[test]
 fn defender_exception_rules_bearing_remainder_composes_both_halves() {
     // (1) RULES-BEARING tail — declines. Expedition Lookout's verbatim line.
