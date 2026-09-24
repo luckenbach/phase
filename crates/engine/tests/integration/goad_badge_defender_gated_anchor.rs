@@ -1073,15 +1073,33 @@ fn deferred_anchor_prohibition_published_state_is_unchanged_by_the_permission_au
          `CantAttack` to `Permission`, or returning `Some(true)` for a \
          prohibition, moves this; got {valid:?}"
     );
+    // #9265: this observable INVERTED, deliberately. It previously asserted the
+    // deferred-anchor creature carries NO badge — "the pre-existing display gap,
+    // held UNCHANGED". That gap is now closed: a creature that is eligible but has
+    // an empty legal-target set carries a `CantAttack` badge so the UI can explain
+    // the refusal it was already enforcing.
+    //
+    // The row still earns its place. It pins that the badge is attributed, not just
+    // present — an unattributed badge tells the player nothing about WHY — and the
+    // `valid.contains(&gated)` assertion above still holds, so the creature remains
+    // OFFERED. Eligibility and display are still separate observables; only the
+    // display half moved.
     assert!(
-        !matches!(
+        matches!(
             constraints.get(&gated),
             Some(CombatRequirement::CantAttack { .. })
         ),
-        "C2.7 ({LABEL}): base observable 2 of 3 — it carries NO CantAttack badge. \
-         This is the pre-existing display gap, held UNCHANGED; got {:?}",
+        "C2.7 ({LABEL}): base observable 2 of 3 — the deferred-anchor creature now \
+         carries a CantAttack badge (#9265 closed the display gap); got {:?}",
         constraints.get(&gated)
     );
+    if let Some(CombatRequirement::CantAttack { sources }) = constraints.get(&gated) {
+        assert!(
+            !sources.is_empty(),
+            "C2.7 ({LABEL}): and the badge must name a carrier — an unattributed \
+             badge cannot explain the refusal; got {sources:?}"
+        );
+    }
     let gated_targets = legal_targets.get(&gated).cloned().unwrap_or_default();
     assert!(
         gated_targets.is_empty(),

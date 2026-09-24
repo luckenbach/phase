@@ -3757,6 +3757,89 @@ fn creature_cant_attack_gated(
 /// restriction on `obj_id`. Mirrors `creature_cant_attack_gated` arm-for-arm —
 /// the enforcement bool early-returns over the same predicates; this payload-path
 /// collector accumulates the carrier ids instead.
+/// CR 508.1c: carriers responsible for an ELIGIBLE creature having no legal attack
+/// target — the attribution for the badge emitted by
+/// `attacker_constraints_for_active_player`.
+///
+/// Two shapes reach that state, and both are collected because either can be the cause
+/// on a given board:
+///
+///  * a target-scoped PROHIBITION that deferred (`CantAttack` gated on
+///    `DefendingPlayerControls`), whose carriers `cant_attack_sources_gated` already
+///    resolves;
+///  * a target-anchored PERMISSION that is withheld for every pairing — a
+///    `CanAttackWithDefender` on a Defender creature gated on an anchored condition
+///    (Weathered Sentinels). Its carrier is the creature itself when intrinsic, or the
+///    remote static's object.
+///
+/// Mirrors `cant_attack_sources_gated`'s intrinsic-then-remote shape rather than
+/// inventing a second attribution idiom. An empty result is legitimate and means the
+/// engine could not name a carrier — the badge still renders, as it does for
+/// player-level goad (CR 701.15b), which carries no object either.
+fn no_legal_attack_target_sources(
+    state: &GameState,
+    obj_id: ObjectId,
+    gates: &CombatStaticGates,
+) -> Vec<ObjectId> {
+    let mut sources = cant_attack_sources_gated(state, obj_id, gates);
+    let Some(obj) = state.objects.get(&obj_id) else {
+        return sources;
+    };
+    // CR 508.1c: a DEFERRED prohibition is invisible to `cant_attack_sources_gated`,
+    // which evaluates the condition to decide attribution — and evaluating is exactly
+    // what a defending-player-anchored gate cannot do at creature level. That is why
+    // the creature reached this badge at all, so the carrier has to be resolved from
+    // the static's SHAPE rather than from its verdict.
+    //
+    // Intrinsic only. A REMOTE deferred prohibition's carrier cannot be attributed
+    // here without a target to test `affected` against, and naming an unrelated
+    // permanent would be worse than naming none — the badge still renders
+    // unattributed in that case, as it does for player-level goad (CR 701.15b).
+    // Read the definitions UNFILTERED. Both functioning-abilities iterators decide
+    // visibility by running the gate — `active_static_definitions` with
+    // `PolarityDeferral::Skip`, and the attack-path variant with no target bound —
+    // and a defending-player-anchored gate is precisely the one that cannot be
+    // decided without a target. Either filter therefore hides the static this badge
+    // is attributing, which is why attribution has to read SHAPE, not verdict.
+    //
+    // `iter_unchecked` is documented as the classification/reporting escape hatch,
+    // and this is reporting: `attacker_constraints` is display-only, asserted
+    // nowhere in legality. No rules verdict is taken from this read — it only names
+    // which object the UI should point at.
+    if obj.static_definitions.iter_unchecked().any(|sd| {
+        matches!(
+            sd.mode,
+            StaticMode::CantAttack | StaticMode::CantAttackOrBlock
+        ) && sd
+            .condition
+            .as_ref()
+            .is_some_and(|c| c.needs_defending_player_anchor())
+    }) {
+        sources.push(obj_id);
+    }
+    // CR 702.3b: only a Defender creature depends on a permission to attack at all, so
+    // only then is a withheld permission the explanation.
+    if obj.has_keyword(&Keyword::Defender) {
+        if super::functioning_abilities::active_static_definitions_for_attack(state, obj, None)
+            .any(|sd| sd.mode == StaticMode::CanAttackWithDefender)
+        {
+            sources.push(obj_id);
+        }
+        // The gate memoizes the resolved carrier set, so this reuses the same
+        // object list the eligibility pass already computed rather than
+        // re-running a static scan.
+        sources.extend(
+            gates
+                .can_attack_with_defender_carriers(state)
+                .iter()
+                .copied(),
+        );
+    }
+    sources.sort_unstable_by_key(|id| id.0);
+    sources.dedup();
+    sources
+}
+
 fn cant_attack_sources_gated(
     state: &GameState,
     obj_id: ObjectId,
@@ -6832,6 +6915,36 @@ pub fn attacker_constraints_for_active_player(
                 let sources =
                     must_attack_sources_gated(state, obj_id, &gates, &attackable_carriers);
                 constraints.insert(obj_id, CombatRequirement::MustAttack { defenders, sources });
+            } else if !attacker_has_legal_attack_target(
+                state,
+                obj_id,
+                &attackable,
+                &gates,
+                &active_team,
+            ) {
+                // CR 508.1c: ELIGIBLE but with an EMPTY legal-target set. A
+                // target-scoped gate — a `CanAttackWithDefender` permission anchored
+                // to the attacked player, or a `CantAttack` gated on
+                // `DefendingPlayerControls` — cannot be answered at creature level,
+                // so `static_ability_match_applies` defers it to the per-pairing
+                // authority and the creature stays in `valid`. Every pairing then
+                // fails downstream.
+                //
+                // Without this arm the creature is published as selectable with no
+                // badge and no targets: the player picks it and is shown nothing,
+                // then the declaration is refused. Enforcement was always correct;
+                // the UI simply had nothing to explain it with.
+                //
+                // `CantAttack` is the honest shape — right now, against every
+                // attackable defender, it cannot attack — and it is what the UI
+                // already greys. Guarded by
+                // `eligible_creature_with_no_legal_target_carries_a_badge`.
+                constraints.insert(
+                    obj_id,
+                    CombatRequirement::CantAttack {
+                        sources: no_legal_attack_target_sources(state, obj_id, &gates),
+                    },
+                );
             }
         } else if creature_cant_attack_gated(state, obj_id, &gates) {
             constraints.insert(
@@ -9417,6 +9530,157 @@ mod tests {
         assert!(
             validate_attackers(&state, &[wall]).is_ok(),
             "CR 508.1a: the offered creature must pass the declaration validator"
+        );
+    }
+
+    // ===== ROW 1c — an eligible creature with no legal target is BADGED =====
+
+    /// CR 508.1c: a creature that is ELIGIBLE but has no legal attack target must
+    /// carry a display badge, not appear selectable with nothing behind it.
+    ///
+    /// A target-scoped gate cannot be answered at creature level, so
+    /// `static_ability_match_applies` defers it to the per-pairing authority and the
+    /// creature stays in `valid_attacker_ids`. Every pairing then fails downstream.
+    /// Before this arm the player could select the creature and be shown no targets
+    /// and no explanation; enforcement was correct the whole time, the UI just had
+    /// nothing to say.
+    ///
+    /// TWO-SIDED, same carrier shape on both sides. The badged creature's anchored
+    /// permission qualifies for NO attackable player; the control's qualifies for one.
+    /// Without the control, a producer that badged EVERY eligible creature — or every
+    /// Defender creature — would satisfy the first assertion and be wrong.
+    #[test]
+    fn eligible_creature_with_no_legal_target_carries_a_badge() {
+        // NOBODY attacked P0 last turn, so the anchored permission qualifies for no
+        // attackable player: eligible, zero legal targets.
+        let mut state = setup_multiplayer_combat(3);
+        let wall = dp_create_defender(&mut state, PlayerId(0), "Weathered Sentinels");
+        dp_push_static(
+            &mut state,
+            wall,
+            dp_intrinsic_permission(Some(dp_anchored())),
+        );
+        crate::game::layers::evaluate_layers(&mut state);
+
+        let valid = get_valid_attacker_ids(&state);
+        assert!(
+            valid.contains(&wall),
+            "precondition: the creature must still be ELIGIBLE — the deferral is what \
+             puts it in this state; got {valid:?}"
+        );
+        let model = AttackDeclarationConstraints::build(&state);
+        assert!(
+            model.legal_targets.get(&wall).is_none_or(|t| t.is_empty()),
+            "precondition: and it must have NO legal target; got {:?}",
+            model.legal_targets.get(&wall)
+        );
+
+        let badges = attacker_constraints_for_active_player(&state, &valid);
+        assert!(
+            matches!(
+                badges.get(&wall),
+                Some(CombatRequirement::CantAttack { .. })
+            ),
+            "an eligible creature with no legal target must carry a CantAttack badge \
+             so the UI can explain the refusal; got {:?}",
+            badges.get(&wall)
+        );
+        // Attribution: the intrinsic permission's carrier is the creature itself.
+        if let Some(CombatRequirement::CantAttack { sources }) = badges.get(&wall) {
+            assert!(
+                sources.contains(&wall),
+                "the withheld permission's carrier must be named; got {sources:?}"
+            );
+        }
+
+        // PAIRED CONTROL, same carrier shape: P1 DID attack P0 last turn, so the same
+        // anchored permission qualifies for P1 and the creature has a legal target. It
+        // must carry NO badge — otherwise a producer that badges every eligible
+        // creature would pass the assertion above.
+        let mut ok = setup_multiplayer_combat(3);
+        dp_seed_attacked(&mut ok, PlayerId(1), PlayerId(0));
+        let ok_wall = dp_create_defender(&mut ok, PlayerId(0), "Weathered Sentinels");
+        dp_push_static(
+            &mut ok,
+            ok_wall,
+            dp_intrinsic_permission(Some(dp_anchored())),
+        );
+        crate::game::layers::evaluate_layers(&mut ok);
+
+        let ok_valid = get_valid_attacker_ids(&ok);
+        let ok_badges = attacker_constraints_for_active_player(&ok, &ok_valid);
+        assert!(
+            !ok_badges.contains_key(&ok_wall),
+            "control: a creature WITH a legal target must not be badged; got {:?}",
+            ok_badges.get(&ok_wall)
+        );
+
+        // THE OTHER CAUSE: a deferred PROHIBITION. `no_legal_attack_target_sources`
+        // claims to attribute both a withheld permission and a deferred
+        // `CantAttack`; without this fixture only the permission half was ever
+        // exercised, and the prohibition half shipped unverified.
+        let mut proh = setup_multiplayer_combat(3);
+        let stuck = dp_create_permanent(&mut proh, PlayerId(0), "Anchored Prohibition");
+        {
+            let o = proh.objects.get_mut(&stuck).expect("fixture object");
+            o.card_types.core_types.push(CoreType::Creature);
+            o.power = Some(2);
+            o.toughness = Some(2);
+        }
+        // EVERY attackable defender must control the named object, or the pairing
+        // against the one that doesn't stays legal and the creature keeps a target —
+        // which is correct behaviour, just not the state under test. The integration
+        // fixture is two-player and gets this for free; this board is three-player.
+        let land = dp_create_permanent(&mut proh, PlayerId(1), "Forest");
+        let land2 = dp_create_permanent(&mut proh, PlayerId(2), "Forest");
+        dp_push_static(
+            &mut proh,
+            stuck,
+            StaticDefinition::new(StaticMode::CantAttack)
+                .affected(TargetFilter::SelfRef)
+                .condition(StaticCondition::DefendingPlayerControls {
+                    filter: TargetFilter::Or {
+                        filters: vec![
+                            TargetFilter::SpecificObject { id: land },
+                            TargetFilter::SpecificObject { id: land2 },
+                        ],
+                    },
+                }),
+        );
+        crate::game::layers::evaluate_layers(&mut proh);
+        let proh_valid = get_valid_attacker_ids(&proh);
+        // Preconditions are ASSERTED, not guarded: an `if` here would make every
+        // assertion below unreachable whenever the fixture stops reaching the
+        // deferred state, and the row would pass while testing nothing.
+        assert!(
+            proh_valid.contains(&stuck),
+            "precondition: the deferred prohibition must leave the creature ELIGIBLE; \
+             got {proh_valid:?}"
+        );
+        let proh_badges = attacker_constraints_for_active_player(&proh, &proh_valid);
+        let Some(CombatRequirement::CantAttack { sources }) = proh_badges.get(&stuck) else {
+            panic!(
+                "a deferred prohibition with no legal target must carry a CantAttack \
+                 badge; got {:?}",
+                proh_badges.get(&stuck)
+            );
+        };
+        assert!(
+            sources.contains(&stuck),
+            "a DEFERRED prohibition must name its intrinsic carrier — the attribution \
+             cannot read the gate's verdict, only its shape; got {sources:?}"
+        );
+
+        // SECOND CONTROL: a vanilla creature on the badged board is unbadged, so the
+        // badge tracks the gate rather than the board being hostile.
+        let bear = create_creature(&mut state, PlayerId(0), "Grizzly Bears", 2, 2);
+        crate::game::layers::evaluate_layers(&mut state);
+        let valid2 = get_valid_attacker_ids(&state);
+        let badges2 = attacker_constraints_for_active_player(&state, &valid2);
+        assert!(
+            !badges2.contains_key(&bear),
+            "control: a vanilla creature on the SAME board is unbadged; got {:?}",
+            badges2.get(&bear)
         );
     }
 
