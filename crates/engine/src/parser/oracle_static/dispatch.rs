@@ -275,7 +275,9 @@ fn parse_max_untap_per_type_static(tp: &TextPair<'_>, text: &str) -> Option<Stat
         // cap's own source, so the self-pronoun rewrite always applies
         // (unlike parse_continuous_gets_has's SelfRef-only guard).
         let condition = parse_static_condition(&rewrite_self_pronoun_subject(condition_text))
-            .unwrap_or_else(|| unparsed_gate_condition(condition_text, ConditionGatePolarity::Positive));
+            .unwrap_or_else(|| {
+                unparsed_gate_condition(condition_text, ConditionGatePolarity::Positive)
+            });
         def.condition = Some(condition);
         return Some(def);
     }
@@ -2099,8 +2101,9 @@ pub(crate) fn parse_static_line_inner(
         // instead, so the line reaches an authority that can model it or is
         // surfaced honestly as unimplemented.
         if let Some(keyword) = map_keyword(keyword_text) {
-            let condition =
-                parse_static_condition(condition_text).unwrap_or_else(|| unparsed_gate_condition(condition_text, ConditionGatePolarity::Positive));
+            let condition = parse_static_condition(condition_text).unwrap_or_else(|| {
+                unparsed_gate_condition(condition_text, ConditionGatePolarity::Positive)
+            });
             return Some(
                 StaticDefinition::continuous()
                     .affected(TargetFilter::SelfRef)
@@ -2243,8 +2246,9 @@ pub(crate) fn parse_static_line_inner(
                 .description(text.to_string());
             if let Some(cond_tp) = condition_tp {
                 let cond_text = cond_tp.original.trim().trim_end_matches('.');
-                let condition =
-                    parse_static_condition(cond_text).unwrap_or_else(|| unparsed_gate_condition(cond_text, ConditionGatePolarity::Positive));
+                let condition = parse_static_condition(cond_text).unwrap_or_else(|| {
+                    unparsed_gate_condition(cond_text, ConditionGatePolarity::Positive)
+                });
                 def = def.condition(condition);
             }
             return Some(def);
@@ -3636,8 +3640,9 @@ pub(crate) fn parse_static_line_inner(
     // only NARROW the set of lines that end up `Unrecognized`, never widen it.
     if let Some(rest_tp) = nom_tag_tp(&tp, "as long as ") {
         let condition_text = rest_tp.original.trim_end_matches('.');
-        let condition =
-            parse_static_condition(condition_text).unwrap_or_else(|| unparsed_gate_condition(condition_text, ConditionGatePolarity::Positive));
+        let condition = parse_static_condition(condition_text).unwrap_or_else(|| {
+            unparsed_gate_condition(condition_text, ConditionGatePolarity::Positive)
+        });
         return Some(
             StaticDefinition::continuous()
                 .affected(TargetFilter::SelfRef)
