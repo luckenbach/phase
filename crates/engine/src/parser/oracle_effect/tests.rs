@@ -72359,7 +72359,9 @@ fn walking_bulwark_comma_compound_carries_the_anchored_condition() {
     assert_eq!(
         subject[1].condition,
         Some(p3e_anchored()),
-        "C3.9: NEVER an unconditioned CanAttackWithDefender on an interposed line"
+        "an interposed line must NEVER yield an unconditioned \
+         CanAttackWithDefender — the interposed class is the permission's gate, \
+         so dropping it grants the permission unconditionally"
     );
     assert_eq!(subject[0].modifications, control[0].modifications);
     assert_eq!(subject[2].modifications, control[2].modifications);
@@ -72558,7 +72560,9 @@ fn adjacent_defender_grammars_keep_their_own_parse_on_the_effect_side() {
     assert_eq!(
         arm7_subject[0].condition,
         Some(p3e_anchored()),
-        "C3.9: the re-attached conjunct must carry the interposed class's condition"
+        "the re-attached conjunct must carry the interposed class's condition — \
+         a conjunct split off and rejoined without its gate is granted \
+         unconditionally"
     );
 
     // ARM 3 — the block-exception sibling on a targeted line. A too-greedy
