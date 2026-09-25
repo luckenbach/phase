@@ -7527,10 +7527,11 @@ mod tests {
         assert_eq!(state.objects[&id].damage_marked, 0);
     }
 
-    /// CR 508.6: cleanup snapshots this turn's attacks into
-    /// `attacked_defenders_last_turn`, keyed by the ending (active) player and
-    /// directional, so "attacked you during their last turn" can query it. A
-    /// no-attack turn overwrites only that player's entry to empty; other players'
+    /// CR 508.6 defines when a player has attacked another player. Cleanup
+    /// snapshots this turn's attacks into `attacked_defenders_last_turn` for the
+    /// ending (active) player. The record is directional, so "attacked you during
+    /// their last turn" can query it. A no-attack turn overwrites only that
+    /// player's entry to empty; other players'
     /// records persist (the skipped-player retention property).
     #[test]
     fn execute_cleanup_snapshots_attacked_defenders_last_turn() {
