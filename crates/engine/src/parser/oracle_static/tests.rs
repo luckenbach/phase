@@ -36766,8 +36766,8 @@ fn weathered_sentinels_line_is_consumed_by_the_non_attached_static_production() 
     let tp = TextPair::new(P3_WEATHERED_SENTINELS_L2, &lower);
     let def = super::evasion::parse_can_attack_despite_defender(&tp, P3_WEATHERED_SENTINELS_L2)
         .expect(
-            "production (b) — `parse_can_attack_despite_defender` — must consume this \
-             line itself; reaching here means a shadowing branch claimed it first",
+            "production (b) — `parse_can_attack_despite_defender` — must parse the \
+             Weathered Sentinels line directly",
         );
     assert_eq!(def.mode, StaticMode::CanAttackWithDefender);
     assert_eq!(def.affected, Some(TargetFilter::SelfRef));
