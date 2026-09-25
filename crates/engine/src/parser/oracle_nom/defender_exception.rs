@@ -272,7 +272,7 @@ pub(crate) fn defender_exception_ir(
     })
     // The in-tree idiom for "a hand-rolled scan declined" (e.g. `oracle.rs:226`).
     .ok_or_else(|| nom::Err::Error(OracleError::new(input, nom::error::ErrorKind::Tag)))?;
-    // CR 702.3b: the interposed segment is a PLAYER CLASS, and a player class does
+    // The interposed segment is a PLAYER CLASS, and a player class does
     // not span sentences. `scan_preceded` walks forward to the FIRST position where
     // the tail parses, with nothing stopping it stepping over a sentence terminator
     // — so a card whose LATER sentence happens to print
@@ -503,7 +503,7 @@ mod tests {
         ));
     }
 
-    /// CR 702.3b: the interposed segment is a PLAYER CLASS, and a player class does
+    /// The interposed segment is a PLAYER CLASS, and a player class does
     /// not span sentences.
     ///
     /// `scan_preceded` walks forward to the FIRST position where the
