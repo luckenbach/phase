@@ -2536,7 +2536,7 @@ fn clear_cleanup_damage(state: &mut GameState, events: &mut Vec<GameEvent>) {
 /// cleanup step begins" — either the control-reversion delayed triggers below,
 /// or a parked `deferred_triggers` batch settled at the tail of this function.
 pub fn execute_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) -> Option<WaitingFor> {
-    // CR 508.6: Snapshot this turn's attacks so "attacked you during their last
+    // Snapshot this turn's attacks so "attacked you during their last
     // turn" (Avenge / O-Kagachi / Weathered Sentinels) can query each player's
     // most recent completed turn. CR 508.6 supplies the SEMANTICS — a player has
     // "attacked [a player]" if they declared one or more creatures attacking
