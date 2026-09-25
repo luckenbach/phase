@@ -19564,7 +19564,7 @@ declare_game_state! {
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map_of_hash_set")]
     pub attacked_defenders_this_turn: HashMap<PlayerId, HashSet<PlayerId>>,
-    /// CR 508.6 + CR 514.2: For each player, the defending players they declared
+    /// CR 508.6: For each player, the defending players they declared
     /// attackers against during that player's MOST RECENT completed turn.
     /// Snapshotted from `attacked_defenders_this_turn` at cleanup
     /// (`execute_cleanup`), keyed by the ending active player, overwriting so a

@@ -6926,7 +6926,7 @@ fn rw_static_condition(x: &StaticCondition) -> RwProfile {
         StaticCondition::SpellCastWithVariantThisTurn { .. } => {
             reads_player_of(StateKind::JournalCast)
         }
-        // CR 508.6 + CR 514.2: reads the cleanup-time attack-history snapshot
+        // CR 508.6: reads the cleanup-time attack-history snapshot
         // (`attacked_defenders_last_turn`), which changes only at turn
         // boundaries. `TurnStructure` is the sequencing kind written by
         // cleanup/turn advance; conservatively depending on it invalidates the
