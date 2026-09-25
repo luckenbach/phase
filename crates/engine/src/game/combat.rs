@@ -3776,6 +3776,66 @@ fn creature_cant_attack_gated(
 /// inventing a second attribution idiom. An empty result is legitimate and means the
 /// engine could not name a carrier — the badge still renders, as it does for
 /// player-level goad (CR 701.15b), which carries no object either.
+/// CR 604.1 + CR 109.5 + CR 508.1c: does `def`, carried by `carrier_id`, name
+/// `subject` among the objects it affects?
+///
+/// `affected: None` APPLIES — an unscoped definition is intrinsic to its own source
+/// (CR 604.1), which is why the enforcement path
+/// [`local_cant_attack_def_applies`] reads a bare `None => true` too. A scoped one
+/// applies only where its filter actually matches, so display attribution and
+/// legality agree about which creature a definition reaches.
+///
+/// Delegates to `static_abilities::static_filter_matches` — the same helper
+/// `carrier_static_applies` uses — rather than re-deriving filter semantics here.
+/// The carrier/subject split is what makes this usable for REMOTE definitions: the
+/// filter is evaluated with the carrier as its source and the badged creature as
+/// the candidate, exactly as the legality authority evaluates it.
+fn definition_affects(
+    state: &GameState,
+    carrier_id: ObjectId,
+    subject: ObjectId,
+    def: &StaticDefinition,
+) -> bool {
+    match def.affected.as_ref() {
+        None => true,
+        Some(filter) => crate::game::static_abilities::static_filter_matches(
+            state,
+            &static_target_ctx(subject),
+            filter,
+            carrier_id,
+        ),
+    }
+}
+
+/// CR 702.3b + CR 508.1c: is `def` a `CanAttackWithDefender` permission whose being
+/// WITHHELD is what explains `subject` having no legal attack target?
+///
+/// Three conjuncts, and the anchor one is the load-bearing pick. A permission that
+/// does NOT name the defending player is decidable at creature level and, where it
+/// applies, it applies against every pairing — so when such a creature has no legal
+/// target the reason lies elsewhere and pointing the tooltip at the permission
+/// misdirects. Only an anchored permission ("... as long as defending player
+/// controls a Swamp") is the thing that can hold for one pairing and fail for all
+/// of them, which is exactly the state this badge reports.
+///
+/// The other two conjuncts are the ones the mode lookup alone does not buy:
+/// `functioning_static_carriers` answers only "carries this MODE", so a carrier
+/// whose permission does not name `subject` would otherwise be attributed.
+/// Callers supply the functioning gate by choosing their iterator.
+fn defender_permission_explains_no_target(
+    state: &GameState,
+    carrier_id: ObjectId,
+    subject: ObjectId,
+    def: &StaticDefinition,
+) -> bool {
+    def.mode == StaticMode::CanAttackWithDefender
+        && def
+            .condition
+            .as_ref()
+            .is_some_and(StaticCondition::needs_defending_player_anchor)
+        && definition_affects(state, carrier_id, subject, def)
+}
+
 fn no_legal_attack_target_sources(
     state: &GameState,
     obj_id: ObjectId,
@@ -3795,25 +3855,27 @@ fn no_legal_attack_target_sources(
     // here without a target to test `affected` against, and naming an unrelated
     // permanent would be worse than naming none — the badge still renders
     // unattributed in that case, as it does for player-level goad (CR 701.15b).
-    // Read the definitions UNFILTERED. Both functioning-abilities iterators decide
-    // visibility by running the gate — `active_static_definitions` with
-    // `PolarityDeferral::Skip`, and the attack-path variant with no target bound —
-    // and a defending-player-anchored gate is precisely the one that cannot be
-    // decided without a target. Either filter therefore hides the static this badge
-    // is attributing, which is why attribution has to read SHAPE, not verdict.
     //
-    // `iter_unchecked` is documented as the classification/reporting escape hatch,
-    // and this is reporting: `attacker_constraints` is display-only, asserted
-    // nowhere in legality. No rules verdict is taken from this read — it only names
-    // which object the UI should point at.
-    if obj.static_definitions.iter_unchecked().any(|sd| {
+    // `object_functioning_statics`, NOT `active_static_definitions` and NOT
+    // `iter_unchecked`. The two `active_*` iterators decide visibility by running the
+    // gate — `PolarityDeferral::Skip` evaluates an anchored condition unanchored, and
+    // the attack-path variant with no target bound defers a prohibition to `false` —
+    // so either one hides the very static this badge attributes. `iter_unchecked`
+    // avoids that but also drops CR 702.26b (phased out) and CR 113.6 (zone of
+    // function), which are decidable WITHOUT a target and whose absence let a
+    // non-functioning definition name a source. `object_functioning_statics` applies
+    // exactly those two gates and stops short of the CR 604.1 condition filter, which
+    // is the split this attribution needs.
+    if super::functioning_abilities::object_functioning_statics(obj).any(|sd| {
         matches!(
             sd.mode,
             StaticMode::CantAttack | StaticMode::CantAttackOrBlock
-        ) && sd
-            .condition
-            .as_ref()
-            .is_some_and(|c| c.needs_defending_player_anchor())
+        ) && sd.attack_defended.is_none()
+            && sd
+                .condition
+                .as_ref()
+                .is_some_and(StaticCondition::needs_defending_player_anchor)
+            && definition_affects(state, obj_id, obj_id, sd)
     }) {
         sources.push(obj_id);
     }
@@ -3821,18 +3883,33 @@ fn no_legal_attack_target_sources(
     // only then is a withheld permission the explanation.
     if obj.has_keyword(&Keyword::Defender) {
         if super::functioning_abilities::active_static_definitions_for_attack(state, obj, None)
-            .any(|sd| sd.mode == StaticMode::CanAttackWithDefender)
+            .any(|sd| defender_permission_explains_no_target(state, obj_id, obj_id, sd))
         {
             sources.push(obj_id);
         }
         // The gate memoizes the resolved carrier set, so this reuses the same
         // object list the eligibility pass already computed rather than
-        // re-running a static scan.
+        // re-running a static scan. `functioning_static_carriers` answers "who
+        // carries a functioning definition of this MODE" and nothing more, so the
+        // per-definition `affected` and anchor tests the intrinsic arm applies have
+        // to be re-asked here or an unrelated carrier — one whose permission does not
+        // name this creature — is offered as the explanation.
         sources.extend(
             gates
                 .can_attack_with_defender_carriers(state)
                 .iter()
-                .copied(),
+                .copied()
+                .filter(|&carrier_id| {
+                    state.objects.get(&carrier_id).is_some_and(|carrier| {
+                        super::functioning_abilities::object_functioning_statics(carrier).any(
+                            |sd| {
+                                defender_permission_explains_no_target(
+                                    state, carrier_id, obj_id, sd,
+                                )
+                            },
+                        )
+                    })
+                }),
         );
     }
     sources.sort_unstable_by_key(|id| id.0);
