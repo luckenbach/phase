@@ -16,7 +16,9 @@ use crate::types::ability::{
     ContinuousModification, ControllerRef, Effect, FilterProp, ObjectScope, PtValue, QuantityExpr,
     QuantityRef, StaticDefinition, TargetFilter, ThisWayCause, TypeFilter,
 };
-use crate::types::ability_visit::{nested_definitions_name_granter, token_static_grants_to_itself};
+use crate::types::ability_visit::{
+    nested_definitions_name_granter, own_fields_name_granter, token_static_grants_to_itself,
+};
 use crate::types::card_type::Supertype;
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaColor;
@@ -1428,8 +1430,8 @@ fn recognize_equip_clause(input: &str) -> OracleResult<'_, &str> {
 /// cannot bind to the object it names: the masker refused a token-name position
 /// (it would read the host); a creator-name reference reached a grant to another
 /// object (layer 6 would bind it to the token); or a token-name reference reached
-/// a grant made by the token's own text (the creation stamp would bind it to the
-/// creator).
+/// a token static's own fields or a grant made by the token's own text (the
+/// creation stamp would bind it to the creator).
 fn push_parsed_statics(
     ability_text: &str,
     token_name: &str,
@@ -1470,12 +1472,14 @@ fn push_parsed_statics(
     {
         return None;
     }
-    // CR 111.3 + CR 201.5a: a token-name reference in a grant made by the token's own text
-    // would be bound to the creator at creation, not to the token it names.
+    // CR 111.3 + CR 201.5a: a token-name reference in a token static's own fields, or in a
+    // grant made by the token's own text, would be bound to the creator at creation, not
+    // to the token it names. An own field cannot tell a token marker from a creator one.
     if token_refs > 0
-        && defs
-            .iter()
-            .any(|d| token_static_grants_to_itself(d) && nested_definitions_name_granter(d))
+        && defs.iter().any(|d| {
+            own_fields_name_granter(d)
+                || (token_static_grants_to_itself(d) && nested_definitions_name_granter(d))
+        })
     {
         return None;
     }

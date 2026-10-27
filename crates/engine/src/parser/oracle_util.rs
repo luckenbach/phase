@@ -2639,9 +2639,9 @@ fn unmask_keyword_action_walker_names(text: String, originals: &[String]) -> Str
 /// * the DISPLAY channel — [`render_granting_self_reference`], invoked from the
 ///   three production parse entry points `parser::oracle::parse_oracle_text`,
 ///   `game::effects::token::catalog_rules_text_abilities` and
-///   `parser::oracle_effect::token::push_parsed_statics` (which renders with the
-///   token's printed name), which renders the marker as the granting object's
-///   PRINTED name.
+///   `parser::oracle_effect::token::push_parsed_statics`, which render the
+///   marker as the granting object's PRINTED name (the token's, at the token
+///   entry point).
 ///
 /// Naming all three entry points here makes the leak surface auditable from the
 /// constant itself. The standing completeness authority for the display channel

@@ -6979,9 +6979,53 @@ mod toggo_rock {
             assert!(json.contains("\"type\":\"Unimplemented\""), "{json}");
         }
 
-        // Paired positive: the same frame naming the creator lowers, bound at creation.
-        let creator_named = own_ability_grant.replace("Sacrifice Rock", "Sacrifice Foo Smith");
-        let parsed = parse_creator(&creator_named, "Foo Smith");
+        // Paired positives: each frame naming the creator lowers, bound at creation.
+        for oracle in [&own_ability_grant, &own_static_grant] {
+            let creator_named = oracle.replace("Sacrifice Rock", "Sacrifice Foo Smith");
+            let parsed = parse_creator(&creator_named, "Foo Smith");
+            assert!(trigger_lowers_token(&parsed), "{parsed:#?}");
+            let json = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+            assert!(json.contains("\"type\":\"GrantingObject"), "{json}");
+        }
+    }
+
+    /// CR 111.3 + CR 201.5a: a quoted grant body that is a simple restriction collapses
+    /// into the token static's own fields, which the creation stamp binds to the creator;
+    /// a token-name reference there would be bound to the creator, so the token clause
+    /// does not lower (honest red).
+    #[test]
+    fn token_static_own_field_naming_the_token_does_not_lower() {
+        const TOGGO_GRANT: &str = "\"Equipped creature has '{1}, {T}, Sacrifice Rock: This creature deals 2 damage to any target'\"";
+        let grant_to_another = TOGGO.replace(
+            TOGGO_GRANT,
+            "\"Equipped creature has 'This creature can't be blocked by artifacts other than Rock.'\"",
+        );
+        let grant_to_itself = TOGGO.replace(
+            TOGGO_GRANT,
+            "\"This artifact has 'This artifact can't be blocked by artifacts other than Rock.'\"",
+        );
+        for oracle in [&grant_to_another, &grant_to_itself] {
+            assert_ne!(
+                oracle.as_str(),
+                TOGGO,
+                "reach-guard: the fixture replaced the grant"
+            );
+            let parsed = parse_creator(oracle, "Foo Smith");
+            assert!(!trigger_lowers_token(&parsed), "{parsed:#?}");
+            let json = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+            assert!(json.contains("\"type\":\"Unimplemented\""), "{json}");
+
+            // Paired positive: the same frame naming the creator lowers, bound at creation.
+            let creator_named = oracle.replace("other than Rock", "other than Foo Smith");
+            let parsed = parse_creator(&creator_named, "Foo Smith");
+            assert!(trigger_lowers_token(&parsed), "{parsed:#?}");
+            let json = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+            assert!(json.contains("\"type\":\"GrantingObject"), "{json}");
+        }
+
+        // Paired positive: the same creator and frame with "Sacrifice Rock" in a nested
+        // grant lowers with the granter.
+        let parsed = parse_creator(TOGGO, "Foo Smith");
         assert!(trigger_lowers_token(&parsed), "{parsed:#?}");
         let json = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
         assert!(json.contains("\"type\":\"GrantingObject"), "{json}");
