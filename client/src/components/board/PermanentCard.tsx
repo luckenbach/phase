@@ -518,18 +518,21 @@ export const PermanentCard = memo(function PermanentCard({
   const attachmentsLifted =
     obj.attachments.length > 0
     && (attachmentsLiftedByAncestor || isInHoveredAttachmentTree);
-  // A multi-pick decision ("Tap X untapped artifacts", "sacrifice two", crew,
-  // proliferate) publishes no one-step fan pick — one pick is not its whole
-  // answer — so `attachmentsActionable` stays false while an attachment is
-  // still a candidate the player toggles in place. Keep the peek stack
-  // expanded for it. The candidate sets are the engine-provided board
-  // affordances the attachment's own click branches already read.
-  const attachmentsChoosable = obj.attachments.some(
-    (attachId) =>
-      boardChoiceObjectIds.has(attachId)
-      || selectableManaCostCreatureIds.has(attachId)
-      || validTargetObjectIds.has(attachId),
-  );
+  // A multi-pick decision ("Tap X untapped artifacts", "sacrifice two", crew)
+  // publishes no one-step fan pick — one pick is not its whole answer — so
+  // `attachmentsActionable` stays false while an attachment is still a
+  // candidate the player toggles in place. Keep the peek stack expanded for
+  // it. Like `attachmentsActionable`, this reads the engine's whole-subtree
+  // membership, so a candidate nested under a later attachment is reachable
+  // too; the candidate sets are the engine-provided board affordances the
+  // attachment's own click branches already read.
+  const attachmentsChoosable =
+    attachmentView?.cards.some(
+      (card) =>
+        boardChoiceObjectIds.has(card.objectId)
+        || selectableManaCostCreatureIds.has(card.objectId)
+        || validTargetObjectIds.has(card.objectId),
+    ) ?? false;
   const attachmentsExpanded =
     obj.attachments.length <= 1 || isSelected || attachmentsActionable || attachmentsChoosable;
   const visibleAttachmentIds = attachmentsExpanded ? obj.attachments : obj.attachments.slice(0, 1);

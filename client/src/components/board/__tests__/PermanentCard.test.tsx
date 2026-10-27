@@ -696,14 +696,17 @@ describe("PermanentCard", () => {
 
   // A multi-pick decision (e.g. "Tap X untapped artifacts") publishes no
   // one-step fan pick, so `attachmentsActionable` is false — yet the attached
-  // candidate must stay reachable in place rather than collapse behind "+N".
-  it("expands multiple direct attachments while one is a candidate of a board choice without a fan pick", () => {
+  // candidate must stay reachable in place rather than collapse behind "+N" —
+  // whether it hangs directly on the host or is nested under a later
+  // attachment (the engine's membership is the whole subtree).
+  it("expands multiple attachments while one in the subtree is a candidate of a board choice without a fan pick", () => {
     const gameState = makeState();
     gameState.objects[1].attachments = [2, 4];
     gameState.objects[4] = makeObject({
       id: 4,
       card_id: 400,
       attached_to: { type: "Object", data: 1 },
+      attachments: [5],
       name: "Second Equipment",
       power: null,
       toughness: null,
@@ -713,17 +716,42 @@ describe("PermanentCard", () => {
       color: [],
       base_color: [],
     });
-    gameState.battlefield = [1, 2, 3, 4];
-    useGameStore.setState({ gameState, waitingFor: gameState.waiting_for });
+    gameState.objects[5] = makeObject({
+      id: 5,
+      card_id: 500,
+      attached_to: { type: "Object", data: 4 },
+      attachments: [],
+      name: "Nested Aura",
+      power: null,
+      toughness: null,
+      base_power: null,
+      base_toughness: null,
+      card_types: { supertypes: [], core_types: ["Enchantment"], subtypes: ["Aura"] },
+      color: [],
+      base_color: [],
+    });
+    gameState.battlefield = [1, 2, 3, 4, 5];
+    // Membership only: the multi-pick decision publishes no fan pick.
+    useGameStore.setState({
+      gameState,
+      waitingFor: gameState.waiting_for,
+      viewerInteraction: membershipOnly([2, 3, 4, 5]),
+    });
 
     // Reach guard: with no candidate the stack stays collapsed.
     const collapsed = renderPermanent();
     expect(collapsed.container.querySelector('[data-object-id="4"]')).toBeNull();
+    expect(collapsed.container.textContent).toContain("+1");
     collapsed.unmount();
 
-    const { container } = renderPermanent(new Set(), new Set(), new Set([4]));
-    expect(container.querySelector('[data-object-id="4"]')).not.toBeNull();
-    expect(container.textContent).not.toContain("+1");
+    const direct = renderPermanent(new Set(), new Set(), new Set([4]));
+    expect(direct.container.querySelector('[data-object-id="4"]')).not.toBeNull();
+    expect(direct.container.textContent).not.toContain("+1");
+    direct.unmount();
+
+    const nested = renderPermanent(new Set(), new Set(), new Set([5]));
+    expect(nested.container.querySelector('[data-object-id="5"]')).not.toBeNull();
+    expect(nested.container.textContent).not.toContain("+1");
   });
 
   it("opens the attachment fan from the collapsed-count button without selecting the host", () => {
