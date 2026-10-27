@@ -694,6 +694,38 @@ describe("PermanentCard", () => {
     expect(container.querySelector('[data-object-id="4"]')).not.toBeNull();
   });
 
+  // A multi-pick decision (e.g. "Tap X untapped artifacts") publishes no
+  // one-step fan pick, so `attachmentsActionable` is false — yet the attached
+  // candidate must stay reachable in place rather than collapse behind "+N".
+  it("expands multiple direct attachments while one is a candidate of a board choice without a fan pick", () => {
+    const gameState = makeState();
+    gameState.objects[1].attachments = [2, 4];
+    gameState.objects[4] = makeObject({
+      id: 4,
+      card_id: 400,
+      attached_to: { type: "Object", data: 1 },
+      name: "Second Equipment",
+      power: null,
+      toughness: null,
+      base_power: null,
+      base_toughness: null,
+      card_types: { supertypes: [], core_types: ["Artifact"], subtypes: ["Equipment"] },
+      color: [],
+      base_color: [],
+    });
+    gameState.battlefield = [1, 2, 3, 4];
+    useGameStore.setState({ gameState, waitingFor: gameState.waiting_for });
+
+    // Reach guard: with no candidate the stack stays collapsed.
+    const collapsed = renderPermanent();
+    expect(collapsed.container.querySelector('[data-object-id="4"]')).toBeNull();
+    collapsed.unmount();
+
+    const { container } = renderPermanent(new Set(), new Set(), new Set([4]));
+    expect(container.querySelector('[data-object-id="4"]')).not.toBeNull();
+    expect(container.textContent).not.toContain("+1");
+  });
+
   it("opens the attachment fan from the collapsed-count button without selecting the host", () => {
     const gameState = makeState();
     gameState.objects[1].attachments = [2, 4];

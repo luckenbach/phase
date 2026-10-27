@@ -518,7 +518,20 @@ export const PermanentCard = memo(function PermanentCard({
   const attachmentsLifted =
     obj.attachments.length > 0
     && (attachmentsLiftedByAncestor || isInHoveredAttachmentTree);
-  const attachmentsExpanded = obj.attachments.length <= 1 || isSelected || attachmentsActionable;
+  // A multi-pick decision ("Tap X untapped artifacts", "sacrifice two", crew,
+  // proliferate) publishes no one-step fan pick — one pick is not its whole
+  // answer — so `attachmentsActionable` stays false while an attachment is
+  // still a candidate the player toggles in place. Keep the peek stack
+  // expanded for it. The candidate sets are the engine-provided board
+  // affordances the attachment's own click branches already read.
+  const attachmentsChoosable = obj.attachments.some(
+    (attachId) =>
+      boardChoiceObjectIds.has(attachId)
+      || selectableManaCostCreatureIds.has(attachId)
+      || validTargetObjectIds.has(attachId),
+  );
+  const attachmentsExpanded =
+    obj.attachments.length <= 1 || isSelected || attachmentsActionable || attachmentsChoosable;
   const visibleAttachmentIds = attachmentsExpanded ? obj.attachments : obj.attachments.slice(0, 1);
   const attachmentPathIds = new Set([...attachmentRenderPath, objectId]);
   const renderableAttachmentIds = visibleAttachmentIds.filter((id) => !attachmentPathIds.has(id));
