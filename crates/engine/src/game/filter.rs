@@ -7660,7 +7660,7 @@ pub(crate) fn source_subject_matches_filter(
 /// transitions, so a missing entry means no record survives — never that a
 /// later object at the same storage id may answer in the captured
 /// incarnation's place.
-fn exit_lki_for_incarnation(
+pub(crate) fn exit_lki_for_incarnation(
     state: &GameState,
     object_id: ObjectId,
     incarnation: u64,
@@ -8796,12 +8796,14 @@ fn filter_inner_for_object(
         // CR 615: compound damage recipient, lowered to `DamageTargetFilter`
         // before runtime — never object-matched here.
         | TargetFilter::ControllerAndControlledPermanents { .. } => false,
-        // CR 201.2 + CR 602.5: "card with the chosen name" — match against source's
-        // ChosenAttribute::CardName. The chosen name comes from a player UI prompt;
-        // the comparison must mirror the spell-cast prohibition path
-        // (`cant_cast_filter_matches`) which uses `eq_ignore_ascii_case`. Without
-        // parity, Pithing Needle's activation-prohibition leg would silently miss
-        // names that differ only by casing from the player's typed input.
+        // CR 201.2a + CR 602.5: "card with the chosen name" — match against source's
+        // ChosenAttribute::CardName. The chosen name comes from a player UI prompt
+        // that accepts any casing (Unicode-aware), so compare via
+        // `card_names_match` — the same comparison the spell-cast prohibition
+        // path (`cant_cast_filter_matches`) uses. Without parity, Pithing
+        // Needle's activation-prohibition leg or Brain Pry's discard would
+        // silently miss names that differ only by casing ("éowyn" / "Éowyn")
+        // from the player's typed input.
         TargetFilter::HasChosenName => {
             let source_ctx = source_context_from_filter(
                 state,
@@ -8817,7 +8819,7 @@ fn filter_inner_for_object(
                 ChosenAttribute::CardName(n) => Some(n.as_str()),
                 _ => None,
             });
-            chosen_name.is_some_and(|name| obj.name.eq_ignore_ascii_case(name))
+            chosen_name.is_some_and(|name| card_names_match(&obj.name, name))
         }
         // CR 609.7a: "the chosen source" — match the ObjectId selected by
         // the prior damage-source choice while its continuation resolves.
@@ -9123,7 +9125,7 @@ fn zone_change_filter_inner(
                     ChosenAttribute::CardName(n) => Some(n.as_str()),
                     _ => None,
             });
-            chosen_name.is_some_and(|name| record.name.eq_ignore_ascii_case(name))
+            chosen_name.is_some_and(|name| card_names_match(&record.name, name))
         }
         // CR 607.2d + CR 603.10a + CR 400.7: the remembered object on the
         // leaves-the-battlefield look-back path. The candidate occurrence is the
@@ -10523,6 +10525,7 @@ fn source_context_from_filter<'a>(
                     is_suspected: false,
                     was_prepared: false,
                     attachments: Vec::new(),
+                    intensity: 0,
                 });
             (
                 lki,
@@ -12963,6 +12966,7 @@ fn source_context_from_spell_filter(context: SpellFilterContext<'_>) -> SourceCo
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            intensity: 0,
         });
     SourceContext {
         id: context.source_id,
@@ -16149,6 +16153,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                intensity: 0,
             },
         );
 
@@ -23052,6 +23057,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            intensity: 0,
         };
         let filter =
             TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::Cmc {
@@ -23101,6 +23107,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            intensity: 0,
         };
         let entrant = ObjectId(700);
         let filter = TargetFilter::Typed(
@@ -23240,6 +23247,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            intensity: 0,
         };
         let filter =
             TargetFilter::Typed(
@@ -23387,6 +23395,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            intensity: 0,
         };
 
         // Left the battlefield TAPPED.
@@ -24377,6 +24386,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            intensity: 0,
         };
         let land_lki = LKISnapshot {
             name: "Test Land".to_string(),
@@ -24399,6 +24409,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            intensity: 0,
         };
 
         let filter =
@@ -24516,6 +24527,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            intensity: 0,
         };
         let filter = TargetFilter::Typed(
             TypedFilter::default().properties(vec![FilterProp::SameNameAsParentTarget]),
@@ -24660,6 +24672,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                intensity: 0,
             },
         );
 
@@ -24732,6 +24745,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                intensity: 0,
             },
         );
 
@@ -27981,6 +27995,7 @@ mod attached_set_host_filter_tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            intensity: 0,
         }
     }
 
@@ -28082,6 +28097,7 @@ mod attached_set_host_filter_tests {
                     controller: PlayerId(1),
                     kind: crate::types::ability::AttachmentKind::Aura,
                 }],
+                intensity: 0,
             },
         );
         state.objects.remove(&host);

@@ -33836,7 +33836,8 @@ fn cant_cast_filter_matches_for(
                 ChosenAttribute::CardName(n) => Some(n.as_str()),
                 _ => None,
             });
-            chosen_name.is_some_and(|name| name.eq_ignore_ascii_case(&spell_obj.name))
+            chosen_name
+                .is_some_and(|name| crate::game::filter::card_names_match(name, &spell_obj.name))
         }
         // Everything else — including IsChosenColor / IsChosenCardType properties —
         // flows through the shared source-aware typed-filter conjunction.
