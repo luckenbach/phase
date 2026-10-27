@@ -6639,7 +6639,7 @@ mod toggo_rock {
             .collect()
     }
 
-    /// CR 207.2c + CR 603.2: plays the Forest from hand and resolves every landfall trigger.
+    /// CR 305.1 + CR 603.2: plays the Forest from hand and resolves every landfall trigger.
     fn play_forest(runner: &mut GameRunner, forest: ObjectId) {
         let card_id = runner.state().objects[&forest].card_id;
         runner
