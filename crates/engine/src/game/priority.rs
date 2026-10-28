@@ -11,7 +11,7 @@ use crate::types::events::GameEvent;
 use crate::types::game_state::{
     AutoPassMode, GameState, PriorityPassingMode, StackEntry, WaitingFor,
 };
-use crate::types::identifiers::ObjectId;
+use crate::types::identifiers::{ObjectId, TrackedSetId};
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 
@@ -535,8 +535,11 @@ impl<'a> DepartureReach<'a> {
         }
         // `Any` is the operand of an instruction that names no population of its
         // own (the card a search found, put into a hand); it describes no
-        // permanent this instruction moves off the battlefield.
-        if matches!(filter, TargetFilter::Any) {
+        // permanent this instruction moves off the battlefield. Likewise a
+        // referent the chain itself produces as it resolves ("those cards" its
+        // reveal publishes, "that token" it creates, CR 608.2c) names nothing
+        // yet: read now, it would name an earlier resolution's objects.
+        if is_chain_produced_referent(filter) {
             return None;
         }
         let Some(scope) = &ability.player_scope else {
@@ -567,6 +570,23 @@ impl<'a> DepartureReach<'a> {
                 matches_target_filter(state, object, filter, &FilterContext::from_ability(context))
             }
         }
+    }
+}
+
+/// CR 608.2c: an operand naming no population of its own (`Any`) or one the
+/// resolving chain publishes as it goes: the chain's tracked-set sentinel and
+/// the last created / revealed / zone-changed objects. A concrete tracked set,
+/// published before this object was put on the stack, is not one of them.
+fn is_chain_produced_referent(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Any
+        | TargetFilter::LastCreated
+        | TargetFilter::LastRevealed
+        | TargetFilter::LastZoneChanged => true,
+        TargetFilter::TrackedSet { id } | TargetFilter::TrackedSetFiltered { id, .. } => {
+            *id == TrackedSetId(0)
+        }
+        _ => false,
     }
 }
 
@@ -1658,6 +1678,57 @@ mod tests {
             assert_eq!(
                 verdict(&state, &sacrifice_it_otherwise_destroy(TRIGGER_SOURCE)),
                 StandingPriorityPass::Granted
+            );
+        }
+
+        /// CR 608.2c: "put the rest on the bottom" moves the cards this chain
+        /// reveals, not whatever an earlier resolution last published.
+        #[test]
+        fn chain_published_referents_do_not_read_an_earlier_resolution() {
+            let (mut state, forest, _) = board();
+            let rest_on_bottom = own_top(
+                Effect::ChangeZoneAll {
+                    origin: None,
+                    destination: Zone::Library,
+                    target: TargetFilter::TrackedSet {
+                        id: TrackedSetId(0),
+                    },
+                    enters_under: None,
+                    enter_tapped: EtbTapState::Unspecified,
+                    enters_attacking: false,
+                    enter_with_counters: vec![],
+                    face_down_profile: None,
+                    library_position: None,
+                    library_shuffle: crate::types::ability::MassLibraryShuffleMode::default(),
+                    random_order: false,
+                },
+                vec![],
+            );
+            assert_eq!(
+                verdict(&state, &rest_on_bottom),
+                StandingPriorityPass::Granted
+            );
+            // An earlier resolution published a set holding the Forest.
+            crate::game::effects::publish_tracked_set(&mut state, vec![forest]);
+            state.chain_tracked_set_id = None;
+            assert_eq!(
+                verdict(&state, &rest_on_bottom),
+                StandingPriorityPass::Granted
+            );
+            // Reach guard: a concrete set published before this object holds.
+            let concrete = crate::game::targeting::latest_tracked_set_id(&state)
+                .expect("the set was published");
+            let sacrifice_those = own_top(
+                Effect::Sacrifice {
+                    target: TargetFilter::TrackedSet { id: concrete },
+                    count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                    min_count: 0,
+                },
+                vec![],
+            );
+            assert_eq!(
+                verdict(&state, &sacrifice_those),
+                StandingPriorityPass::Held
             );
         }
 
