@@ -2645,7 +2645,7 @@ fn own_bounce_of_your_land(forest_tapped: bool) -> GameState {
     state
 }
 
-/// CR 117.3c + CR 605.3a: an own top that can move one of the player's
+/// CR 117.1d + CR 605.3a: an own top that can move one of the player's
 /// activatable mana sources off the battlefield is `Held`, not a standing pass,
 /// so a rechecking session pauses an unverified representative's live window
 /// and authorizes no skipped window over it.
@@ -2689,7 +2689,7 @@ fn recheck_session_pauses_an_own_top_held_for_a_removable_mana_source() {
     ));
 }
 
-/// CR 117.3c + CR 605.3a: a turn-boundary session breaks on an own top that is
+/// CR 117.1d + CR 605.3a: a turn-boundary session breaks on an own top that is
 /// `Held` for a removable mana source, and keeps passing own tops otherwise.
 #[test]
 fn until_end_of_turn_breaks_on_an_own_top_held_for_a_removable_mana_source() {

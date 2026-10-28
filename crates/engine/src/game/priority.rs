@@ -429,8 +429,10 @@ fn resolution_can_remove_activatable_mana_source(
         return false;
     }
     // `None`: `resolve_top` would not run the chain as it stands (a false
-    // intervening-if, a missing or illegal declared target), so it moves nothing
-    // this window can foresee.
+    // intervening-if, a missing required target), or a declared target is no
+    // longer legal. A partly illegal target set still resolves for its legal
+    // targets (CR 608.2b), so that case keeps the standing pass: an accepted
+    // under-approximation.
     let Some((board, prepared)) = resolution_board(state, top, root) else {
         return false;
     };
@@ -488,7 +490,9 @@ impl<'a> DepartureReach<'a> {
     ///   `player_scope` instruction applies once per scoped player with that
     ///   player as its controller (CR 109.5), so it reaches `player`'s
     ///   permanents only when `player` is in scope, read from `player`'s own
-    ///   iteration.
+    ///   iteration. Membership is read from the instruction's own targets, so a
+    ///   scope anchored on a target declared above it reads none (an accepted
+    ///   under-approximation).
     ///
     /// `None` when the instruction can move none of `player`'s permanents.
     fn of(state: &GameState, player: PlayerId, departure: Departure<'a>) -> Option<Self> {
@@ -528,6 +532,12 @@ impl<'a> DepartureReach<'a> {
         }
         if matches!(filter, TargetFilter::ParentTarget) {
             return Some(Self::Objects(vec![ability.source_id]));
+        }
+        // `Any` is the operand of an instruction that names no population of its
+        // own (the card a search found, put into a hand); it describes no
+        // permanent this instruction moves off the battlefield.
+        if matches!(filter, TargetFilter::Any) {
+            return None;
         }
         let Some(scope) = &ability.player_scope else {
             return Some(Self::Described {
@@ -1424,6 +1434,31 @@ mod tests {
                 vec![],
             );
             assert_eq!(verdict(&state, &put_lands), StandingPriorityPass::Granted);
+
+            // A search's "put that card into your hand": no origin, an `Any`
+            // operand naming the found card.
+            let found_card_to_hand = own_top(
+                Effect::ChangeZone {
+                    origin: None,
+                    destination: Zone::Hand,
+                    target: TargetFilter::Any,
+                    owner_library: false,
+                    enter_transformed: false,
+                    enters_under: None,
+                    enter_tapped: EtbTapState::Unspecified,
+                    enters_attacking: false,
+                    up_to: false,
+                    enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
+                    face_down_profile: None,
+                    enters_modified_if: None,
+                },
+                vec![],
+            );
+            assert_eq!(
+                verdict(&state, &found_card_to_hand),
+                StandingPriorityPass::Granted
+            );
         }
 
         /// Coral Atoll class: the land's own trigger sacrifices it.
@@ -1662,10 +1697,12 @@ mod tests {
                 StandingPriorityPass::Granted
             );
             // "Up to one target land" with no target chosen moves nothing.
-            assert_eq!(
-                verdict(&state, &destroy(vec![])),
-                StandingPriorityPass::Granted
-            );
+            let mut up_to_one = destroy(vec![]);
+            up_to_one.ability_mut().unwrap().optional_targeting = true;
+            // Reach guard: the board is prepared, so the verdict comes from
+            // the empty announced slot, not from a refused resolution.
+            assert!(resolution_board(&state, &up_to_one, up_to_one.ability().unwrap()).is_some());
+            assert_eq!(verdict(&state, &up_to_one), StandingPriorityPass::Granted);
         }
 
         /// CR 109.5: a `player_scope` sacrifice applies with each scoped player as
