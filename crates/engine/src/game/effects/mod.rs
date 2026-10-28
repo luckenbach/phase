@@ -21483,42 +21483,7 @@ fn resolve_chain_body(
             ability.starting_with.clone(),
             controller,
         );
-        let matching_players: Vec<PlayerId> = match scope {
-            PlayerFilter::AllExcept { .. }
-            | PlayerFilter::ParentObjectTargetController
-            | PlayerFilter::ParentObjectTargetOwner
-            | PlayerFilter::AnyOf { .. }
-            | PlayerFilter::TargetPlayer => {
-                // CR 608.2c + CR 109.4 + CR 608.2h: these anchors are all
-                // ability-target references — the `AllExcept` exclude anchor and the
-                // direct `ParentObjectTargetController` / `ParentObjectTargetOwner`
-                // scopes (e.g. Declaration in Stone's "That player investigates",
-                // where "that player" = the controller of the exiled target). The
-                // generic `matches_player_scope` predicate cannot resolve them (it
-                // carries no `ResolvedAbility`, so `parent_target_controller`'s
-                // last-known-information lookup over `ability.targets` is
-                // unavailable). Route through the ability-aware
-                // `speed_effects::players_for_filter`, then re-impose APNAP order by
-                // intersecting against the apnap sequence. CR 115.1 + CR 101.4:
-                // `AnyOf` resolves every member ability-aware; `TargetPlayer` reads
-                // `ability.targets`.
-                let set =
-                    crate::game::effects::speed_effects::players_for_filter(state, scope, ability);
-                apnap.into_iter().filter(|pid| set.contains(pid)).collect()
-            }
-            PlayerFilter::ChosenPlayer { index } => ability
-                .chosen_players
-                .get(*index as usize)
-                .copied()
-                .map(|chosen| apnap.into_iter().filter(|pid| *pid == chosen).collect())
-                .unwrap_or_default(),
-            _ => apnap
-                .into_iter()
-                .filter(|pid| {
-                    matches_player_scope(state, *pid, scope, controller, ability.source_id)
-                })
-                .collect(),
-        };
+        let matching_players = player_scope_members(state, scope, ability, apnap);
         // CR 101.4 + CR 118.12a: A scoped token instruction whose
         // each player may avert the result by sacrificing has one aggregate
         // outcome, not one token creation per iteration. Let its dedicated
@@ -25751,10 +25716,56 @@ fn append_after_every_route(leg: &mut ResolvedAbility, next: ResolvedAbility) {
     }
 }
 
+/// CR 101.4 + CR 109.5 + CR 608.2c: the players a `player_scope` instruction
+/// runs for, in `apnap` order.
+pub(crate) fn player_scope_members(
+    state: &GameState,
+    scope: &PlayerFilter,
+    ability: &ResolvedAbility,
+    apnap: Vec<PlayerId>,
+) -> Vec<PlayerId> {
+    match scope {
+        PlayerFilter::AllExcept { .. }
+        | PlayerFilter::ParentObjectTargetController
+        | PlayerFilter::ParentObjectTargetOwner
+        | PlayerFilter::AnyOf { .. }
+        | PlayerFilter::TargetPlayer => {
+            // CR 608.2c + CR 109.4 + CR 608.2h: these anchors are all
+            // ability-target references — the `AllExcept` exclude anchor and the
+            // direct `ParentObjectTargetController` / `ParentObjectTargetOwner`
+            // scopes (e.g. Declaration in Stone's "That player investigates",
+            // where "that player" = the controller of the exiled target). The
+            // generic `matches_player_scope` predicate cannot resolve them (it
+            // carries no `ResolvedAbility`, so `parent_target_controller`'s
+            // last-known-information lookup over `ability.targets` is
+            // unavailable). Route through the ability-aware
+            // `speed_effects::players_for_filter`, then re-impose APNAP order by
+            // intersecting against the apnap sequence. CR 115.1 + CR 101.4:
+            // `AnyOf` resolves every member ability-aware; `TargetPlayer` reads
+            // `ability.targets`.
+            let set =
+                crate::game::effects::speed_effects::players_for_filter(state, scope, ability);
+            apnap.into_iter().filter(|pid| set.contains(pid)).collect()
+        }
+        PlayerFilter::ChosenPlayer { index } => ability
+            .chosen_players
+            .get(*index as usize)
+            .copied()
+            .map(|chosen| apnap.into_iter().filter(|pid| *pid == chosen).collect())
+            .unwrap_or_default(),
+        _ => apnap
+            .into_iter()
+            .filter(|pid| {
+                matches_player_scope(state, *pid, scope, ability.controller, ability.source_id)
+            })
+            .collect(),
+    }
+}
+
 /// CR 608.2 + CR 109.5: `template` bound to run for `seat`. The scoped player is
 /// the acting controller for the whole per-player chain; the printed controller
 /// stays in `original_controller` so "you" references are stable.
-fn bind_scoped_seat(
+pub(crate) fn bind_scoped_seat(
     template: &ResolvedAbility,
     controller: PlayerId,
     seat: PlayerId,

@@ -2090,7 +2090,7 @@ pub fn auto_pass_recommended(state: &GameState, actions: &[GameAction]) -> bool 
     // so the recommendation and the engine-side pass cannot disagree about the
     // same window. A yield or own object outranks every castability and
     // meaningful-action hold below, including the issue #4388 opponent-turn
-    // mana-window hold (MTGA parity). CR 117.3c + CR 605.3a: an own object
+    // mana-window hold (MTGA parity). CR 117.1d + CR 605.3a: an own object
     // that can move one of the player's activatable mana sources off the
     // battlefield holds instead — the rungs below never count a mana activation
     // as meaningful, so falling through would still pass that window.

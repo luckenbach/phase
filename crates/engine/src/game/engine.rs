@@ -10042,10 +10042,11 @@ fn priority_auto_pass_decision(state: &GameState, player: PlayerId) -> AutoPassD
             // CR 117.3d: An opponent-controlled top-of-stack normally ends the
             // session so the player can respond — unless they have pre-committed
             // to yield priority for that exact triggered ability, in which case
-            // the session keeps auto-passing through it. CR 117.3c + CR 605.3a:
+            // the session keeps auto-passing through it. CR 117.1d + CR 605.3a:
             // the player's own object that can move one of their activatable
             // mana sources off the battlefield (`Held`) ends it too, since that
-            // activation is lost once the object resolves. The standing rungs
+            // activation is lost once the object resolves. (`UntilStackEmpty` is
+            // consent to resolve the stack itself, so it passes through.) The standing rungs
             // are `priority::standing_priority_pass`'s; Full Control already
             // returned above, so `Withheld` cannot reach this arm.
             let top_needs_response = state.stack.last().is_some_and(|top| {
@@ -10608,7 +10609,7 @@ fn stack_resolution_session_participant_authorizes_pass(
         // the session's own representative's included.
         priority::StandingPriorityPass::Withheld => return false,
         priority::StandingPriorityPass::Granted => true,
-        // CR 117.3c + CR 605.3a: an own object that can remove an activatable
+        // CR 117.1d + CR 605.3a: an own object that can remove an activatable
         // mana source is no standing pass; only explicit consent skips it.
         priority::StandingPriorityPass::Held | priority::StandingPriorityPass::Undecided => false,
     };

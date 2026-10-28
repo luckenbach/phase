@@ -9,13 +9,14 @@ use crate::types::ability::{
 use crate::types::actions::GameAction;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    AutoPassMode, GameState, PriorityPassingMode, StackEntry, StackEntryKind, WaitingFor,
+    AutoPassMode, GameState, PriorityPassingMode, StackEntry, WaitingFor,
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 
-use super::effects::speed_effects::players_for_filter;
+use super::effects::stack_reach::resolution_board;
+use super::effects::{bind_scoped_seat, player_scope_members};
 use super::mana_sources;
 use super::players;
 use super::precast_copy_shortcut;
@@ -354,9 +355,13 @@ pub(crate) enum StandingPriorityPass {
     /// the top triggered ability, or the player's own object on top when it is
     /// not `Held`.
     Granted,
-    /// CR 117.3b + CR 117.3c + CR 605.3a: the player's own object is on top, but resolving
+    /// CR 117.1d + CR 605.3a: the player's own object is on top, but resolving
     /// it can move a permanent whose mana ability they can activate now off the
-    /// battlefield (CR 400.7), so the window is kept for that activation.
+    /// battlefield (CR 400.7), so the window is kept for that activation. Kept
+    /// unconditionally: the mana stays until the step ends (CR 106.4), and what
+    /// it can pay for once the object resolves (a sorcery-speed spell after a
+    /// karoo returns itself) is not castable now, so no castability test here
+    /// can tell. Opponent objects are not covered; they fall to the ladder.
     Held,
     /// No standing answer; the window needs a fresh decision.
     Undecided,
@@ -394,15 +399,17 @@ pub(crate) fn standing_priority_pass(
     }
 }
 
-/// CR 117.3b + CR 117.3c + CR 605.3a + CR 400.7: whether resolving `top` can
-/// move a permanent with a mana ability `player` can activate now off the
-/// battlefield. Once it moves, the permanent is a new object (CR 400.7) and that
-/// mana is out of reach, so this is the one window in which the activation is
-/// possible.
+/// CR 117.1d + CR 605.3a + CR 400.7: whether resolving `top` can move a
+/// permanent with a mana ability `player` can activate now off the battlefield.
+/// Once it moves, the permanent is a new object (CR 400.7) and that mana is out
+/// of reach, so this is the one window in which the activation is possible.
 ///
 /// An instruction's battlefield departures are named by
 /// [`battlefield_departure_slot`]; [`DepartureReach::of`] decides which objects
-/// each one can move.
+/// each one can move. The chain is read on the board `stack::resolve_top`
+/// prepares just before its first instruction runs
+/// (`stack_reach::resolution_board`), so trigger-event references, the event
+/// batch and the resolving entry read exactly what resolution will.
 fn resolution_can_remove_activatable_mana_source(
     state: &GameState,
     player: PlayerId,
@@ -411,43 +418,41 @@ fn resolution_can_remove_activatable_mana_source(
     let Some(root) = top.ability() else {
         return false;
     };
-    let mut departures = Vec::new();
-    collect_battlefield_departures(root, &[], &mut departures);
-    if departures.is_empty() {
+    if !chain_has_battlefield_departure(root) {
         return false;
     }
-    let trigger_event = match &top.kind {
-        StackEntryKind::TriggeredAbility { trigger_event, .. } => trigger_event.as_ref(),
-        StackEntryKind::Spell { .. }
-        | StackEntryKind::ActivatedAbility { .. }
-        | StackEntryKind::KeywordAction { .. }
-        | StackEntryKind::CombatDamage { .. } => None,
-    };
-    // CR 608.2k + CR 608.2: event-relative references ("that player", "that
-    // creature") read the triggering event, which the resolver installs as
-    // `current_trigger_event` while the trigger resolves; read them in that
-    // same frame.
-    let resolution_frame;
-    let frame = match trigger_event {
-        Some(event) if state.current_trigger_event.as_ref() != Some(event) => {
-            let mut projected = state.clone();
-            projected.current_trigger_event = Some(event.clone());
-            resolution_frame = projected;
-            &resolution_frame
-        }
-        Some(_) | None => state,
-    };
-    let reaches: Vec<DepartureReach<'_>> = departures
-        .into_iter()
-        .filter_map(|departure| DepartureReach::of(frame, player, departure, trigger_event))
-        .collect();
-    if reaches.is_empty() {
-        return false;
-    }
-    mana_sources::activatable_mana_actions_for_player(state, player)
+    let sources: Vec<ObjectId> = mana_sources::activatable_mana_actions_for_player(state, player)
         .iter()
         .filter_map(GameAction::source_object)
-        .any(|source| reaches.iter().any(|reach| reach.contains(frame, source)))
+        .collect();
+    if sources.is_empty() {
+        return false;
+    }
+    // `None`: `resolve_top` would not run the chain as it stands (a false
+    // intervening-if, a missing or illegal declared target), so it moves nothing
+    // this window can foresee.
+    let Some((board, prepared)) = resolution_board(state, top, root) else {
+        return false;
+    };
+    let mut departures = Vec::new();
+    collect_battlefield_departures(&prepared, &[], &mut departures);
+    let reaches: Vec<DepartureReach<'_>> = departures
+        .into_iter()
+        .filter_map(|departure| DepartureReach::of(&board, player, departure))
+        .collect();
+    sources
+        .iter()
+        .any(|&source| reaches.iter().any(|reach| reach.contains(&board, source)))
+}
+
+/// Whether any instruction in `ability`'s chain can move battlefield objects to
+/// another zone — the structural gate before any board is read.
+fn chain_has_battlefield_departure(ability: &ResolvedAbility) -> bool {
+    battlefield_departure_slot(&ability.effect).is_some()
+        || [&ability.sub_ability, &ability.else_ability]
+            .into_iter()
+            .flatten()
+            .any(|branch| chain_has_battlefield_departure(branch))
 }
 
 /// The objects one battlefield-departure instruction can move, as far as they
@@ -468,9 +473,11 @@ impl<'a> DepartureReach<'a> {
     ///   CR 603.3d) moves only the objects chosen for it, which are fixed on the
     ///   stack; with none chosen it moves nothing.
     /// - A reference to a target an earlier instruction declared ("destroy
-    ///   it", CR 608.2c) moves that target; the resolver hands it down the
-    ///   chain only as the chain resolves, so it is read from the targets the
-    ///   instruction's ancestors declared (a slot reference reads them all).
+    ///   it", CR 608.2c) moves that target: the instruction's own targets when
+    ///   it already holds some (an event referent seeded as the trigger was put
+    ///   on the stack), else the targets its ancestors declared, which the
+    ///   resolver hands down only as the chain resolves (a slot reference reads
+    ///   them all).
     ///   With none, the event referent below applies, and an unresolved "it"
     ///   is approximated by the source (some resolvers fall back to it; a
     ///   sacrifice does not, so this can only add a hold).
@@ -484,12 +491,7 @@ impl<'a> DepartureReach<'a> {
     ///   iteration.
     ///
     /// `None` when the instruction can move none of `player`'s permanents.
-    fn of(
-        state: &GameState,
-        player: PlayerId,
-        departure: Departure<'a>,
-        trigger_event: Option<&GameEvent>,
-    ) -> Option<Self> {
+    fn of(state: &GameState, player: PlayerId, departure: Departure<'a>) -> Option<Self> {
         let Departure {
             ability,
             filter,
@@ -505,15 +507,21 @@ impl<'a> DepartureReach<'a> {
             filter,
             TargetFilter::ParentTarget | TargetFilter::ParentTargetSlot { .. }
         );
-        if parent_target && !ancestor_targets.is_empty() {
-            return Some(Self::Objects(ancestor_targets));
+        if parent_target {
+            let own: Vec<ObjectId> = object_targets(&ability.targets).collect();
+            if !own.is_empty() {
+                return Some(Self::Objects(own));
+            }
+            if !ancestor_targets.is_empty() {
+                return Some(Self::Objects(ancestor_targets));
+            }
         }
         if filter.is_context_ref() {
             if let Some(TargetRef::Object(id)) = resolve_event_context_target_for_event_or_state(
                 state,
                 filter,
                 ability.source_id,
-                trigger_event,
+                state.current_trigger_event.as_ref(),
             ) {
                 return Some(Self::Objects(vec![id]));
             }
@@ -527,16 +535,18 @@ impl<'a> DepartureReach<'a> {
                 context: Box::new(Cow::Borrowed(ability)),
             });
         };
-        if !players_for_filter(state, scope, ability).contains(&player) {
+        let apnap =
+            players::apnap_order_from(state, ability.starting_with.clone(), ability.controller);
+        if !player_scope_members(state, scope, ability, apnap).contains(&player) {
             return None;
         }
-        let mut iteration = ability.clone();
-        iteration.set_original_controller_recursive(ability.controller);
-        iteration.set_controller_recursive(player);
-        iteration.set_scoped_player_recursive(player);
         Some(Self::Described {
             filter,
-            context: Box::new(Cow::Owned(iteration)),
+            context: Box::new(Cow::Owned(bind_scoped_seat(
+                ability,
+                ability.controller,
+                player,
+            ))),
         })
     }
 
@@ -1535,6 +1545,42 @@ mod tests {
             );
             assert_eq!(
                 verdict(&state, &sacrifice_it(opponent_forest)),
+                StandingPriorityPass::Granted
+            );
+        }
+
+        /// "Tap target land. Return it to its owner's hand." — a `Bounce` of the
+        /// parent target reads the declared land, not its filter.
+        #[test]
+        fn own_parent_target_bounce_holds_only_for_the_declared_land() {
+            let (state, forest, opponent_forest) = board();
+            let tap_then_return_it = |target| {
+                let mut ability = ResolvedAbility::new(
+                    Effect::TargetOnly {
+                        target: TargetFilter::Typed(TypedFilter::land()),
+                    },
+                    vec![TargetRef::Object(target)],
+                    TRIGGER_SOURCE,
+                    PlayerId(0),
+                );
+                ability.sub_ability = Some(Box::new(ResolvedAbility::new(
+                    Effect::Bounce {
+                        target: TargetFilter::ParentTarget,
+                        destination: None,
+                        selection: BounceSelection::Targeted,
+                    },
+                    vec![],
+                    TRIGGER_SOURCE,
+                    PlayerId(0),
+                )));
+                top(PlayerId(0), TRIGGER_SOURCE, ability)
+            };
+            assert_eq!(
+                verdict(&state, &tap_then_return_it(forest)),
+                StandingPriorityPass::Held
+            );
+            assert_eq!(
+                verdict(&state, &tap_then_return_it(opponent_forest)),
                 StandingPriorityPass::Granted
             );
         }

@@ -11089,8 +11089,10 @@ pub(crate) fn instruction_object_reach(effect: &Effect) -> InstructionObjectReac
 /// (CR 701.8a) or sacrificing (CR 701.21a) a permanent, returning it to its
 /// owner's hand or library, or exiling it. `None` for every other instruction,
 /// including known departures not classified here (`ChooseAndSacrificeRest`,
-/// `Exploit`, `PutAtLibraryPosition`, `PutOnTopOrBottom`): a documented
-/// under-approximation, so their callers keep their default.
+/// `Exploit`, `PutAtLibraryPosition`, `PutOnTopOrBottom`, and a permanent paid
+/// as an unless cost or reached only through a nested definition such as
+/// `ChooseOneOf` / `GenericEffect`): a documented under-approximation, so their
+/// callers keep their default.
 ///
 /// The slot is the instruction's printed object operand: a declared target,
 /// a resolution-time choice (CR 608.2d), a mass population, or a self
