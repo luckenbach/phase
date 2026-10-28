@@ -15,6 +15,7 @@ use crate::types::identifiers::ObjectId;
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 
+use super::ability_utils::declared_targets_in_chain;
 use super::effects::speed_effects::players_for_filter;
 use super::mana_sources;
 use super::players;
@@ -408,10 +409,11 @@ fn resolution_can_remove_activatable_mana_source(
     player: PlayerId,
     top: &StackEntry,
 ) -> bool {
+    let Some(root) = top.ability() else {
+        return false;
+    };
     let mut departures = Vec::new();
-    if let Some(ability) = top.ability() {
-        collect_battlefield_departures(ability, &mut departures);
-    }
+    collect_battlefield_departures(root, &mut departures);
     if departures.is_empty() {
         return false;
     }
@@ -422,7 +424,7 @@ fn resolution_can_remove_activatable_mana_source(
         | StackEntryKind::KeywordAction { .. }
         | StackEntryKind::CombatDamage { .. } => None,
     };
-    // CR 603.7c + CR 608.2: event-relative references ("that player", "that
+    // CR 608.2k + CR 608.2: event-relative references ("that player", "that
     // creature") read the triggering event, which the resolver installs as
     // `current_trigger_event` while the trigger resolves; read them in that
     // same frame.
@@ -439,7 +441,7 @@ fn resolution_can_remove_activatable_mana_source(
     let reaches: Vec<DepartureReach<'_>> = departures
         .into_iter()
         .filter_map(|(ability, filter)| {
-            DepartureReach::of(frame, player, ability, filter, trigger_event)
+            DepartureReach::of(frame, player, root, ability, filter, trigger_event)
         })
         .collect();
     if reaches.is_empty() {
@@ -468,8 +470,13 @@ impl<'a> DepartureReach<'a> {
     /// - An announced target slot (CR 115.1 + CR 601.2c / CR 602.2b /
     ///   CR 603.3d) moves only the objects chosen for it, which are fixed on the
     ///   stack; with none chosen it moves nothing.
+    /// - A reference to a target an earlier instruction declared ("destroy
+    ///   it", CR 608.2c) moves that target; the resolver hands it down the
+    ///   chain only as the chain resolves, so it is read from the chain's
+    ///   declared targets (a slot reference reads them all). Unresolved, "it"
+    ///   names the source, as the resolver falls back to it.
     /// - A reference to the triggering event's object ("sacrifice that
-    ///   creature", CR 603.7c) moves that object.
+    ///   creature", CR 608.2k) moves that object.
     /// - Otherwise the instruction's objects are chosen or determined as it
     ///   resolves (CR 608.2d), so anything its filter describes can be moved. A
     ///   `player_scope` instruction applies once per scoped player with that
@@ -481,6 +488,7 @@ impl<'a> DepartureReach<'a> {
     fn of(
         state: &GameState,
         player: PlayerId,
+        root: &ResolvedAbility,
         ability: &'a ResolvedAbility,
         filter: &'a TargetFilter,
         trigger_event: Option<&GameEvent>,
@@ -491,6 +499,17 @@ impl<'a> DepartureReach<'a> {
         if announced_targets {
             return Some(Self::Objects(object_targets(&ability.targets).collect()));
         }
+        let parent_target = matches!(
+            filter,
+            TargetFilter::ParentTarget | TargetFilter::ParentTargetSlot { .. }
+        );
+        if parent_target {
+            let declared: Vec<ObjectId> =
+                object_targets(&declared_targets_in_chain(root)).collect();
+            if !declared.is_empty() {
+                return Some(Self::Objects(declared));
+            }
+        }
         if filter.is_context_ref() {
             if let Some(TargetRef::Object(id)) = resolve_event_context_target_for_event_or_state(
                 state,
@@ -500,6 +519,9 @@ impl<'a> DepartureReach<'a> {
             ) {
                 return Some(Self::Objects(vec![id]));
             }
+        }
+        if matches!(filter, TargetFilter::ParentTarget) {
+            return Some(Self::Objects(vec![ability.source_id]));
         }
         let Some(scope) = &ability.player_scope else {
             return Some(Self::Described {
@@ -1399,7 +1421,7 @@ mod tests {
             assert_eq!(verdict(&state, &sacrifice_self), StandingPriorityPass::Held);
         }
 
-        /// CR 603.7c: "sacrifice that permanent" names the triggering event's
+        /// CR 608.2k: "sacrifice that permanent" names the triggering event's
         /// object, which the trigger's stack entry carries.
         #[test]
         fn own_event_reference_departure_holds_only_for_the_named_mana_source() {
@@ -1432,7 +1454,7 @@ mod tests {
             );
         }
 
-        /// CR 603.7c: a filter axis relative to the triggering event ("lands
+        /// CR 608.2k: a filter axis relative to the triggering event ("lands
         /// that player controls") is read in the resolver's frame.
         #[test]
         fn own_event_relative_mass_destruction_holds_only_for_that_player() {
@@ -1460,6 +1482,43 @@ mod tests {
             );
             assert_eq!(
                 verdict(&state, &destroy_that_players_lands(PlayerId(1))),
+                StandingPriorityPass::Granted
+            );
+        }
+
+        /// CR 608.2c: "target land's controller sacrifices it" names the target
+        /// the first instruction declared; on the stack only the chain root
+        /// carries it.
+        #[test]
+        fn own_parent_target_departure_holds_only_for_the_declared_land() {
+            let (state, forest, opponent_forest) = board();
+            let sacrifice_it = |target| {
+                let mut ability = ResolvedAbility::new(
+                    Effect::TargetOnly {
+                        target: TargetFilter::Typed(TypedFilter::land()),
+                    },
+                    vec![TargetRef::Object(target)],
+                    TRIGGER_SOURCE,
+                    PlayerId(0),
+                );
+                ability.sub_ability = Some(Box::new(ResolvedAbility::new(
+                    Effect::Sacrifice {
+                        target: TargetFilter::ParentTarget,
+                        count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                        min_count: 0,
+                    },
+                    vec![],
+                    TRIGGER_SOURCE,
+                    PlayerId(0),
+                )));
+                top(PlayerId(0), TRIGGER_SOURCE, ability)
+            };
+            assert_eq!(
+                verdict(&state, &sacrifice_it(forest)),
+                StandingPriorityPass::Held
+            );
+            assert_eq!(
+                verdict(&state, &sacrifice_it(opponent_forest)),
                 StandingPriorityPass::Granted
             );
         }
