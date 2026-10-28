@@ -19,7 +19,7 @@ use super::effects::speed_effects::players_for_filter;
 use super::mana_sources;
 use super::players;
 use super::precast_copy_shortcut;
-use super::targeting::resolve_event_context_target_for_event_or_state;
+use super::targeting::{object_targets, resolve_event_context_target_for_event_or_state};
 use super::turn_control;
 use super::turns;
 
@@ -422,10 +422,24 @@ fn resolution_can_remove_activatable_mana_source(
         | StackEntryKind::KeywordAction { .. }
         | StackEntryKind::CombatDamage { .. } => None,
     };
+    // CR 603.7c + CR 608.2: event-relative references ("that player", "that
+    // creature") read the triggering event, which the resolver installs as
+    // `current_trigger_event` while the trigger resolves; read them in that
+    // same frame.
+    let resolution_frame;
+    let frame = match trigger_event {
+        Some(event) if state.current_trigger_event.as_ref() != Some(event) => {
+            let mut projected = state.clone();
+            projected.current_trigger_event = Some(event.clone());
+            resolution_frame = projected;
+            &resolution_frame
+        }
+        Some(_) | None => state,
+    };
     let reaches: Vec<DepartureReach<'_>> = departures
         .into_iter()
         .filter_map(|(ability, filter)| {
-            DepartureReach::of(state, player, ability, filter, trigger_event)
+            DepartureReach::of(frame, player, ability, filter, trigger_event)
         })
         .collect();
     if reaches.is_empty() {
@@ -434,7 +448,7 @@ fn resolution_can_remove_activatable_mana_source(
     mana_sources::activatable_mana_actions_for_player(state, player)
         .iter()
         .filter_map(GameAction::source_object)
-        .any(|source| reaches.iter().any(|reach| reach.contains(state, source)))
+        .any(|source| reaches.iter().any(|reach| reach.contains(frame, source)))
 }
 
 /// The objects one battlefield-departure instruction can move, as far as they
@@ -446,7 +460,7 @@ enum DepartureReach<'a> {
     /// Anything `filter` describes, read in `context`'s frame.
     Described {
         filter: &'a TargetFilter,
-        context: Cow<'a, ResolvedAbility>,
+        context: Box<Cow<'a, ResolvedAbility>>,
     },
 }
 
@@ -475,7 +489,7 @@ impl<'a> DepartureReach<'a> {
             && extract_target_filter_from_effect(&ability.effect)
                 .is_some_and(|slot| !slot.is_context_ref());
         if announced_targets {
-            return Some(Self::Objects(object_targets(&ability.targets)));
+            return Some(Self::Objects(object_targets(&ability.targets).collect()));
         }
         if filter.is_context_ref() {
             if let Some(TargetRef::Object(id)) = resolve_event_context_target_for_event_or_state(
@@ -490,7 +504,7 @@ impl<'a> DepartureReach<'a> {
         let Some(scope) = &ability.player_scope else {
             return Some(Self::Described {
                 filter,
-                context: Cow::Borrowed(ability),
+                context: Box::new(Cow::Borrowed(ability)),
             });
         };
         if !players_for_filter(state, scope, ability).contains(&player) {
@@ -502,7 +516,7 @@ impl<'a> DepartureReach<'a> {
         iteration.set_scoped_player_recursive(player);
         Some(Self::Described {
             filter,
-            context: Cow::Owned(iteration),
+            context: Box::new(Cow::Owned(iteration)),
         })
     }
 
@@ -514,16 +528,6 @@ impl<'a> DepartureReach<'a> {
             }
         }
     }
-}
-
-fn object_targets(targets: &[TargetRef]) -> Vec<ObjectId> {
-    targets
-        .iter()
-        .filter_map(|target| match target {
-            TargetRef::Object(id) => Some(*id),
-            TargetRef::Player(_) => None,
-        })
-        .collect()
 }
 
 /// Every instruction in `ability`'s chain (its sub-abilities and else branches)
@@ -1424,6 +1428,38 @@ mod tests {
             state.objects.get_mut(&forest).unwrap().tapped = true;
             assert_eq!(
                 verdict(&state, &sacrifice_that(forest)),
+                StandingPriorityPass::Granted
+            );
+        }
+
+        /// CR 603.7c: a filter axis relative to the triggering event ("lands
+        /// that player controls") is read in the resolver's frame.
+        #[test]
+        fn own_event_relative_mass_destruction_holds_only_for_that_player() {
+            let (state, _, _) = board();
+            let destroy_that_players_lands = |player_id| {
+                with_trigger_event(
+                    own_top(
+                        Effect::DestroyAll {
+                            target: TargetFilter::Typed(
+                                TypedFilter::land().controller(ControllerRef::TriggeringPlayer),
+                            ),
+                            cant_regenerate: false,
+                        },
+                        vec![],
+                    ),
+                    GameEvent::CardsDrawn {
+                        player_id,
+                        count: 1,
+                    },
+                )
+            };
+            assert_eq!(
+                verdict(&state, &destroy_that_players_lands(PlayerId(0))),
+                StandingPriorityPass::Held
+            );
+            assert_eq!(
+                verdict(&state, &destroy_that_players_lands(PlayerId(1))),
                 StandingPriorityPass::Granted
             );
         }

@@ -10683,11 +10683,11 @@ pub(crate) fn stack_resolution_session_authorized_limit(state: &GameState) -> Op
     // (CR 732.2b), so K = 1 + the authorized prefix of those windows. Each
     // window is judged against the board before anything resolves, so it cannot
     // see a mana source an earlier member untaps. That is sound for the `Held`
-    // rung only because the stack resolver batches nothing but its inert kinds
-    // (no-ops, self counters, controller life gain, fixed opponent life loss
-    // or mill, token creation), none of
-    // which moves a permanent off the battlefield, so no window inside a batch
-    // can be `Held`.
+    // rung because a batch consumes only windows this look-ahead authorized, and
+    // its members are either the resolver's fixed inert kinds or one repeated
+    // untargeted triggered ability. A member that untaps a mana source which a
+    // later identical member then removes, without pausing, is an accepted
+    // under-approximation.
     let authorized_skipped_windows = fenced_prefix
         .take_while(|window_top| {
             participants.iter().all(|&participant| {
