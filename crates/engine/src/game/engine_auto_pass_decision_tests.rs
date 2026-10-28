@@ -2651,9 +2651,21 @@ fn own_bounce_of_your_land(forest_tapped: bool) -> GameState {
 /// and authorizes no skipped window over it.
 #[test]
 fn recheck_session_pauses_an_own_top_held_for_a_removable_mana_source() {
+    // The look-ahead: with an own inert entry above the bounce, the skipped
+    // window over the bounce is authorized only when nothing can be lost.
+    for (forest_tapped, limit) in [(false, 1), (true, 2)] {
+        let mut state = own_bounce_of_your_land(forest_tapped);
+        push_simple_stack_entry(&mut state, 30_502, PlayerId(0));
+        install_recheck_session(&mut state, &[PlayerId(1)]);
+        assert_eq!(
+            stack_resolution_session_authorized_limit(&state),
+            Some(limit),
+            "Forest tapped: {forest_tapped}"
+        );
+    }
+
     let mut held = own_bounce_of_your_land(false);
     install_recheck_session(&mut held, &[PlayerId(1)]);
-    assert_eq!(stack_resolution_session_authorized_limit(&held), Some(1));
     assert!(matches!(
         stack_resolution_session_priority_decision(
             &mut held,

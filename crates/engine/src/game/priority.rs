@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::game::engine::EngineError;
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::types::ability::{
@@ -7,7 +9,7 @@ use crate::types::ability::{
 use crate::types::actions::GameAction;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    AutoPassMode, GameState, PriorityPassingMode, StackEntry, WaitingFor,
+    AutoPassMode, GameState, PriorityPassingMode, StackEntry, StackEntryKind, WaitingFor,
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::phase::Phase;
@@ -17,6 +19,7 @@ use super::effects::speed_effects::players_for_filter;
 use super::mana_sources;
 use super::players;
 use super::precast_copy_shortcut;
+use super::targeting::resolve_event_context_target_for_event_or_state;
 use super::turn_control;
 use super::turns;
 
@@ -398,8 +401,8 @@ pub(crate) fn standing_priority_pass(
 /// possible.
 ///
 /// An instruction's battlefield departures are named by
-/// [`battlefield_departure_slot`]; [`departure_can_reach`] decides which
-/// objects each one can move.
+/// [`battlefield_departure_slot`]; [`DepartureReach::of`] decides which objects
+/// each one can move.
 fn resolution_can_remove_activatable_mana_source(
     state: &GameState,
     player: PlayerId,
@@ -412,59 +415,115 @@ fn resolution_can_remove_activatable_mana_source(
     if departures.is_empty() {
         return false;
     }
+    let trigger_event = match &top.kind {
+        StackEntryKind::TriggeredAbility { trigger_event, .. } => trigger_event.as_ref(),
+        StackEntryKind::Spell { .. }
+        | StackEntryKind::ActivatedAbility { .. }
+        | StackEntryKind::KeywordAction { .. }
+        | StackEntryKind::CombatDamage { .. } => None,
+    };
+    let reaches: Vec<DepartureReach<'_>> = departures
+        .into_iter()
+        .filter_map(|(ability, filter)| {
+            DepartureReach::of(state, player, ability, filter, trigger_event)
+        })
+        .collect();
+    if reaches.is_empty() {
+        return false;
+    }
     mana_sources::activatable_mana_actions_for_player(state, player)
         .iter()
         .filter_map(GameAction::source_object)
-        .any(|source| {
-            departures.iter().any(|(ability, filter)| {
-                departure_can_reach(state, player, ability, filter, source)
-            })
-        })
+        .any(|source| reaches.iter().any(|reach| reach.contains(state, source)))
 }
 
-/// Whether one battlefield-departure instruction can move `player`'s permanent
-/// `source`.
-///
-/// - An announced target slot (CR 115.1 + CR 601.2c / CR 602.2b / CR 603.3d)
-///   moves only the objects chosen for it, which are fixed on the stack; with
-///   none chosen it moves nothing.
-/// - Otherwise the instruction's objects are chosen or determined as it
-///   resolves (CR 608.2d), so anything its filter describes can be moved. A
-///   `player_scope` instruction applies once per scoped player with that player
-///   as its controller (CR 109.5), so it reaches `player`'s permanents only when
-///   `player` is in scope, read from `player`'s own iteration.
-fn departure_can_reach(
-    state: &GameState,
-    player: PlayerId,
-    ability: &ResolvedAbility,
-    filter: &TargetFilter,
-    source: ObjectId,
-) -> bool {
-    let announced_targets = ability.target_choice_timing == TargetChoiceTiming::Stack
-        && extract_target_filter_from_effect(&ability.effect)
-            .is_some_and(|slot| !slot.is_context_ref());
-    if announced_targets {
-        return ability
-            .targets
-            .iter()
-            .any(|target| matches!(target, TargetRef::Object(id) if *id == source));
+/// The objects one battlefield-departure instruction can move, as far as they
+/// are known before it resolves.
+enum DepartureReach<'a> {
+    /// Exactly these objects: the targets chosen for an announced slot, or the
+    /// object an event reference names.
+    Objects(Vec<ObjectId>),
+    /// Anything `filter` describes, read in `context`'s frame.
+    Described {
+        filter: &'a TargetFilter,
+        context: Cow<'a, ResolvedAbility>,
+    },
+}
+
+impl<'a> DepartureReach<'a> {
+    /// - An announced target slot (CR 115.1 + CR 601.2c / CR 602.2b /
+    ///   CR 603.3d) moves only the objects chosen for it, which are fixed on the
+    ///   stack; with none chosen it moves nothing.
+    /// - A reference to the triggering event's object ("sacrifice that
+    ///   creature", CR 603.7c) moves that object.
+    /// - Otherwise the instruction's objects are chosen or determined as it
+    ///   resolves (CR 608.2d), so anything its filter describes can be moved. A
+    ///   `player_scope` instruction applies once per scoped player with that
+    ///   player as its controller (CR 109.5), so it reaches `player`'s
+    ///   permanents only when `player` is in scope, read from `player`'s own
+    ///   iteration.
+    ///
+    /// `None` when the instruction can move none of `player`'s permanents.
+    fn of(
+        state: &GameState,
+        player: PlayerId,
+        ability: &'a ResolvedAbility,
+        filter: &'a TargetFilter,
+        trigger_event: Option<&GameEvent>,
+    ) -> Option<Self> {
+        let announced_targets = ability.target_choice_timing == TargetChoiceTiming::Stack
+            && extract_target_filter_from_effect(&ability.effect)
+                .is_some_and(|slot| !slot.is_context_ref());
+        if announced_targets {
+            return Some(Self::Objects(object_targets(&ability.targets)));
+        }
+        if filter.is_context_ref() {
+            if let Some(TargetRef::Object(id)) = resolve_event_context_target_for_event_or_state(
+                state,
+                filter,
+                ability.source_id,
+                trigger_event,
+            ) {
+                return Some(Self::Objects(vec![id]));
+            }
+        }
+        let Some(scope) = &ability.player_scope else {
+            return Some(Self::Described {
+                filter,
+                context: Cow::Borrowed(ability),
+            });
+        };
+        if !players_for_filter(state, scope, ability).contains(&player) {
+            return None;
+        }
+        let mut iteration = ability.clone();
+        iteration.set_original_controller_recursive(ability.controller);
+        iteration.set_controller_recursive(player);
+        iteration.set_scoped_player_recursive(player);
+        Some(Self::Described {
+            filter,
+            context: Cow::Owned(iteration),
+        })
     }
-    let Some(scope) = &ability.player_scope else {
-        return matches_target_filter(state, source, filter, &FilterContext::from_ability(ability));
-    };
-    if !players_for_filter(state, scope, ability).contains(&player) {
-        return false;
+
+    fn contains(&self, state: &GameState, object: ObjectId) -> bool {
+        match self {
+            Self::Objects(objects) => objects.contains(&object),
+            Self::Described { filter, context } => {
+                matches_target_filter(state, object, filter, &FilterContext::from_ability(context))
+            }
+        }
     }
-    let mut iteration = ability.clone();
-    iteration.set_original_controller_recursive(ability.controller);
-    iteration.set_controller_recursive(player);
-    iteration.set_scoped_player_recursive(player);
-    matches_target_filter(
-        state,
-        source,
-        filter,
-        &FilterContext::from_ability(&iteration),
-    )
+}
+
+fn object_targets(targets: &[TargetRef]) -> Vec<ObjectId> {
+    targets
+        .iter()
+        .filter_map(|target| match target {
+            TargetRef::Object(id) => Some(*id),
+            TargetRef::Player(_) => None,
+        })
+        .collect()
 }
 
 /// Every instruction in `ability`'s chain (its sub-abilities and else branches)
@@ -1215,6 +1274,13 @@ mod tests {
             }
         }
 
+        fn with_trigger_event(mut entry: StackEntry, event: GameEvent) -> StackEntry {
+            if let StackEntryKind::TriggeredAbility { trigger_event, .. } = &mut entry.kind {
+                *trigger_event = Some(event);
+            }
+            entry
+        }
+
         fn own_top(effect: Effect, targets: Vec<TargetRef>) -> StackEntry {
             top(
                 PlayerId(0),
@@ -1270,6 +1336,11 @@ mod tests {
         #[test]
         fn own_non_departure_instructions_keep_the_pass() {
             let (state, _, _) = board();
+            // Reach guard: this board does hold for a departure instruction.
+            assert_eq!(
+                verdict(&state, &own_top(return_a_land_you_control(), vec![])),
+                StandingPriorityPass::Held
+            );
             // Amulet of Vigor: "untap it".
             let untap = own_top(
                 Effect::SetTapState {
@@ -1322,6 +1393,39 @@ mod tests {
                 ),
             );
             assert_eq!(verdict(&state, &sacrifice_self), StandingPriorityPass::Held);
+        }
+
+        /// CR 603.7c: "sacrifice that permanent" names the triggering event's
+        /// object, which the trigger's stack entry carries.
+        #[test]
+        fn own_event_reference_departure_holds_only_for_the_named_mana_source() {
+            let (mut state, forest, opponent_forest) = board();
+            let sacrifice_that = |object_id| {
+                with_trigger_event(
+                    own_top(
+                        Effect::Sacrifice {
+                            target: TargetFilter::TriggeringSource,
+                            count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                            min_count: 0,
+                        },
+                        vec![],
+                    ),
+                    GameEvent::PermanentUntapped { object_id },
+                )
+            };
+            assert_eq!(
+                verdict(&state, &sacrifice_that(forest)),
+                StandingPriorityPass::Held
+            );
+            assert_eq!(
+                verdict(&state, &sacrifice_that(opponent_forest)),
+                StandingPriorityPass::Granted
+            );
+            state.objects.get_mut(&forest).unwrap().tapped = true;
+            assert_eq!(
+                verdict(&state, &sacrifice_that(forest)),
+                StandingPriorityPass::Granted
+            );
         }
 
         /// Armageddon class: an own mass destruction of lands.

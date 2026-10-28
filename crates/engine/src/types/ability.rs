@@ -11087,8 +11087,10 @@ pub(crate) fn instruction_object_reach(effect: &Effect) -> InstructionObjectReac
 /// CR 701.8a + CR 701.21a + CR 400.7: the slot naming the objects one
 /// instruction can move from the battlefield to another zone — destroying
 /// (CR 701.8a) or sacrificing (CR 701.21a) a permanent, returning it to its
-/// owner's hand or library, or exiling it. `None` when the instruction moves
-/// no battlefield object to another zone.
+/// owner's hand or library, or exiling it. `None` for every other instruction,
+/// including known departures not classified here (`ChooseAndSacrificeRest`,
+/// `Exploit`, `PutAtLibraryPosition`, `PutOnTopOrBottom`): a documented
+/// under-approximation, so their callers keep their default.
 ///
 /// The slot is the instruction's printed object operand: a declared target,
 /// a resolution-time choice (CR 608.2d), a mass population, or a self

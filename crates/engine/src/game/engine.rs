@@ -10684,7 +10684,8 @@ pub(crate) fn stack_resolution_session_authorized_limit(state: &GameState) -> Op
     // window is judged against the board before anything resolves, so it cannot
     // see a mana source an earlier member untaps. That is sound for the `Held`
     // rung only because the stack resolver batches nothing but its inert kinds
-    // (no-ops, self counters, controller life gain, token creation), none of
+    // (no-ops, self counters, controller life gain, fixed opponent life loss
+    // or mill, token creation), none of
     // which moves a permanent off the battlefield, so no window inside a batch
     // can be `Held`.
     let authorized_skipped_windows = fenced_prefix

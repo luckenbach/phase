@@ -9,7 +9,7 @@
 //! 4. With Commons' own trigger still on the stack, its controller receives
 //!    priority (CR 117.3b) and taps Commons for mana (CR 605.3a).
 //! 5. Commons' trigger resolves and returns Commons itself (the choice is made
-//!    on resolution, CR 608.2c), leaving its mana in the pool.
+//!    on resolution, CR 608.2d), leaving its mana in the pool.
 //!
 //! Every priority window of the acting player is driven the way the client
 //! drives it: the window is passed for the player exactly when the engine's
@@ -156,7 +156,7 @@ fn amulet_untaps_bounce_land_and_its_mana_survives_returning_it() {
                     .expect("order the triggers");
                 ordered = true;
             }
-            // Step 5 (CR 608.2c): Commons' trigger resolves; return Commons itself.
+            // Step 5 (CR 608.2d): Commons' trigger resolves; return Commons itself.
             WaitingFor::EffectZoneChoice {
                 zone: Zone::Battlefield,
                 cards,
