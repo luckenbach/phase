@@ -15,7 +15,6 @@ use crate::types::identifiers::ObjectId;
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 
-use super::ability_utils::declared_targets_in_chain;
 use super::effects::speed_effects::players_for_filter;
 use super::mana_sources;
 use super::players;
@@ -413,7 +412,7 @@ fn resolution_can_remove_activatable_mana_source(
         return false;
     };
     let mut departures = Vec::new();
-    collect_battlefield_departures(root, &mut departures);
+    collect_battlefield_departures(root, &[], &mut departures);
     if departures.is_empty() {
         return false;
     }
@@ -440,9 +439,7 @@ fn resolution_can_remove_activatable_mana_source(
     };
     let reaches: Vec<DepartureReach<'_>> = departures
         .into_iter()
-        .filter_map(|(ability, filter)| {
-            DepartureReach::of(frame, player, root, ability, filter, trigger_event)
-        })
+        .filter_map(|departure| DepartureReach::of(frame, player, departure, trigger_event))
         .collect();
     if reaches.is_empty() {
         return false;
@@ -472,9 +469,11 @@ impl<'a> DepartureReach<'a> {
     ///   stack; with none chosen it moves nothing.
     /// - A reference to a target an earlier instruction declared ("destroy
     ///   it", CR 608.2c) moves that target; the resolver hands it down the
-    ///   chain only as the chain resolves, so it is read from the chain's
-    ///   declared targets (a slot reference reads them all). Unresolved, "it"
-    ///   names the source, as the resolver falls back to it.
+    ///   chain only as the chain resolves, so it is read from the targets the
+    ///   instruction's ancestors declared (a slot reference reads them all).
+    ///   With none, the event referent below applies, and an unresolved "it"
+    ///   is approximated by the source (some resolvers fall back to it; a
+    ///   sacrifice does not, so this can only add a hold).
     /// - A reference to the triggering event's object ("sacrifice that
     ///   creature", CR 608.2k) moves that object.
     /// - Otherwise the instruction's objects are chosen or determined as it
@@ -488,11 +487,14 @@ impl<'a> DepartureReach<'a> {
     fn of(
         state: &GameState,
         player: PlayerId,
-        root: &ResolvedAbility,
-        ability: &'a ResolvedAbility,
-        filter: &'a TargetFilter,
+        departure: Departure<'a>,
         trigger_event: Option<&GameEvent>,
     ) -> Option<Self> {
+        let Departure {
+            ability,
+            filter,
+            ancestor_targets,
+        } = departure;
         let announced_targets = ability.target_choice_timing == TargetChoiceTiming::Stack
             && extract_target_filter_from_effect(&ability.effect)
                 .is_some_and(|slot| !slot.is_context_ref());
@@ -503,12 +505,8 @@ impl<'a> DepartureReach<'a> {
             filter,
             TargetFilter::ParentTarget | TargetFilter::ParentTargetSlot { .. }
         );
-        if parent_target {
-            let declared: Vec<ObjectId> =
-                object_targets(&declared_targets_in_chain(root)).collect();
-            if !declared.is_empty() {
-                return Some(Self::Objects(declared));
-            }
+        if parent_target && !ancestor_targets.is_empty() {
+            return Some(Self::Objects(ancestor_targets));
         }
         if filter.is_context_ref() {
             if let Some(TargetRef::Object(id)) = resolve_event_context_target_for_event_or_state(
@@ -552,20 +550,38 @@ impl<'a> DepartureReach<'a> {
     }
 }
 
+/// One instruction that can move battlefield objects to another zone.
+struct Departure<'a> {
+    ability: &'a ResolvedAbility,
+    /// The slot naming the objects it can move.
+    filter: &'a TargetFilter,
+    /// Object targets declared by the instructions above it in its chain — what
+    /// a parent-target reference ("it") inherits as the chain resolves.
+    ancestor_targets: Vec<ObjectId>,
+}
+
 /// Every instruction in `ability`'s chain (its sub-abilities and else branches)
-/// that can move battlefield objects to another zone, with the slot naming them.
+/// that can move battlefield objects to another zone. `ancestor_targets` are the
+/// object targets declared above `ability`.
 fn collect_battlefield_departures<'a>(
     ability: &'a ResolvedAbility,
-    departures: &mut Vec<(&'a ResolvedAbility, &'a TargetFilter)>,
+    ancestor_targets: &[ObjectId],
+    departures: &mut Vec<Departure<'a>>,
 ) {
     if let Some(filter) = battlefield_departure_slot(&ability.effect) {
-        departures.push((ability, filter));
+        departures.push(Departure {
+            ability,
+            filter,
+            ancestor_targets: ancestor_targets.to_vec(),
+        });
     }
+    let mut inherited = ancestor_targets.to_vec();
+    inherited.extend(object_targets(&ability.targets));
     for branch in [&ability.sub_ability, &ability.else_ability]
         .into_iter()
         .flatten()
     {
-        collect_battlefield_departures(branch, departures);
+        collect_battlefield_departures(branch, &inherited, departures);
     }
 }
 
@@ -1519,6 +1535,47 @@ mod tests {
             );
             assert_eq!(
                 verdict(&state, &sacrifice_it(opponent_forest)),
+                StandingPriorityPass::Granted
+            );
+        }
+
+        /// A target declared after the departing instruction is not what its
+        /// "it" names: a root `Sacrifice { ParentTarget }` with nothing declared
+        /// above it reads the event referent and then its source ("sacrifice
+        /// this land ..., otherwise destroy target land").
+        #[test]
+        fn later_declared_targets_do_not_rebind_a_root_parent_target() {
+            let (state, forest, opponent_forest) = board();
+            let sacrifice_it_otherwise_destroy = |source| {
+                let mut ability = ResolvedAbility::new(
+                    Effect::Sacrifice {
+                        target: TargetFilter::ParentTarget,
+                        count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                        min_count: 0,
+                    },
+                    vec![],
+                    source,
+                    PlayerId(0),
+                );
+                ability.else_ability = Some(Box::new(ResolvedAbility::new(
+                    Effect::Destroy {
+                        target: TargetFilter::Typed(TypedFilter::land()),
+                        cant_regenerate: false,
+                    },
+                    vec![TargetRef::Object(opponent_forest)],
+                    source,
+                    PlayerId(0),
+                )));
+                top(PlayerId(0), source, ability)
+            };
+            // The Forest's own trigger: "it" is the Forest, not the later target.
+            assert_eq!(
+                verdict(&state, &sacrifice_it_otherwise_destroy(forest)),
+                StandingPriorityPass::Held
+            );
+            // Reach guard: a non-land source names nothing P0 can tap.
+            assert_eq!(
+                verdict(&state, &sacrifice_it_otherwise_destroy(TRIGGER_SOURCE)),
                 StandingPriorityPass::Granted
             );
         }
