@@ -479,10 +479,9 @@ impl<'a> DepartureReach<'a> {
     ///   it already holds some (an event referent seeded as the trigger was put
     ///   on the stack), else the targets its ancestors declared, which the
     ///   resolver hands down only as the chain resolves (a slot reference reads
-    ///   them all).
-    ///   With none, the event referent below applies, and an unresolved "it"
-    ///   is approximated by the source (some resolvers fall back to it; a
-    ///   sacrifice does not, so this can only add a hold).
+    ///   them all). With none declared, "it" names an object the chain
+    ///   produces as it resolves, so it reaches nothing foreseeable (an
+    ///   accepted under-approximation).
     /// - A reference to the triggering event's object ("sacrifice that
     ///   creature", CR 608.2k) moves that object.
     /// - Otherwise the instruction's objects are chosen or determined as it
@@ -519,6 +518,10 @@ impl<'a> DepartureReach<'a> {
             if !ancestor_targets.is_empty() {
                 return Some(Self::Objects(ancestor_targets));
             }
+            // With nothing declared, "it" is an object the chain produces as it
+            // resolves (the card it looked at or revealed) or one the resolver
+            // falls back to; neither is foreseeable here.
+            return None;
         }
         if filter.is_context_ref() {
             if let Some(TargetRef::Object(id)) = resolve_event_context_target_for_event_or_state(
@@ -529,9 +532,6 @@ impl<'a> DepartureReach<'a> {
             ) {
                 return Some(Self::Objects(vec![id]));
             }
-        }
-        if matches!(filter, TargetFilter::ParentTarget) {
-            return Some(Self::Objects(vec![ability.source_id]));
         }
         // `Any` is the operand of an instruction that names no population of its
         // own (the card a search found, put into a hand); it describes no
@@ -1641,13 +1641,13 @@ mod tests {
         }
 
         /// A target declared after the departing instruction is not what its
-        /// "it" names: a root `Sacrifice { ParentTarget }` with nothing declared
-        /// above it reads the event referent and then its source ("sacrifice
-        /// this land ..., otherwise destroy target land").
+        /// "it" names, and with nothing declared above it "it" is an object the
+        /// chain produces as it resolves ("look at the top card ... put it into
+        /// your hand"), so it falls back to neither the event nor the source.
         #[test]
-        fn later_declared_targets_do_not_rebind_a_root_parent_target() {
-            let (state, forest, opponent_forest) = board();
-            let sacrifice_it_otherwise_destroy = |source| {
+        fn undeclared_parent_target_reaches_nothing() {
+            let (state, forest, _) = board();
+            let sacrifice_it_otherwise_destroy = |source, later_target| {
                 let mut ability = ResolvedAbility::new(
                     Effect::Sacrifice {
                         target: TargetFilter::ParentTarget,
@@ -1659,25 +1659,49 @@ mod tests {
                     PlayerId(0),
                 );
                 ability.else_ability = Some(Box::new(ResolvedAbility::new(
-                    Effect::Destroy {
+                    Effect::TargetOnly {
                         target: TargetFilter::Typed(TypedFilter::land()),
-                        cant_regenerate: false,
                     },
-                    vec![TargetRef::Object(opponent_forest)],
+                    vec![TargetRef::Object(later_target)],
                     source,
                     PlayerId(0),
                 )));
                 top(PlayerId(0), source, ability)
             };
-            // The Forest's own trigger: "it" is the Forest, not the later target.
+            // The else branch targets P0's Forest; the root "it" does not read it.
             assert_eq!(
-                verdict(&state, &sacrifice_it_otherwise_destroy(forest)),
-                StandingPriorityPass::Held
-            );
-            // Reach guard: a non-land source names nothing P0 can tap.
-            assert_eq!(
-                verdict(&state, &sacrifice_it_otherwise_destroy(TRIGGER_SOURCE)),
+                verdict(
+                    &state,
+                    &sacrifice_it_otherwise_destroy(TRIGGER_SOURCE, forest)
+                ),
                 StandingPriorityPass::Granted
+            );
+            // The Forest's own trigger, nothing declared: no source fallback.
+            let found_it_to_hand = with_trigger_event(
+                top(
+                    PlayerId(0),
+                    forest,
+                    ResolvedAbility::new(
+                        Effect::Bounce {
+                            target: TargetFilter::ParentTarget,
+                            destination: None,
+                            selection: BounceSelection::Targeted,
+                        },
+                        vec![],
+                        forest,
+                        PlayerId(0),
+                    ),
+                ),
+                GameEvent::PermanentUntapped { object_id: forest },
+            );
+            assert_eq!(
+                verdict(&state, &found_it_to_hand),
+                StandingPriorityPass::Granted
+            );
+            // Reach guard: the same board holds once a target is declared above.
+            assert_eq!(
+                verdict(&state, &own_top(return_a_land_you_control(), vec![])),
+                StandingPriorityPass::Held
             );
         }
 

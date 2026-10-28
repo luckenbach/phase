@@ -253,3 +253,52 @@ fn amulet_untaps_bounce_land_and_its_mana_survives_returning_it() {
         "Commons' {{C}}{{C}} stays in the pool after Commons leaves the battlefield"
     );
 }
+
+const AMARETH_THE_LUSTROUS: &str = "Flying\nWhenever another permanent you control enters, look at the top card of your library. If it shares a card type with that permanent, you may reveal that card and put it into your hand.";
+
+/// No spurious hold: an own trigger whose "put it into your hand" names the
+/// card it looks at (an object the chain produces as it resolves) cannot move
+/// the land that just entered, so its window keeps the own-object standing
+/// pass even with that land untapped.
+#[test]
+fn own_look_at_top_card_trigger_keeps_the_pass_over_an_untapped_land() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario
+        .add_creature(P0, "Amareth, the Lustrous", 6, 6)
+        .from_oracle_text_with_keywords(&["Flying"], AMARETH_THE_LUSTROUS);
+    scenario.with_library_top(P0, &["Library Card"]);
+    let forest = scenario
+        .add_land_to_hand(P0, "Forest")
+        .from_oracle_text("{T}: Add {G}.")
+        .id();
+    let mut runner = scenario.build();
+    let card_id = runner.state().objects[&forest].card_id;
+    runner
+        .act(GameAction::PlayLand {
+            object_id: forest,
+            card_id,
+        })
+        .expect("play the Forest");
+
+    // Reach guard: Amareth's trigger is on top, P0 has priority, and the Forest
+    // is an untapped land whose mana ability P0 can activate now.
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player } if player == P0
+    ));
+    assert_eq!(
+        top_source_name(&runner).as_deref(),
+        Some("Amareth, the Lustrous")
+    );
+    assert!(!runner.state().objects[&forest].tapped);
+    let (_, _, grouped) = legal_actions_full(runner.state());
+    assert!(grouped.get(&forest).is_some_and(|actions| actions
+        .iter()
+        .any(|action| matches!(action, GameAction::TapLandForMana { .. }))));
+
+    assert!(
+        recommends_pass(&runner),
+        "nothing this trigger does can move the Forest, so the own-object pass stands"
+    );
+}
