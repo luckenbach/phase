@@ -1,11 +1,20 @@
 use crate::game::engine::EngineError;
+use crate::game::filter::{matches_target_filter, FilterContext};
+use crate::types::ability::{
+    battlefield_departure_slot, extract_target_filter_from_effect, ResolvedAbility,
+    TargetChoiceTiming, TargetFilter, TargetRef,
+};
+use crate::types::actions::GameAction;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     AutoPassMode, GameState, PriorityPassingMode, StackEntry, WaitingFor,
 };
+use crate::types::identifiers::ObjectId;
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 
+use super::effects::speed_effects::players_for_filter;
+use super::mana_sources;
 use super::players;
 use super::precast_copy_shortcut;
 use super::turn_control;
@@ -339,8 +348,13 @@ pub(crate) enum StandingPriorityPass {
     /// CR 117.1: Full Control refuses to have any window passed for this player.
     Withheld,
     /// CR 117.3d: the player stands committed to pass this window — a yield to
-    /// the top triggered ability, or the player's own object on top.
+    /// the top triggered ability, or the player's own object on top when it is
+    /// not `Held`.
     Granted,
+    /// CR 117.3b + CR 117.3c + CR 605.3a: the player's own object is on top, but resolving
+    /// it can move a permanent whose mana ability they can activate now off the
+    /// battlefield (CR 400.7), so the window is kept for that activation.
+    Held,
     /// No standing answer; the window needs a fresh decision.
     Undecided,
 }
@@ -360,13 +374,113 @@ pub(crate) fn standing_priority_pass(
         return StandingPriorityPass::Withheld;
     }
     match window_top {
-        // CR 117.3d: a yield is a pre-committed pass; an own object on top is
-        // the ladder's MTGA-parity standing pass (it outranks castability, see
-        // `auto_pass_recommended`).
-        Some(top) if state.is_priority_yielded(player, top) || top.controller == player => {
-            StandingPriorityPass::Granted
+        // CR 117.3d: a yield is a pre-committed pass.
+        Some(top) if state.is_priority_yielded(player, top) => StandingPriorityPass::Granted,
+        // An own object on top is the ladder's MTGA-parity standing pass (it
+        // outranks castability, see `auto_pass_recommended`): whatever the
+        // player could do now, they can still do once it resolves — except
+        // activate a mana ability of a permanent it moves off the battlefield.
+        Some(top) if top.controller == player => {
+            if resolution_can_remove_activatable_mana_source(state, player, top) {
+                StandingPriorityPass::Held
+            } else {
+                StandingPriorityPass::Granted
+            }
         }
         Some(_) | None => StandingPriorityPass::Undecided,
+    }
+}
+
+/// CR 117.3b + CR 117.3c + CR 605.3a + CR 400.7: whether resolving `top` can
+/// move a permanent with a mana ability `player` can activate now off the
+/// battlefield. Once it moves, the permanent is a new object (CR 400.7) and that
+/// mana is out of reach, so this is the one window in which the activation is
+/// possible.
+///
+/// An instruction's battlefield departures are named by
+/// [`battlefield_departure_slot`]; [`departure_can_reach`] decides which
+/// objects each one can move.
+fn resolution_can_remove_activatable_mana_source(
+    state: &GameState,
+    player: PlayerId,
+    top: &StackEntry,
+) -> bool {
+    let mut departures = Vec::new();
+    if let Some(ability) = top.ability() {
+        collect_battlefield_departures(ability, &mut departures);
+    }
+    if departures.is_empty() {
+        return false;
+    }
+    mana_sources::activatable_mana_actions_for_player(state, player)
+        .iter()
+        .filter_map(GameAction::source_object)
+        .any(|source| {
+            departures.iter().any(|(ability, filter)| {
+                departure_can_reach(state, player, ability, filter, source)
+            })
+        })
+}
+
+/// Whether one battlefield-departure instruction can move `player`'s permanent
+/// `source`.
+///
+/// - An announced target slot (CR 115.1 + CR 601.2c / CR 602.2b / CR 603.3d)
+///   moves only the objects chosen for it, which are fixed on the stack; with
+///   none chosen it moves nothing.
+/// - Otherwise the instruction's objects are chosen or determined as it
+///   resolves (CR 608.2d), so anything its filter describes can be moved. A
+///   `player_scope` instruction applies once per scoped player with that player
+///   as its controller (CR 109.5), so it reaches `player`'s permanents only when
+///   `player` is in scope, read from `player`'s own iteration.
+fn departure_can_reach(
+    state: &GameState,
+    player: PlayerId,
+    ability: &ResolvedAbility,
+    filter: &TargetFilter,
+    source: ObjectId,
+) -> bool {
+    let announced_targets = ability.target_choice_timing == TargetChoiceTiming::Stack
+        && extract_target_filter_from_effect(&ability.effect)
+            .is_some_and(|slot| !slot.is_context_ref());
+    if announced_targets {
+        return ability
+            .targets
+            .iter()
+            .any(|target| matches!(target, TargetRef::Object(id) if *id == source));
+    }
+    let Some(scope) = &ability.player_scope else {
+        return matches_target_filter(state, source, filter, &FilterContext::from_ability(ability));
+    };
+    if !players_for_filter(state, scope, ability).contains(&player) {
+        return false;
+    }
+    let mut iteration = ability.clone();
+    iteration.set_original_controller_recursive(ability.controller);
+    iteration.set_controller_recursive(player);
+    iteration.set_scoped_player_recursive(player);
+    matches_target_filter(
+        state,
+        source,
+        filter,
+        &FilterContext::from_ability(&iteration),
+    )
+}
+
+/// Every instruction in `ability`'s chain (its sub-abilities and else branches)
+/// that can move battlefield objects to another zone, with the slot naming them.
+fn collect_battlefield_departures<'a>(
+    ability: &'a ResolvedAbility,
+    departures: &mut Vec<(&'a ResolvedAbility, &'a TargetFilter)>,
+) {
+    if let Some(filter) = battlefield_departure_slot(&ability.effect) {
+        departures.push((ability, filter));
+    }
+    for branch in [&ability.sub_ability, &ability.else_ability]
+        .into_iter()
+        .flatten()
+    {
+        collect_battlefield_departures(branch, departures);
     }
 }
 
@@ -1055,5 +1169,232 @@ mod tests {
             standing_priority_pass(&state, PlayerId(0), Some(&opponent_spell)),
             StandingPriorityPass::Undecided
         );
+    }
+
+    mod removable_mana_source {
+        use super::*;
+        use crate::game::scenario::GameScenario;
+        use crate::types::ability::{
+            BounceSelection, ControllerRef, Effect, PlayerFilter, TypedFilter,
+        };
+        use crate::types::game_state::StackEntryKind;
+        use crate::types::mana::ManaColor;
+        use crate::types::zones::{EtbTapState, Zone};
+
+        const TRIGGER_SOURCE: ObjectId = ObjectId(900);
+
+        /// P0 controls an untapped Forest (a mana source P0 can activate now)
+        /// and P1 controls a Forest of its own.
+        fn board() -> (GameState, ObjectId, ObjectId) {
+            let mut scenario = GameScenario::new();
+            let forest = scenario.add_basic_land(PlayerId(0), ManaColor::Green);
+            let opponent_forest = scenario.add_basic_land(PlayerId(1), ManaColor::Green);
+            (scenario.build().state().clone(), forest, opponent_forest)
+        }
+
+        fn your_lands() -> TargetFilter {
+            TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You))
+        }
+
+        fn top(controller: PlayerId, source: ObjectId, ability: ResolvedAbility) -> StackEntry {
+            StackEntry {
+                id: ObjectId(901),
+                source_id: source,
+                controller,
+                kind: StackEntryKind::TriggeredAbility {
+                    source_id: source,
+                    ability: Box::new(ability),
+                    condition: None,
+                    trigger_event: None,
+                    description: None,
+                    source_name: String::new(),
+                    subject_match_count: None,
+                    die_result: None,
+                    provenance: None,
+                },
+            }
+        }
+
+        fn own_top(effect: Effect, targets: Vec<TargetRef>) -> StackEntry {
+            top(
+                PlayerId(0),
+                TRIGGER_SOURCE,
+                ResolvedAbility::new(effect, targets, TRIGGER_SOURCE, PlayerId(0)),
+            )
+        }
+
+        fn verdict(state: &GameState, top: &StackEntry) -> StandingPriorityPass {
+            standing_priority_pass(state, PlayerId(0), Some(top))
+        }
+
+        /// Guildless Commons / karoo class: "return a land you control to its
+        /// owner's hand", chosen as the trigger resolves.
+        fn return_a_land_you_control() -> Effect {
+            Effect::Bounce {
+                target: your_lands(),
+                destination: None,
+                selection: BounceSelection::AtResolution,
+            }
+        }
+
+        #[test]
+        fn own_resolution_time_bounce_of_your_land_holds_while_the_land_can_tap() {
+            let (mut state, forest, _) = board();
+            let bounce = own_top(return_a_land_you_control(), vec![]);
+            assert_eq!(verdict(&state, &bounce), StandingPriorityPass::Held);
+
+            // Reach guard: the predicate consults activatability — with the
+            // Forest tapped there is no mana left to lose, so the pass stands.
+            state.objects.get_mut(&forest).unwrap().tapped = true;
+            assert_eq!(verdict(&state, &bounce), StandingPriorityPass::Granted);
+        }
+
+        #[test]
+        fn opponent_resolution_time_bounce_stays_undecided() {
+            let (state, _, _) = board();
+            let bounce = top(
+                PlayerId(1),
+                TRIGGER_SOURCE,
+                ResolvedAbility::new(
+                    return_a_land_you_control(),
+                    vec![],
+                    TRIGGER_SOURCE,
+                    PlayerId(1),
+                ),
+            );
+            assert_eq!(verdict(&state, &bounce), StandingPriorityPass::Undecided);
+        }
+
+        /// The classifier keeps the own-object pass for instructions that move
+        /// nothing off the battlefield, even with an activatable land in play.
+        #[test]
+        fn own_non_departure_instructions_keep_the_pass() {
+            let (state, _, _) = board();
+            // Amulet of Vigor: "untap it".
+            let untap = own_top(
+                Effect::SetTapState {
+                    target: TargetFilter::TriggeringSource,
+                    scope: crate::types::ability::EffectScope::Single,
+                    state: crate::types::ability::TapStateChange::Untap,
+                },
+                vec![],
+            );
+            assert_eq!(verdict(&state, &untap), StandingPriorityPass::Granted);
+
+            // Patron of the Moon: lands from hand onto the battlefield.
+            let put_lands = own_top(
+                Effect::ChangeZone {
+                    origin: Some(Zone::Hand),
+                    destination: Zone::Battlefield,
+                    target: TargetFilter::Typed(TypedFilter::land()),
+                    owner_library: false,
+                    enter_transformed: false,
+                    enters_under: None,
+                    enter_tapped: EtbTapState::Tapped,
+                    enters_attacking: false,
+                    up_to: true,
+                    enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
+                    face_down_profile: None,
+                    enters_modified_if: None,
+                },
+                vec![],
+            );
+            assert_eq!(verdict(&state, &put_lands), StandingPriorityPass::Granted);
+        }
+
+        /// Coral Atoll class: the land's own trigger sacrifices it.
+        #[test]
+        fn own_self_sacrifice_of_the_mana_land_holds() {
+            let (state, forest, _) = board();
+            let sacrifice_self = top(
+                PlayerId(0),
+                forest,
+                ResolvedAbility::new(
+                    Effect::Sacrifice {
+                        target: TargetFilter::SelfRef,
+                        count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                        min_count: 0,
+                    },
+                    vec![],
+                    forest,
+                    PlayerId(0),
+                ),
+            );
+            assert_eq!(verdict(&state, &sacrifice_self), StandingPriorityPass::Held);
+        }
+
+        /// Armageddon class: an own mass destruction of lands.
+        #[test]
+        fn own_mass_destruction_of_lands_holds() {
+            let (state, _, _) = board();
+            let armageddon = own_top(
+                Effect::DestroyAll {
+                    target: TargetFilter::Typed(TypedFilter::land()),
+                    cant_regenerate: false,
+                },
+                vec![],
+            );
+            assert_eq!(verdict(&state, &armageddon), StandingPriorityPass::Held);
+        }
+
+        /// An announced target slot moves only what was chosen for it.
+        #[test]
+        fn own_targeted_destruction_holds_only_for_the_chosen_land() {
+            let (state, forest, opponent_forest) = board();
+            let destroy = |targets| {
+                own_top(
+                    Effect::Destroy {
+                        target: TargetFilter::Typed(TypedFilter::land()),
+                        cant_regenerate: false,
+                    },
+                    targets,
+                )
+            };
+            assert_eq!(
+                verdict(&state, &destroy(vec![TargetRef::Object(forest)])),
+                StandingPriorityPass::Held
+            );
+            assert_eq!(
+                verdict(&state, &destroy(vec![TargetRef::Object(opponent_forest)])),
+                StandingPriorityPass::Granted
+            );
+            // "Up to one target land" with no target chosen moves nothing.
+            assert_eq!(
+                verdict(&state, &destroy(vec![])),
+                StandingPriorityPass::Granted
+            );
+        }
+
+        /// CR 109.5: a `player_scope` sacrifice applies with each scoped player as
+        /// its controller, so "you control" names the scoped player's lands.
+        #[test]
+        fn player_scoped_sacrifice_holds_only_when_you_are_in_scope() {
+            let (state, _, _) = board();
+            let scoped_sacrifice = |scope| {
+                let mut ability = ResolvedAbility::new(
+                    Effect::Sacrifice {
+                        target: your_lands(),
+                        count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                        min_count: 0,
+                    },
+                    vec![],
+                    TRIGGER_SOURCE,
+                    PlayerId(0),
+                );
+                ability.player_scope = Some(scope);
+                top(PlayerId(0), TRIGGER_SOURCE, ability)
+            };
+            // Liliana's Triumph shape: "each opponent sacrifices".
+            assert_eq!(
+                verdict(&state, &scoped_sacrifice(PlayerFilter::Opponent)),
+                StandingPriorityPass::Granted
+            );
+            // "Each player sacrifices".
+            assert_eq!(
+                verdict(&state, &scoped_sacrifice(PlayerFilter::All)),
+                StandingPriorityPass::Held
+            );
+        }
     }
 }

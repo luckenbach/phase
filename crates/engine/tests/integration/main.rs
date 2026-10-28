@@ -2137,6 +2137,7 @@ mod activate_only_restriction_list;
 mod celes_kotis_graveyard_origin_batch;
 mod commanders_plate_protection;
 mod display_identity_serde;
+mod etb_trigger_order_mana_window;
 mod event_window_trigger_gate;
 mod magnificent_end_tapped_target_cost;
 mod put_target_count_entry_counters;

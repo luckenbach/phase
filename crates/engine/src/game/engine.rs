@@ -10004,7 +10004,8 @@ enum AutoPassDecision {
 ///
 /// Interrupts (MTGA-style): `UntilStackEmpty` bails when the stack empties or
 /// grows beyond the baseline (trigger or opponent spell); `UntilTurnBoundary`
-/// bails when an opponent-controlled object is on top of the stack or when the
+/// bails when an opponent-controlled object is on top of the stack, when the
+/// player's own top is `Held` (`priority::standing_priority_pass`), or when the
 /// current phase is in the user-supplied `phase_stops` list. The per-window
 /// interrupt logic is boundary-agnostic — both `EndOfCurrentTurn` and
 /// `MyNextTurnStart` behave identically within a priority window.
@@ -10041,14 +10042,20 @@ fn priority_auto_pass_decision(state: &GameState, player: PlayerId) -> AutoPassD
             // CR 117.3d: An opponent-controlled top-of-stack normally ends the
             // session so the player can respond — unless they have pre-committed
             // to yield priority for that exact triggered ability, in which case
-            // the session keeps auto-passing through it. The standing rungs are
-            // `priority::standing_priority_pass`'s; Full Control already returned
-            // above, so `Withheld` cannot reach this arm.
-            let opponent_on_stack = state.stack.last().is_some_and(|top| {
-                priority::standing_priority_pass(state, player, Some(top))
-                    == priority::StandingPriorityPass::Undecided
+            // the session keeps auto-passing through it. CR 117.3c + CR 605.3a:
+            // the player's own object that can move one of their activatable
+            // mana sources off the battlefield (`Held`) ends it too, since that
+            // activation is lost once the object resolves. The standing rungs
+            // are `priority::standing_priority_pass`'s; Full Control already
+            // returned above, so `Withheld` cannot reach this arm.
+            let top_needs_response = state.stack.last().is_some_and(|top| {
+                matches!(
+                    priority::standing_priority_pass(state, player, Some(top)),
+                    priority::StandingPriorityPass::Undecided
+                        | priority::StandingPriorityPass::Held
+                )
             });
-            if opponent_on_stack {
+            if top_needs_response {
                 AutoPassDecision::Break
             } else if state.phase_stop_hit(player) {
                 AutoPassDecision::Finish
@@ -10601,7 +10608,9 @@ fn stack_resolution_session_participant_authorizes_pass(
         // the session's own representative's included.
         priority::StandingPriorityPass::Withheld => return false,
         priority::StandingPriorityPass::Granted => true,
-        priority::StandingPriorityPass::Undecided => false,
+        // CR 117.3c + CR 605.3a: an own object that can remove an activatable
+        // mana source is no standing pass; only explicit consent skips it.
+        priority::StandingPriorityPass::Held | priority::StandingPriorityPass::Undecided => false,
     };
     match session.policy {
         // A verified AI pass authorizes later windows in this exact fenced
@@ -10671,7 +10680,13 @@ pub(crate) fn stack_resolution_session_authorized_limit(state: &GameState) -> Op
     // CR 117.3b + CR 117.4: resolving K entries skips every participant's
     // window over each of the next K − 1 entries, each with its own top; the
     // boundary ends before the first window a participant has not authorized
-    // (CR 732.2b), so K = 1 + the authorized prefix of those windows.
+    // (CR 732.2b), so K = 1 + the authorized prefix of those windows. Each
+    // window is judged against the board before anything resolves, so it cannot
+    // see a mana source an earlier member untaps. That is sound for the `Held`
+    // rung only because the stack resolver batches nothing but its inert kinds
+    // (no-ops, self counters, controller life gain, token creation), none of
+    // which moves a permanent off the battlefield, so no window inside a batch
+    // can be `Held`.
     let authorized_skipped_windows = fenced_prefix
         .take_while(|window_top| {
             participants.iter().all(|&participant| {
